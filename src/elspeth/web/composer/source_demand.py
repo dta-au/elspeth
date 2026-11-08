@@ -33,7 +33,7 @@ import cycle.
 from __future__ import annotations
 
 import json
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Final
@@ -46,7 +46,7 @@ from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from elspeth.plugins.sources.csv_source import CSVSourceConfig
 from elspeth.plugins.sources.field_normalization import resolve_field_names
 from elspeth.web.composer.source_inspection import inspect_csv_source_content
-from elspeth.web.composer.state import SOURCE_AUTHORING_KEY, CompositionState, SourceSpec
+from elspeth.web.composer.state import SOURCE_AUTHORING_KEY, CompositionState, SourceSpec, ValidationSummary
 
 # Stable user-facing label for the data-contract review row. The card's
 # user-visible title ("Data contract") lives in the frontend renderer.
@@ -195,7 +195,11 @@ def _source_options_without_guaranteed_fields(
     return {**options, schema_key: schema}
 
 
-def _unsatisfied_edge_misses(state: CompositionState) -> dict[tuple[str, str], frozenset[str]]:
+def _unsatisfied_edge_misses(
+    state: CompositionState,
+    *,
+    raw_validator: Callable[[CompositionState], ValidationSummary] | None = None,
+) -> dict[tuple[str, str], frozenset[str]]:
     """Missing required fields per producer->consumer PAIR, from Stage-1's own ledger.
 
     Keyed on the ledger's own ``(from_id, to_id)`` — one entry per pair
@@ -205,9 +209,10 @@ def _unsatisfied_edge_misses(state: CompositionState) -> dict[tuple[str, str], f
     requires nothing, or the producer abstains under ADR-007). Callers that
     read absence as "no misses" are reading the first meaning only.
     """
+    validation = state.validate() if raw_validator is None else raw_validator(state)
     return {
         (contract.from_id, contract.to_id): frozenset(contract.missing_fields)
-        for contract in state.validate().edge_contracts
+        for contract in validation.edge_contracts
         if not contract.satisfied
     }
 
@@ -266,6 +271,7 @@ def backtraced_source_demand(
     source_name: str,
     *,
     disregard_fields: frozenset[str] = frozenset(),
+    raw_validator: Callable[[CompositionState], ValidationSummary] | None = None,
 ) -> tuple[str, ...]:
     """Minimal field set the pipeline genuinely requires from ``source_name``.
 
@@ -301,6 +307,10 @@ def backtraced_source_demand(
     Returns ``()`` when there is no demand or when this source cannot carry
     a guarantee stamp at all — a card that acknowledgement could not
     resolve must never be staged.
+
+    An admitted Composer operation may supply its raw validator to share
+    immutable summaries. Each distinct hypothesis is submitted separately;
+    callers without operation-owned analysis retain the uncached reference.
     """
     source = state.sources[source_name] if source_name in state.sources else None
     if source is None or SOURCE_AUTHORING_KEY in source.options:
@@ -310,7 +320,7 @@ def backtraced_source_demand(
     if _eligible_source_stamp_size(baseline_source) is None:
         return ()
     baseline_state = _state_with_source_options(state, source_name, source, baseline_options)
-    baseline_misses = _unsatisfied_edge_misses(baseline_state)
+    baseline_misses = _unsatisfied_edge_misses(baseline_state, raw_validator=raw_validator)
     if not baseline_misses:
         return ()
     all_missing = frozenset().union(*baseline_misses.values())
@@ -335,14 +345,14 @@ def backtraced_source_demand(
             raise AuditIntegrityError("source guarantee-stamp eligibility changed within one demand analysis")
         stamped_by_name[name] = stamped
 
-    h_all_misses = _unsatisfied_edge_misses(_state_with_stamped_sources(baseline_state, stamped_by_name))
+    h_all_misses = _unsatisfied_edge_misses(_state_with_stamped_sources(baseline_state, stamped_by_name), raw_validator=raw_validator)
     if len(stamped_by_name) == 1:
         # Single eligible source: H_not_S IS the baseline — skip the third
         # validation run and keep the original solo-delta cost.
         h_not_s_misses = baseline_misses
     else:
         without_s = {name: options for name, options in stamped_by_name.items() if name != source_name}
-        h_not_s_misses = _unsatisfied_edge_misses(_state_with_stamped_sources(baseline_state, without_s))
+        h_not_s_misses = _unsatisfied_edge_misses(_state_with_stamped_sources(baseline_state, without_s), raw_validator=raw_validator)
 
     demand: set[str] = set()
     for edge, missing in baseline_misses.items():

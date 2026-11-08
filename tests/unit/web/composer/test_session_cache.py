@@ -14,6 +14,7 @@ import pytest
 from elspeth.contracts.errors import FrameworkBugError
 from elspeth.web import async_workers
 from elspeth.web.composer._response_json import FrozenResponseJSON
+from elspeth.web.composer.analysis import ComposerAnalysis
 from elspeth.web.composer.discovery_cache import CachedDiscoveryPayload
 from elspeth.web.composer.session_cache import (
     ComposerSessionCache,
@@ -517,3 +518,261 @@ async def test_queued_job_pressure_and_shutdown_preserve_running_work(small_pool
         assert registry.snapshot().weight_bytes == registry.snapshot().retained_entries == registry.snapshot().pins == 0
     finally:
         release.set()
+
+
+def test_outer_worker_pin_is_idempotent_and_never_resurrects_disposed_owner() -> None:
+    registry = ComposerSessionCacheRegistry()
+    lease = registry.borrow(_key())
+    cache = lease.cache
+    assert cache is not None
+    pin = cache.pin_worker()
+    assert pin is not None
+    registry.retire_session("one").close()
+    lease.close()
+    assert registry.snapshot().pins == registry.snapshot().retained_sessions == 1
+    assert registry.borrow(_key()).cache is None
+    pin.close()
+    pin.close()
+    assert registry.snapshot().pins == registry.snapshot().retained_sessions == registry.snapshot().weight_bytes == 0
+    assert cache.pin_worker() is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("deadline", (False, True))
+async def test_outer_worker_running_before_entry_cancellation_returns_promptly(
+    small_pool: ThreadPoolExecutor, monkeypatch: pytest.MonkeyPatch, deadline: bool
+) -> None:
+    registry = ComposerSessionCacheRegistry()
+    running, enter_callable = threading.Event(), threading.Event()
+    actual_submit = small_pool.submit
+
+    def delayed_submit[**P, T](fn: Callable[P, T], /, *args: P.args, **kwargs: P.kwargs) -> Future[T]:
+        def delayed_entry() -> T:
+            running.set()
+            assert enter_callable.wait(5)
+            return fn(*args, **kwargs)
+
+        return actual_submit(delayed_entry)
+
+    monkeypatch.setattr(small_pool, "submit", delayed_submit)
+    lease = registry.borrow(_key())
+    cache = lease.cache
+    assert cache is not None
+    analysis = ComposerAnalysis(cache)
+    request = asyncio.create_task(analysis.run_in_worker(lambda: "late"))
+    try:
+        await _until(running.is_set)
+        assert registry.snapshot().pins == 1
+        assert registry.snapshot().pending_entries == 0
+        registry.retire_session("one").close()
+        lease.close()
+        if deadline:
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(request, timeout=0.02)
+        else:
+            request.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(request, timeout=0.5)
+        assert not enter_callable.is_set()
+        assert registry.snapshot().retained_sessions == registry.snapshot().pins == 1
+        assert registry.borrow(_key()).cache is None
+        enter_callable.set()
+        await _until(lambda: registry.snapshot().pins == 0)
+        assert registry.snapshot().retained_sessions == registry.snapshot().weight_bytes == 0
+        with registry.borrow(_key()) as fresh:
+            assert fresh.cache is not None
+            assert fresh.cache is not cache
+    finally:
+        enter_callable.set()
+
+
+@pytest.mark.asyncio
+async def test_outer_queued_cancellation_releases_without_running(small_pool: ThreadPoolExecutor) -> None:
+    registry = ComposerSessionCacheRegistry()
+    release = threading.Event()
+    started = [threading.Event(), threading.Event()]
+    calls = [0]
+
+    def block(index: int) -> None:
+        started[index].set()
+        assert release.wait(5)
+
+    blockers = [asyncio.create_task(async_workers.run_sync_in_worker(block, i)) for i in range(2)]
+    with registry.borrow(_key()) as lease:
+        assert lease.cache is not None
+        analysis = ComposerAnalysis(lease.cache)
+
+        def compute() -> str:
+            calls[0] += 1
+            return "never"
+
+        try:
+            await _until(lambda: all(event.is_set() for event in started))
+            request = asyncio.create_task(analysis.run_in_worker(compute))
+            await _until(lambda: async_workers.outstanding_admissions() == 3)
+            assert registry.snapshot().pins == 1
+            request.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(request, timeout=0.5)
+            await _until(lambda: registry.snapshot().pins == 0)
+            assert calls == [0]
+            assert async_workers.outstanding_admissions() == 2
+        finally:
+            release.set()
+            await asyncio.gather(*blockers)
+
+
+@pytest.mark.asyncio
+async def test_outer_worker_admission_and_setup_failures_release_once(
+    small_pool: ThreadPoolExecutor, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry = ComposerSessionCacheRegistry()
+    with registry.borrow(_key()) as lease:
+        assert lease.cache is not None
+        analysis = ComposerAnalysis(lease.cache)
+
+        async def reject() -> None:
+            assert registry.snapshot().pins == 1
+            raise async_workers.AsyncWorkerAdmissionTimeoutError("saturated")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(async_workers, "_acquire_admission", reject)
+            with pytest.raises(async_workers.AsyncWorkerAdmissionTimeoutError):
+                await analysis.run_in_worker(lambda: "never")
+        assert registry.snapshot().pins == 0
+
+        def setup_failure() -> ThreadPoolExecutor:
+            raise RuntimeError("setup failed")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(async_workers, "_get_shared_executor", setup_failure)
+            with pytest.raises(RuntimeError, match="setup failed"):
+                await analysis.run_in_worker(lambda: "never")
+        assert registry.snapshot().pins == 0
+
+        def compute(value: str, *, suffix: str) -> str:
+            assert registry.snapshot().pins == 1
+            return value + suffix
+
+        assert await analysis.run_in_worker(compute, "value", suffix="-done") == "value-done"
+        assert registry.snapshot().pins == 0
+
+
+@pytest.mark.asyncio
+async def test_outer_worker_cancel_during_admission_releases_without_submission(
+    small_pool: ThreadPoolExecutor, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry = ComposerSessionCacheRegistry()
+    admitting, hold_admission = asyncio.Event(), asyncio.Event()
+    calls = [0]
+
+    async def wait_for_admission() -> None:
+        admitting.set()
+        await hold_admission.wait()
+
+    def compute() -> str:
+        calls[0] += 1
+        return "never"
+
+    monkeypatch.setattr(async_workers, "_acquire_admission", wait_for_admission)
+    with registry.borrow(_key()) as lease:
+        assert lease.cache is not None
+        request = asyncio.create_task(ComposerAnalysis(lease.cache).run_in_worker(compute))
+        await asyncio.wait_for(admitting.wait(), timeout=3)
+        assert registry.snapshot().pins == 1
+        request.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(request, timeout=0.5)
+        assert calls == [0]
+        assert registry.snapshot().pins == async_workers.outstanding_admissions() == 0
+
+
+@pytest.mark.asyncio
+async def test_outer_worker_failure_baseexception_and_uncached_fallback(small_pool: ThreadPoolExecutor) -> None:
+    class Aborted(BaseException):
+        pass
+
+    registry = ComposerSessionCacheRegistry()
+    lease = registry.borrow(_key())
+    cache = lease.cache
+    assert cache is not None
+    analysis = ComposerAnalysis(cache)
+
+    def fail(error: BaseException) -> str:
+        raise error
+
+    for error in (RuntimeError("failed"), Aborted("aborted")):
+        with pytest.raises(type(error)):
+            await analysis.run_in_worker(fail, error)
+        assert registry.snapshot().pins == 0
+    registry.retire_session("one").close()
+    lease.close()
+    assert await analysis.run_in_worker(lambda: "disposed fallback") == "disposed fallback"
+    assert await ComposerAnalysis().run_in_worker(lambda: "uncached") == "uncached"
+    assert registry.snapshot().pins == registry.snapshot().retained_sessions == registry.snapshot().weight_bytes == 0
+
+
+@pytest.mark.asyncio
+async def test_outer_worker_late_failure_after_request_cancel_is_observed(small_pool: ThreadPoolExecutor) -> None:
+    registry = ComposerSessionCacheRegistry()
+    loop = asyncio.get_running_loop()
+    previous_handler = loop.get_exception_handler()
+    messages: list[str] = []
+    loop.set_exception_handler(lambda _loop, context: messages.append(context["message"]))
+    started, release = threading.Event(), threading.Event()
+
+    def fail_late() -> str:
+        started.set()
+        assert release.wait(5)
+        raise RuntimeError("late worker failure")
+
+    with registry.borrow(_key()) as lease:
+        assert lease.cache is not None
+        analysis = ComposerAnalysis(lease.cache)
+        request = asyncio.create_task(analysis.run_in_worker(fail_late))
+        try:
+            await _until(started.is_set)
+            request.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(request, timeout=0.5)
+            assert registry.snapshot().pins == 1
+            release.set()
+            await _until(lambda: registry.snapshot().pins == 0)
+            await asyncio.sleep(0)
+            assert messages == []
+        finally:
+            release.set()
+            loop.set_exception_handler(previous_handler)
+
+
+@pytest.mark.asyncio
+async def test_outer_cancelled_producer_completes_running_memo_for_survivor(small_pool: ThreadPoolExecutor) -> None:
+    registry = ComposerSessionCacheRegistry()
+    started, release = threading.Event(), threading.Event()
+    calls = [0]
+
+    def compute() -> str:
+        calls[0] += 1
+        started.set()
+        assert release.wait(5)
+        return "shared"
+
+    with registry.borrow(_key()) as lease:
+        cache = lease.cache
+        assert cache is not None
+        analysis = ComposerAnalysis(cache)
+        first = asyncio.create_task(analysis.run_in_worker(_get, cache, "x", compute))
+        try:
+            await _until(started.is_set)
+            second = asyncio.create_task(analysis.run_in_worker(_get, cache, "x", compute))
+            await _until(lambda: registry.snapshot().joins == 1)
+            first.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(first, timeout=0.5)
+            assert registry.snapshot().pins >= 2
+            release.set()
+            assert (await second).value == "shared"
+            assert calls == [1]
+            assert registry.snapshot().pins == registry.snapshot().pending_entries == 0
+        finally:
+            release.set()

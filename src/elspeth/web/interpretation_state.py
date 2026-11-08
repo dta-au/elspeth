@@ -12,7 +12,7 @@ states can be opened and resolved during the migration window.
 from __future__ import annotations
 
 import heapq
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from difflib import get_close_matches
 from hashlib import sha256
@@ -50,6 +50,7 @@ from elspeth.web.composer.state import (
     CompositionState,
     NodeSpec,
     SourceSpec,
+    ValidationSummary,
     _coalesce_branch_connections,
     _well_formed_query_entries,
 )
@@ -1113,6 +1114,7 @@ def interpretation_sites(
     state: CompositionState,
     *,
     operator_resolved_model_node_ids: frozenset[str] = frozenset(),
+    raw_validator: Callable[[CompositionState], ValidationSummary] | None = None,
 ) -> tuple[InterpretationReviewSite, ...]:
     """Return unresolved interpretation-review sites across source and transforms.
 
@@ -1125,7 +1127,7 @@ def interpretation_sites(
     sites: list[InterpretationReviewSite] = []
     for source_name, source in state.sources.items():
         sites.extend(_pending_source_sites(source, component_id=source_component_id(source_name)))
-    sites.extend(_pending_source_data_contract_sites(state))
+    sites.extend(_pending_source_data_contract_sites(state, raw_validator=raw_validator))
     web_scrape_raw_fields = _web_scrape_raw_fields(state.nodes)
     for node in state.nodes:
         node_sites = [*_pending_node_sites(node), *_legacy_placeholder_sites(node)]
@@ -1182,6 +1184,7 @@ def pending_execution_interpretation_sites(
     state: CompositionState,
     *,
     operator_resolved_model_node_ids: frozenset[str] = frozenset(),
+    raw_validator: Callable[[CompositionState], ValidationSummary] | None = None,
 ) -> tuple[InterpretationReviewSite, ...]:
     """Pending interpretation-review sites as the execution gate counts them.
 
@@ -1197,6 +1200,7 @@ def pending_execution_interpretation_sites(
     return interpretation_sites(
         state,
         operator_resolved_model_node_ids=operator_resolved_model_node_ids | _profile_resolved_model_node_ids(state),
+        raw_validator=raw_validator,
     )
 
 
@@ -1438,7 +1442,12 @@ def _source_data_contract_evidence_is_current(
     return acknowledged_fields is not None and guaranteed_fields is not None and frozenset(acknowledged_fields) <= guaranteed_fields
 
 
-def current_source_data_contract_demand(state: CompositionState, source_name: str) -> tuple[str, ...]:
+def current_source_data_contract_demand(
+    state: CompositionState,
+    source_name: str,
+    *,
+    raw_validator: Callable[[CompositionState], ValidationSummary] | None = None,
+) -> tuple[str, ...]:
     """Requirement-aware demand backtrace for one source.
 
     The single derivation shared by the pending-site enumerator, the
@@ -1470,7 +1479,7 @@ def current_source_data_contract_demand(state: CompositionState, source_name: st
         )
         disregard = frozenset(acknowledged)
     try:
-        return backtraced_source_demand(state, source_name, disregard_fields=disregard)
+        return backtraced_source_demand(state, source_name, disregard_fields=disregard, raw_validator=raw_validator)
     except SourceDemandAnalysisLimitError as exc:
         raise InterpretationReviewCapacityError(
             "source data-contract demand exceeds the bounded analysis limit",
@@ -1480,7 +1489,11 @@ def current_source_data_contract_demand(state: CompositionState, source_name: st
         ) from exc
 
 
-def _pending_source_data_contract_sites(state: CompositionState) -> tuple[InterpretationReviewSite, ...]:
+def _pending_source_data_contract_sites(
+    state: CompositionState,
+    *,
+    raw_validator: Callable[[CompositionState], ValidationSummary] | None = None,
+) -> tuple[InterpretationReviewSite, ...]:
     """Enumerate unacknowledged (or drifted) data-contract sites per source.
 
     Derived, not staged (elspeth-da68332faf work item 2): the site exists
@@ -1520,7 +1533,7 @@ def _pending_source_data_contract_sites(state: CompositionState) -> tuple[Interp
                 )
             )
             continue
-        demand = current_source_data_contract_demand(state, source_name)
+        demand = current_source_data_contract_demand(state, source_name, raw_validator=raw_validator)
         if not demand:
             continue
         if (

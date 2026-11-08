@@ -151,19 +151,31 @@ def _execute_set_output(
         )
     except FailureRouteChoiceError as exc:
         return _saved_graph_rejection_result(
-            state, str(exc), error_code="failure_route_required", rejected_component=f"output:{validated.sink_name}"
+            state,
+            str(exc),
+            error_code="failure_route_required",
+            rejected_component=f"output:{validated.sink_name}",
+            catalog=context.catalog,
         )
     plugin = validated.plugin
     sink_options = validated.options
     endpoint_policy_error = web_aws_s3_endpoint_url_policy_error(plugin, sink_options)
     if endpoint_policy_error is not None:
         return _saved_graph_rejection_result(
-            state, endpoint_policy_error, error_code="aws_s3_endpoint_url_not_allowed", rejected_component=f"output:{validated.sink_name}"
+            state,
+            endpoint_policy_error,
+            error_code="aws_s3_endpoint_url_not_allowed",
+            rejected_component=f"output:{validated.sink_name}",
+            catalog=context.catalog,
         )
     plugin_error = _plugin_selection_violation(context, "sink", plugin)
     if plugin_error is not None:
         return _saved_graph_plugin_policy_failure(
-            state, plugin_error, component=f"output:{validated.sink_name}", rejected_component=f"output:{validated.sink_name}"
+            state,
+            plugin_error,
+            component=f"output:{validated.sink_name}",
+            rejected_component=f"output:{validated.sink_name}",
+            catalog=context.catalog,
         )
     context.catalog.get_schema("sink", plugin)
 
@@ -175,6 +187,7 @@ def _execute_set_output(
         plugin_type="sink",
         plugin_name=plugin,
         options=sink_options,
+        catalog=context.catalog,
     )
     if credential_error is not None:
         return credential_error
@@ -186,6 +199,7 @@ def _execute_set_output(
             "Use an authorized session-local output path.",
             error_code="sink_path_policy_invalid",
             rejected_component=f"output:{validated.sink_name}",
+            catalog=context.catalog,
         )
 
     prevalidation_error = _prevalidate_sink(plugin, sink_options)
@@ -196,6 +210,7 @@ def _execute_set_output(
             error_code="plugin_options_invalid",
             plugin_identity=("sink", plugin),
             rejected_component=f"output:{validated.sink_name}",
+            catalog=context.catalog,
         )
     collision_error = validate_composer_file_sink_collision_policy(
         plugin,
@@ -204,7 +219,11 @@ def _execute_set_output(
     )
     if collision_error is not None:
         return _saved_graph_rejection_result(
-            state, collision_error, error_code="file_sink_write_policy_invalid", rejected_component=f"output:{validated.sink_name}"
+            state,
+            collision_error,
+            error_code="file_sink_write_policy_invalid",
+            rejected_component=f"output:{validated.sink_name}",
+            catalog=context.catalog,
         )
 
     output = OutputSpec(
@@ -215,11 +234,11 @@ def _execute_set_output(
         description=validated.description,
     )
     new_state = state.with_output(output)
-    invariant_error = _post_mutation_invariant_error(new_state)
+    invariant_error = _post_mutation_invariant_error(new_state, analysis=context.analysis)
     if invariant_error is not None:
         message, error_code = invariant_error
-        return _saved_graph_rejection_result(state, message, error_code=error_code, rejected_component=None)
-    return _mutation_result(new_state, (validated.sink_name,))
+        return _saved_graph_rejection_result(state, message, error_code=error_code, rejected_component=None, catalog=context.catalog)
+    return _mutation_result(new_state, (validated.sink_name,), catalog=context.catalog)
 
 
 def _execute_remove_output(
@@ -228,15 +247,18 @@ def _execute_remove_output(
     context: ToolContext,
 ) -> ToolResult:
     """Remove a pipeline output (sink) by name."""
-    del context  # unused; signature uniformity with the other handlers.
     validated = _validate_mutation_arguments(_RemoveOutputArgumentsModel, args, "remove_output arguments")
     sink_name = validated.sink_name
     new_state = state.without_output(sink_name)
     if new_state is None:
         return _saved_graph_rejection_result(
-            state, f"Output '{sink_name}' not found.", error_code="output_not_found", rejected_component=f"output:{sink_name}"
+            state,
+            f"Output '{sink_name}' not found.",
+            error_code="output_not_found",
+            rejected_component=f"output:{sink_name}",
+            catalog=context.catalog,
         )
-    return _mutation_result(new_state, (sink_name,))
+    return _mutation_result(new_state, (sink_name,), catalog=context.catalog)
 
 
 def _execute_patch_output_options(
@@ -270,21 +292,33 @@ def _execute_patch_output_options(
     current = next((o for o in state.outputs if o.name == sink_name), None)
     if current is None:
         return _saved_graph_rejection_result(
-            state, f"Output '{sink_name}' not found.", error_code="output_not_found", rejected_component=f"output:{sink_name}"
+            state,
+            f"Output '{sink_name}' not found.",
+            error_code="output_not_found",
+            rejected_component=f"output:{sink_name}",
+            catalog=context.catalog,
         )
     # State-held plugin: resolve it through the request's policy view before
     # prevalidation stamps it (see _execute_patch_source_options).
     plugin_error = _plugin_selection_violation(context, "sink", current.plugin)
     if plugin_error is not None:
         return _saved_graph_plugin_policy_failure(
-            state, plugin_error, component=f"output:{sink_name}", rejected_component=f"output:{sink_name}"
+            state,
+            plugin_error,
+            component=f"output:{sink_name}",
+            rejected_component=f"output:{sink_name}",
+            catalog=context.catalog,
         )
     context.catalog.get_schema("sink", current.plugin)
     new_options = _apply_merge_patch(current.options, patch)
     endpoint_policy_error = web_aws_s3_endpoint_url_policy_error(current.plugin, new_options)
     if endpoint_policy_error is not None:
         return _saved_graph_rejection_result(
-            state, endpoint_policy_error, error_code="aws_s3_endpoint_url_not_allowed", rejected_component=f"output:{sink_name}"
+            state,
+            endpoint_policy_error,
+            error_code="aws_s3_endpoint_url_not_allowed",
+            rejected_component=f"output:{sink_name}",
+            catalog=context.catalog,
         )
     credential_error = _saved_graph_credential_wiring_contract_failure(
         state,
@@ -293,6 +327,7 @@ def _execute_patch_output_options(
         plugin_type="sink",
         plugin_name=current.plugin,
         options=new_options,
+        catalog=context.catalog,
     )
     if credential_error is not None:
         return credential_error
@@ -306,6 +341,7 @@ def _execute_patch_output_options(
             "Use an authorized session-local output path.",
             error_code="sink_path_policy_invalid",
             rejected_component=f"output:{sink_name}",
+            catalog=context.catalog,
         )
 
     prevalidation_error = _prevalidate_sink(current.plugin, new_options)
@@ -316,6 +352,7 @@ def _execute_patch_output_options(
             error_code="plugin_options_invalid",
             plugin_identity=("sink", current.plugin),
             rejected_component=f"output:{sink_name}",
+            catalog=context.catalog,
         )
     collision_error = validate_composer_file_sink_collision_policy(
         current.plugin,
@@ -324,12 +361,16 @@ def _execute_patch_output_options(
     )
     if collision_error is not None:
         return _saved_graph_rejection_result(
-            state, collision_error, error_code="file_sink_write_policy_invalid", rejected_component=f"output:{sink_name}"
+            state,
+            collision_error,
+            error_code="file_sink_write_policy_invalid",
+            rejected_component=f"output:{sink_name}",
+            catalog=context.catalog,
         )
 
     new_output = replace(current, options=new_options)
     new_state = state.with_output(new_output)
-    return _mutation_result(new_state, (sink_name,))
+    return _mutation_result(new_state, (sink_name,), catalog=context.catalog)
 
 
 def _handle_patch_output_options(

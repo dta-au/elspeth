@@ -63,6 +63,16 @@ def _isolated_manager_with_llm_source() -> PluginManager:
     return manager
 
 
+def test_registry_generation_is_stable_and_moves_without_private_values() -> None:
+    settings = RuntimeWebPluginConfig.from_settings(_settings())
+    policy = compile_web_plugin_policy(registry=_isolated_manager_with_llm_source(), settings=settings)
+    first = OperatorProfileRegistry(policy=policy, settings=settings)
+    second = OperatorProfileRegistry(policy=policy, settings=settings)
+    assert type(first.generation) is int
+    assert first.generation == first.generation
+    assert second.generation > first.generation
+
+
 def test_openrouter_profile_requires_explicit_scoped_credential() -> None:
     with pytest.raises(ValidationError):
         _settings(llm_profiles={"tutorial": {"provider": "openrouter", "model": "openai/gpt-5-mini"}}, default_llm_profile="tutorial")

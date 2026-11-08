@@ -36,7 +36,6 @@ from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.contracts.tool_calls import PROVIDER_TOOL_CALL_ID_MAX_LENGTH
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.core.canonical import canonical_json
-from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.blobs.protocol import BlobQuotaExceededError
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer._compose_loop_carriers import (
@@ -197,6 +196,7 @@ if TYPE_CHECKING:
     from sqlalchemy import Engine
 
     from elspeth.contracts.secrets import WebSecretResolver
+    from elspeth.web.composer.analysis import ComposerAnalysis
     from elspeth.web.composer.pipeline_custody import PipelineCustodyPreparation
     from elspeth.web.composer.provider_quota import ProviderInvocationOwner
     from elspeth.web.composer.redaction_telemetry import RedactionTelemetry
@@ -705,7 +705,7 @@ async def _finalize_complete_set_pipeline_candidate(
     policy_catalog: PolicyCatalogView,
 ) -> _SetPipelineFinalization:
     """Validate public input, wire required controls, and retain review authority."""
-    candidate = await run_sync_in_worker(
+    candidate = await policy_catalog.run_in_worker(
         build_set_pipeline_candidate,
         arguments,
         state,
@@ -714,7 +714,7 @@ async def _finalize_complete_set_pipeline_candidate(
     if not candidate.acceptable:
         return _SetPipelineFinalization(arguments, context, candidate, False)
 
-    finalized = await run_sync_in_worker(
+    finalized = await policy_catalog.run_in_worker(
         wire_required_controls,
         arguments,
         plugin_snapshot,
@@ -730,7 +730,7 @@ async def _finalize_complete_set_pipeline_candidate(
 
         # Admit nominal server-staged control disclosure before copying any
         # canonical rows. A provider-authored reserved string remains refused.
-        compact_candidate = await run_sync_in_worker(
+        compact_candidate = await policy_catalog.run_in_worker(
             build_set_pipeline_candidate,
             compact_arguments,
             state,
@@ -755,7 +755,7 @@ async def _finalize_complete_set_pipeline_candidate(
         tool_arguments_hash=composer_authority_hash(audit_arguments),
         _interpretation_requirements_are_internal=True,
     )
-    canonical_candidate = await run_sync_in_worker(
+    canonical_candidate = await policy_catalog.run_in_worker(
         build_set_pipeline_candidate,
         canonical_arguments,
         state,
@@ -787,7 +787,7 @@ async def _finalize_completed_incremental_mutation(
     """
     if not result.success or result.updated_state.version <= prior_state.version or not result.validation.is_valid:
         return result
-    finalized_state = await run_sync_in_worker(
+    finalized_state = await policy_catalog.run_in_worker(
         wire_required_controls_state,
         result.updated_state,
         plugin_snapshot,
@@ -795,7 +795,7 @@ async def _finalize_completed_incremental_mutation(
     )
     if finalized_state is result.updated_state:
         return result
-    finalized_validation = await run_sync_in_worker(
+    finalized_validation = await policy_catalog.run_in_worker(
         policy_catalog.validate_composition_state,
         finalized_state,
     )
@@ -889,6 +889,10 @@ class ToolBatchContext:
     composition_turns_used: int = 0
     discovery_turns_used: int = 0
     failed_turn: FailedTurnMetadata | None = None
+
+    @property
+    def analysis(self) -> ComposerAnalysis:
+        return self.policy_catalog.analysis
 
 
 @dataclass(slots=True)
@@ -1550,20 +1554,23 @@ async def run_tool_batch(
         # authored in this same response. Existing saved resources remain usable.
         if is_mutation_tool(tool_name) and has_unavailable_prerequisite(tool_name, arguments, refused_resources, state):
             reject = _candidate_rejection_result if tool_name == "set_pipeline" else _saved_graph_rejection_result
-            blocked = reject(
+            blocked = await ctx.policy_catalog.run_in_worker(
+                reject,
                 state,
                 "This mutation depends on a new resource or connection from an earlier refused call in this batch. "
                 "Nothing from this call was applied. Inspect the saved pipeline and repair the refused prerequisite "
                 "in a new turn before retrying this dependent change.",
                 error_code="batch_dependency_refused",
                 rejected_component=None,
+                catalog=ctx.policy_catalog,
             )
-            blocked = finalize_tool_result(
+            blocked = await ctx.policy_catalog.run_in_worker(
+                finalize_tool_result,
                 blocked,
                 tool_name=tool_name,
                 catalog=ctx.policy_catalog,
                 context=ToolContext(catalog=ctx.policy_catalog, plugin_snapshot=ctx.plugin_snapshot),
-                prior_validation=last_validation or ctx.policy_catalog.validate_composition_state(state).validation,
+                prior_validation=(await ctx.policy_catalog.validate_composition_state_async(state)).validation,
             )
             recorder.record(finish_success(audit, result_payload=blocked.to_dict(), version_after=state.version))
             _append_tool_outcome(response=blocked, error_class=None, error_category=None, error_message=None, post_version=state.version)
@@ -1606,7 +1613,7 @@ async def run_tool_batch(
                 try:
                     cached_admitted = (
                         await _await_started_tool_stage(
-                            run_sync_in_worker(
+                            ctx.policy_catalog.run_in_worker(
                                 admitted_result_from_cached_discovery_payload,
                                 tool_name,
                                 state,
@@ -1623,7 +1630,7 @@ async def run_tool_batch(
                         cached_admitted.result
                         if cached_admitted is not None
                         else await _await_started_tool_stage(
-                            run_sync_in_worker(
+                            ctx.policy_catalog.run_in_worker(
                                 _result_from_cached_discovery_payload,
                                 state,
                                 discovery_cache[cache_key],
@@ -1633,7 +1640,9 @@ async def run_tool_batch(
                             recorder=recorder,
                         )
                     )
-                    cached_result = normalize_tool_result_validation(cached_result, ctx.policy_catalog)
+                    cached_result = await ctx.policy_catalog.run_in_worker(
+                        normalize_tool_result_validation, cached_result, ctx.policy_catalog
+                    )
                     if cached_admitted is not None:
                         cached_admitted = AdmittedDiscoveryResult(cached_result, cached_admitted.response, cached_admitted.contract)
                     cached_payload = {
@@ -1769,9 +1778,7 @@ async def run_tool_batch(
         # an internal one merely by attempting finalization.
         if tool_name == "set_pipeline" and not explicit_approval_required:
             try:
-                candidate_prior_validation = (
-                    last_validation if last_validation is not None else ctx.policy_catalog.validate_composition_state(state).validation
-                )
+                candidate_prior_validation = (await ctx.policy_catalog.validate_composition_state_async(state)).validation
                 candidate_context = ToolContext(
                     catalog=ctx.policy_catalog,
                     plugin_snapshot=ctx.plugin_snapshot,
@@ -1874,11 +1881,7 @@ async def run_tool_batch(
                     redacted_arguments = None
                 else:
                     try:
-                        candidate_prior_validation = (
-                            last_validation
-                            if last_validation is not None
-                            else ctx.policy_catalog.validate_composition_state(state).validation
-                        )
+                        candidate_prior_validation = (await ctx.policy_catalog.validate_composition_state_async(state)).validation
                         candidate_context = ToolContext(
                             catalog=ctx.policy_catalog,
                             plugin_snapshot=ctx.plugin_snapshot,
@@ -1928,7 +1931,8 @@ async def run_tool_batch(
                                 semantic=True,
                             )
                             interpretation_requirements_are_internal = True
-                        finalized_candidate_result = finalize_tool_result(
+                        finalized_candidate_result = await ctx.policy_catalog.run_in_worker(
+                            finalize_tool_result,
                             candidate.result,
                             tool_name=tool_name,
                             catalog=ctx.policy_catalog,
@@ -1979,7 +1983,8 @@ async def run_tool_batch(
                             )
                             if custody_outcome == "quota_exceeded":
                                 proposal_acceptable = False
-                                finalized_candidate_result = finalize_tool_result(
+                                finalized_candidate_result = await ctx.policy_catalog.run_in_worker(
+                                    finalize_tool_result,
                                     _candidate_rejection_result(
                                         state,
                                         "Session blob quota exceeded while reserving inline proposal custody.",
@@ -1993,13 +1998,14 @@ async def run_tool_batch(
                                 )
                             else:
                                 pipeline_custody_result = "ready"
-                                candidate = await run_sync_in_worker(
+                                candidate = await ctx.policy_catalog.run_in_worker(
                                     build_set_pipeline_candidate,
                                     arguments,
                                     state,
                                     safe_candidate_context,
                                 )
-                                finalized_candidate_result = finalize_tool_result(
+                                finalized_candidate_result = await ctx.policy_catalog.run_in_worker(
+                                    finalize_tool_result,
                                     candidate.result,
                                     tool_name=tool_name,
                                     catalog=ctx.policy_catalog,
@@ -2078,7 +2084,7 @@ async def run_tool_batch(
             proposal_redacted_arguments = redacted_arguments
             if redacted_arguments is not None and tool_name in _MUTATION_TOOLS and tool_name != "set_pipeline":
                 try:
-                    preview_result = await run_sync_in_worker(
+                    preview_result = await ctx.policy_catalog.run_in_worker(
                         execute_tool,
                         tool_name,
                         arguments,
@@ -2112,14 +2118,14 @@ async def run_tool_batch(
                         and preview_result.updated_state.version > state.version
                         and preview_result.validation.is_valid
                     ):
-                        finalized_state = await run_sync_in_worker(
+                        finalized_state = await ctx.policy_catalog.run_in_worker(
                             wire_required_controls_state,
                             preview_result.updated_state,
                             ctx.plugin_snapshot,
                             ctx.policy_catalog,
                         )
                         if finalized_state is not preview_result.updated_state:
-                            finalized_validation = await run_sync_in_worker(
+                            finalized_validation = await ctx.policy_catalog.run_in_worker(
                                 ctx.policy_catalog.validate_composition_state,
                                 finalized_state,
                             )
@@ -2224,15 +2230,7 @@ async def run_tool_batch(
                 proposal_result = ToolResult(
                     success=True,
                     updated_state=state,
-                    validation=(
-                        candidate_prior_validation
-                        if candidate_prior_validation is not None
-                        else (
-                            last_validation
-                            if last_validation is not None
-                            else ctx.policy_catalog.validate_composition_state(state).validation
-                        )
-                    ),
+                    validation=(await ctx.policy_catalog.validate_composition_state_async(state)).validation,
                     affected_nodes=(),
                     # Built inline and never bound to a name, so nothing stands between
                     # construction and the freeze in ``ToolResult.__post_init__``: there is no
@@ -2749,7 +2747,7 @@ async def run_tool_batch(
         #
         # ``_SESSION_AWARE_TOOL_HANDLERS`` holds handlers that AWAIT
         # session-service writers/readers; they cannot be dispatched
-        # through the sync ``run_sync_in_worker(execute_tool, ...)``
+        # through the policy view's owned ``run_in_worker(execute_tool, ...)``
         # path because execute_tool() is sync. The compose loop
         # intercepts these tool names BEFORE the generic dispatch
         # and awaits the handler directly, then routes the result
@@ -3027,7 +3025,7 @@ async def run_tool_batch(
                 raise _preproposal_exception
             if _prevalidated_unapplied_result is not None:
                 return _prevalidated_unapplied_result
-            dispatched_result = await run_sync_in_worker(
+            dispatched_result = await ctx.policy_catalog.run_in_worker(
                 execute_tool,
                 _tool_name,
                 _arguments,

@@ -253,6 +253,7 @@ class SessionToolOwner:
             tool_call_id=tool_call_id,
             composer_model_version=composer_model_version,
             session_operation_context=session_operation_context,
+            policy_catalog=policy_catalog,
         )
 
         try:
@@ -263,7 +264,7 @@ class SessionToolOwner:
                 result = ToolResult(
                     success=False,
                     updated_state=state,
-                    validation=policy_catalog.validate_composition_state(state).validation,
+                    validation=(await policy_catalog.validate_composition_state_async(state)).validation,
                     affected_nodes=(),
                     runtime_preflight=review_preflight,
                     data={
@@ -354,7 +355,7 @@ class SessionToolOwner:
                 post_version=state.version,
             )
 
-        result = normalize_tool_result_validation(result, policy_catalog)
+        result = await policy_catalog.run_in_worker(normalize_tool_result_validation, result, policy_catalog)
 
         # SUCCESS path. The handler returned a clean ToolResult; record
         # ``finish_success`` and serialise the result for the LLM. The
@@ -404,6 +405,7 @@ class SessionToolOwner:
         tool_call_id: str,
         composer_model_version: str,
         session_operation_context: SessionOperationContext | None,
+        policy_catalog: PolicyCatalogView | None = None,
     ) -> dict[str, Any]:
         """Build the kwarg dict for a session-aware tool handler.
 
@@ -443,6 +445,7 @@ class SessionToolOwner:
                 "composer_skill_hash": self._composer_skill_hash,
                 "create_pending_interpretation_event": create_pending,
                 "list_interpretation_events": sessions_service.list_interpretation_events,
+                "catalog": policy_catalog,
             }
         # Defensive: a session-aware tool registered without a kwarg
         # branch here would silently fail at dispatch. Crash loudly so

@@ -68,6 +68,7 @@ from elspeth.web.blobs.service import (
     content_hash,
     sanitize_filename,
 )
+from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer._attachment_response import READ_ATTACHMENT_RESPONSE_CONTRACT
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.redaction import (
@@ -123,6 +124,7 @@ def _credential_safe_blob_discovery_result(
     payload: Any,
     *,
     surface: str,
+    catalog: PolicyCatalogView | None = None,
 ) -> ToolResult | None:
     """Return a fixed tool refusal when legacy blob output is unsafe."""
     try:
@@ -132,6 +134,7 @@ def _credential_safe_blob_discovery_result(
             state,
             CREDENTIAL_REFUSAL_DETAIL,
             error_code="credential_material_rejected",
+            catalog=catalog,
         )
     return None
 
@@ -593,12 +596,12 @@ def _handle_list_blobs(
     session_engine = context.session_engine
     session_id = context.session_id
     if session_engine is None or session_id is None:
-        return _failure_result(state, "Blob tools require session context.")
+        return _failure_result(state, "Blob tools require session context.", catalog=context.catalog)
     blobs = _sync_list_blobs(session_engine, session_id)
-    refusal = _credential_safe_blob_discovery_result(state, blobs, surface="composer_blob_metadata")
+    refusal = _credential_safe_blob_discovery_result(state, blobs, surface="composer_blob_metadata", catalog=context.catalog)
     if refusal is not None:
         return refusal
-    return _discovery_result(state, blobs)
+    return _discovery_result(state, blobs, catalog=context.catalog)
 
 
 _LIST_BLOBS_DECLARATION = ToolDeclaration(
@@ -629,16 +632,17 @@ def _handle_list_composer_blobs(
     session_engine = context.session_engine
     session_id = context.session_id
     if session_engine is None or session_id is None:
-        return _failure_result(state, "Blob tools require session context.")
+        return _failure_result(state, "Blob tools require session context.", catalog=context.catalog)
     payload = {"blobs": _sync_list_ready_blob_inline_descriptors(session_engine, session_id)}
     refusal = _credential_safe_blob_discovery_result(
         state,
         payload,
         surface="composer_blob_metadata",
+        catalog=context.catalog,
     )
     if refusal is not None:
         return refusal
-    return _discovery_result(state, payload)
+    return _discovery_result(state, payload, catalog=context.catalog)
 
 
 _LIST_COMPOSER_BLOBS_DECLARATION = ToolDeclaration(
@@ -664,13 +668,13 @@ def _handle_get_blob_metadata(
     session_engine = context.session_engine
     session_id = context.session_id
     if session_engine is None or session_id is None:
-        return _failure_result(state, "Blob tools require session context.")
+        return _failure_result(state, "Blob tools require session context.", catalog=context.catalog)
     blob_id_error = _blob_id_uuid_validation_error(validated.blob_id)
     if blob_id_error is not None:
-        return _failure_result(state, blob_id_error)
+        return _failure_result(state, blob_id_error, catalog=context.catalog)
     blob = _sync_get_blob(session_engine, validated.blob_id, session_id)
     if blob is None:
-        return _failure_result(state, "Blob not found for this session.")
+        return _failure_result(state, "Blob not found for this session.", catalog=context.catalog)
     safe_blob: BlobMetadataPayload = {
         "id": blob["id"],
         "filename": blob["filename"],
@@ -679,10 +683,10 @@ def _handle_get_blob_metadata(
         "content_hash": blob["content_hash"],
         "status": blob["status"],
     }
-    refusal = _credential_safe_blob_discovery_result(state, safe_blob, surface="composer_blob_metadata")
+    refusal = _credential_safe_blob_discovery_result(state, safe_blob, surface="composer_blob_metadata", catalog=context.catalog)
     if refusal is not None:
         return refusal
-    return _discovery_result(state, safe_blob)
+    return _discovery_result(state, safe_blob, catalog=context.catalog)
 
 
 _GET_BLOB_METADATA_DECLARATION = ToolDeclaration(
@@ -1011,12 +1015,12 @@ def _execute_wire_blob_inline_ref(
     session_engine = context.session_engine
     session_id = context.session_id
     if session_engine is None or session_id is None:
-        return _failure_result(state, "Blob tools require session context.")
+        return _failure_result(state, "Blob tools require session context.", catalog=context.catalog)
 
     field_path = validated.field_path
     blob_id_error = _blob_id_uuid_validation_error(validated.blob_id)
     if blob_id_error is not None:
-        return _failure_result(state, blob_id_error)
+        return _failure_result(state, blob_id_error, catalog=context.catalog)
     blob_id = UUID(validated.blob_id)
 
     # The argument model validates ContentEncoding and defaults absence to utf-8.
@@ -1024,9 +1028,9 @@ def _execute_wire_blob_inline_ref(
 
     blob = _sync_get_blob(session_engine, str(blob_id), session_id)
     if blob is None:
-        return _failure_result(state, f"Blob '{blob_id}' not found.")
+        return _failure_result(state, f"Blob '{blob_id}' not found.", catalog=context.catalog)
     if blob["status"] != "ready":
-        return _failure_result(state, f"Blob '{blob_id}' is not ready (status: {blob['status']}).")
+        return _failure_result(state, f"Blob '{blob_id}' is not ready (status: {blob['status']}).", catalog=context.catalog)
     pinned_hash = blob["content_hash"]
     if pinned_hash is None:
         raise AuditIntegrityError(f"Ready blob '{blob_id}' has null content_hash; cannot author inline_content ref")
@@ -1039,7 +1043,7 @@ def _execute_wire_blob_inline_ref(
             encoding=encoding,
         )
     except ValueError as exc:
-        return _failure_result(state, f"Invalid field_path for inline blob ref: {exc}")
+        return _failure_result(state, f"Invalid field_path for inline blob ref: {exc}", catalog=context.catalog)
 
     prompt_surface_error = _llm_authored_prompt_surface_error(
         state,
@@ -1048,7 +1052,7 @@ def _execute_wire_blob_inline_ref(
         creation_modality=CreationModality(blob["creation_modality"]),
     )
     if prompt_surface_error is not None:
-        return _failure_result(state, prompt_surface_error)
+        return _failure_result(state, prompt_surface_error, catalog=context.catalog)
 
     marker: dict[str, Any] = {
         "blob_ref": str(blob_id),
@@ -1061,7 +1065,7 @@ def _execute_wire_blob_inline_ref(
     try:
         new_state = _apply_inline_blob_marker(state, ref.field_path, marker)
     except ValueError as exc:
-        return _failure_result(state, str(exc))
+        return _failure_result(state, str(exc), catalog=context.catalog)
     canonical_error = _composition_canonical_interpretation_requirement_error(
         new_state,
         tool_name="wire_blob_inline_ref",
@@ -1071,10 +1075,11 @@ def _execute_wire_blob_inline_ref(
             state,
             canonical_error,
             error_code="interpretation_requirements_invalid",
+            catalog=context.catalog,
         )
     endpoint_policy_error = _inline_blob_endpoint_policy_error(new_state, ref.field_path)
     if endpoint_policy_error is not None:
-        return _failure_result(state, endpoint_policy_error)
+        return _failure_result(state, endpoint_policy_error, catalog=context.catalog)
     # The marker rewrites the component's options in place, so a resolved
     # review whose artifact covers the wired field must reopen (or the edit is
     # refused here) — the same post-mutation invariant splice_transform and the
@@ -1087,6 +1092,7 @@ def _execute_wire_blob_inline_ref(
             state,
             review_reconciliation_failure_message(exc, retry_hint="Re-inspect the pipeline and retry."),
             error_code="review_reconciliation_failed",
+            catalog=context.catalog,
         )
     canonical_error = _composition_canonical_interpretation_requirement_error(
         reconciled,
@@ -1097,8 +1103,11 @@ def _execute_wire_blob_inline_ref(
             state,
             canonical_error,
             error_code="interpretation_requirements_invalid",
+            catalog=context.catalog,
         )
-    return _mutation_result(reconciled, _affected_component_for_inline_field_path(ref.field_path), data={"field_path": ref.field_path})
+    return _mutation_result(
+        reconciled, _affected_component_for_inline_field_path(ref.field_path), data={"field_path": ref.field_path}, catalog=context.catalog
+    )
 
 
 _WIRE_BLOB_INLINE_REF_DECLARATION = ToolDeclaration(
@@ -1585,9 +1594,9 @@ def _execute_create_blob(
     session_engine = context.session_engine
     session_id = context.session_id
     if session_engine is None or session_id is None:
-        return _failure_result(state, "Blob tools require session context.")
+        return _failure_result(state, "Blob tools require session context.", catalog=context.catalog)
     if context.data_dir is None:
-        return _failure_result(state, "Blob tools require data_dir for storage.")
+        return _failure_result(state, "Blob tools require data_dir for storage.", catalog=context.catalog)
 
     try:
         validated = CreateBlobArgumentsModel.model_validate(arguments)
@@ -1647,9 +1656,9 @@ def _execute_create_blob(
         session_operation_authority=context.session_operation_authority,
     )
     if quota_error is not None:
-        return _failure_result(state, quota_error)
+        return _failure_result(state, quota_error, catalog=context.catalog)
 
-    return _discovery_result(state, _blob_create_payload(prepared))
+    return _discovery_result(state, _blob_create_payload(prepared), catalog=context.catalog)
 
 
 _CREATE_BLOB_DECLARATION = ToolDeclaration(
@@ -1701,9 +1710,9 @@ def _execute_update_blob(
     from elspeth.web.coordination.repository import SessionDerivedCustodyError
 
     if context.session_engine is None or context.session_id is None:
-        return _failure_result(state, "Blob tools require session context.")
+        return _failure_result(state, "Blob tools require session context.", catalog=context.catalog)
     if context.data_dir is None:
-        return _failure_result(state, "Blob tools require data_dir for storage.")
+        return _failure_result(state, "Blob tools require data_dir for storage.", catalog=context.catalog)
     try:
         validated = UpdateBlobArgumentsModel.model_validate(arguments)
     except PydanticValidationError as exc:
@@ -1715,7 +1724,7 @@ def _execute_update_blob(
         ) from exc
     blob_id_error = _blob_id_uuid_validation_error(validated.blob_id)
     if blob_id_error is not None:
-        return _failure_result(state, blob_id_error)
+        return _failure_result(state, blob_id_error, catalog=context.catalog)
     try:
         content_bytes = validated.content.encode("utf-8")
     except UnicodeEncodeError as exc:
@@ -1742,6 +1751,7 @@ def _execute_update_blob(
             return _failure_result(
                 state,
                 f"Blob '{validated.blob_id}' is referenced by the current composition and cannot be updated; unbind it first.",
+                catalog=context.catalog,
             )
         replacement = replace(
             expected,
@@ -1764,9 +1774,9 @@ def _execute_update_blob(
             accepting_proposal_id=UUID(context.executing_proposal_id) if context.executing_proposal_id is not None else None,
         )
     except SessionDerivedCustodyError:
-        return _failure_result(state, f"Blob '{validated.blob_id}' not found.")
+        return _failure_result(state, f"Blob '{validated.blob_id}' not found.", catalog=context.catalog)
     except (BlobActiveRunError, BlobPendingProposalError, BlobInProgressForkError, BlobQuotaExceededError, BlobStateError) as exc:
-        return _failure_result(state, str(exc))
+        return _failure_result(state, str(exc), catalog=context.catalog)
     return _discovery_result(
         state,
         {
@@ -1776,6 +1786,7 @@ def _execute_update_blob(
             "size_bytes": result.size_bytes,
             "content_hash": result.content_hash,
         },
+        catalog=context.catalog,
     )
 
 
@@ -1816,13 +1827,13 @@ def _execute_delete_blob(
     from elspeth.web.coordination.repository import SessionDerivedCustodyError
 
     if context.session_engine is None or context.session_id is None:
-        return _failure_result(state, "Blob tools require session context.")
+        return _failure_result(state, "Blob tools require session context.", catalog=context.catalog)
     if context.data_dir is None:
-        return _failure_result(state, "Blob tools require data_dir for storage.")
+        return _failure_result(state, "Blob tools require data_dir for storage.", catalog=context.catalog)
     blob_id = validated.blob_id
     blob_id_error = _blob_id_uuid_validation_error(blob_id)
     if blob_id_error is not None:
-        return _failure_result(state, blob_id_error)
+        return _failure_result(state, blob_id_error, catalog=context.catalog)
     authority, operation = _require_blob_tool_authority(context)
     service = BlobServiceImpl(
         context.session_engine,
@@ -1844,6 +1855,7 @@ def _execute_delete_blob(
             return _failure_result(
                 state,
                 f"Blob '{blob_id}' is referenced by the current composition and cannot be deleted; unbind it first.",
+                catalog=context.catalog,
             )
         try:
             service._delete_blob_with_ledger(
@@ -1852,8 +1864,8 @@ def _execute_delete_blob(
                 accepting_proposal_id=UUID(context.executing_proposal_id) if context.executing_proposal_id is not None else None,
             )
         except (BlobNotFoundError, BlobActiveRunError, BlobPendingProposalError, BlobInProgressForkError) as exc:
-            return _failure_result(state, str(exc))
-    return _discovery_result(state, {"blob_id": blob_id, "deleted": True})
+            return _failure_result(state, str(exc), catalog=context.catalog)
+    return _discovery_result(state, {"blob_id": blob_id, "deleted": True}, catalog=context.catalog)
 
 
 _DELETE_BLOB_DECLARATION = ToolDeclaration(
@@ -2006,13 +2018,13 @@ def _execute_get_blob_content(
     session_engine = context.session_engine
     session_id = context.session_id
     if session_engine is None or session_id is None:
-        return _failure_result(state, "Blob tools require session context.")
+        return _failure_result(state, "Blob tools require session context.", catalog=context.catalog)
 
     validated = _validate_mutation_arguments(GetBlobContentArgumentsModel, arguments, "get_blob_content arguments")
     blob_id = validated.blob_id
     blob_id_error = _blob_id_uuid_validation_error(blob_id)
     if blob_id_error is not None:
-        return _failure_result(state, blob_id_error)
+        return _failure_result(state, blob_id_error, catalog=context.catalog)
     # Guards 1 + 2 (lifecycle, integrity) run inside the same-session
     # custody lock so the row and the bytes are one version — a read
     # racing update/delete must block rather than pair the old committed
@@ -2026,17 +2038,18 @@ def _execute_get_blob_content(
         session_operation_authority=context.session_operation_authority,
     )
     if blob is None:
-        return _failure_result(state, f"Blob '{blob_id}' not found.")
+        return _failure_result(state, f"Blob '{blob_id}' not found.", catalog=context.catalog)
 
     blob_status = blob["status"]
     if blob_status != "ready":
         return _failure_result(
             state,
             f"Blob '{blob_id}' is not readable — status is '{blob_status}', expected 'ready'.",
+            catalog=context.catalog,
         )
 
     if data is None:
-        return _failure_result(state, f"Blob storage file missing for '{blob_id}'.")
+        return _failure_result(state, f"Blob storage file missing for '{blob_id}'.", catalog=context.catalog)
 
     # Guard 3 — decode safety.  Non-UTF-8 bytes are a Tier-3 external
     # input condition (the operator supplied content in an encoding we
@@ -2049,17 +2062,18 @@ def _execute_get_blob_content(
         return _failure_result(
             state,
             f"Blob '{blob_id}' is not valid UTF-8 text ({exc.reason} at byte offset {exc.start}).",
+            catalog=context.catalog,
         )
 
     verified_hash = blob["content_hash"]
     if verified_hash is None:
         raise AuditIntegrityError("Ready blob content has no verified hash")
     if validated.expected_content_hash is not None and not hmac.compare_digest(validated.expected_content_hash, verified_hash):
-        return _failure_result(state, "Blob content changed; restart inspection with its current content hash.")
+        return _failure_result(state, "Blob content changed; restart inspection with its current content hash.", catalog=context.catalog)
     total_chars = len(content)
     start_char = validated.offset_chars
     if start_char > total_chars:
-        return _failure_result(state, "Blob content offset exceeds its decoded character length.")
+        return _failure_result(state, "Blob content offset exceeds its decoded character length.", catalog=context.catalog)
 
     payload: AttachmentContentPayload = {
         "blob_id": blob_id,
@@ -2081,13 +2095,13 @@ def _execute_get_blob_content(
     }
     # Inspect the FULL decoded content before slicing. Otherwise credentials
     # beyond or across a page seam could leak through a successful prefix.
-    refusal = _credential_safe_blob_discovery_result(state, payload, surface="composer_blob_content")
+    refusal = _credential_safe_blob_discovery_result(state, payload, surface="composer_blob_content", catalog=context.catalog)
     if refusal is not None:
         return refusal
 
     from elspeth.web.composer.discovery_response import admit_discovery_result, serialize_admitted_discovery_result
 
-    result = _discovery_result(state, payload)
+    result = _discovery_result(state, payload, catalog=context.catalog)
 
     def page(end_char: int) -> tuple[ToolResult, int]:
         page_payload: AttachmentContentPayload = {
@@ -2130,7 +2144,7 @@ def _execute_get_blob_content(
         else:
             high = middle - 1
     if best is None:
-        return _failure_result(state, "Blob page cannot fit the bounded tool response; no content was returned.")
+        return _failure_result(state, "Blob page cannot fit the bounded tool response; no content was returned.", catalog=context.catalog)
     return best
 
 
@@ -2177,12 +2191,12 @@ def _execute_read_attachment(arguments: dict[str, Any], state: CompositionState,
     session_engine = context.session_engine
     session_id = context.session_id
     if session_engine is None or session_id is None:
-        return _failure_result(state, "Blob tools require session context.")
+        return _failure_result(state, "Blob tools require session context.", catalog=context.catalog)
     validated = _validate_mutation_arguments(ReadAttachmentArgumentsModel, arguments, "read_attachment arguments")
     blob_id = validated.blob_id
     blob_id_error = _blob_id_uuid_validation_error(blob_id)
     if blob_id_error is not None:
-        return _failure_result(state, blob_id_error)
+        return _failure_result(state, blob_id_error, catalog=context.catalog)
     blob, data = _locked_read_ready_blob(
         session_engine,
         session_id,
@@ -2192,27 +2206,32 @@ def _execute_read_attachment(arguments: dict[str, Any], state: CompositionState,
         session_operation_authority=context.session_operation_authority,
     )
     if blob is None:
-        return _failure_result(state, f"Blob '{blob_id}' not found.")
+        return _failure_result(state, f"Blob '{blob_id}' not found.", catalog=context.catalog)
     if blob["status"] != "ready":
-        return _failure_result(state, f"Blob '{blob_id}' is not readable — status is '{blob['status']}', expected 'ready'.")
+        return _failure_result(
+            state, f"Blob '{blob_id}' is not readable — status is '{blob['status']}', expected 'ready'.", catalog=context.catalog
+        )
     if data is None:
-        return _failure_result(state, f"Blob storage file missing for '{blob_id}'.")
+        return _failure_result(state, f"Blob storage file missing for '{blob_id}'.", catalog=context.catalog)
     if len(data) > READ_ATTACHMENT_MAX_UTF8_BYTES:
         return _failure_result(
             state,
             f"The attachment is {len(data)} bytes, exceeding the current {READ_ATTACHMENT_MAX_UTF8_BYTES}-byte "
             "whole-input credential inspection limit. Neither read_attachment nor get_blob_content can disclose it "
             "under that limit; no content was returned.",
+            catalog=context.catalog,
         )
     try:
         content = data.decode("utf-8")
     except UnicodeDecodeError as exc:
-        return _failure_result(state, f"Blob '{blob_id}' is not valid UTF-8 text ({exc.reason} at byte offset {exc.start}).")
+        return _failure_result(
+            state, f"Blob '{blob_id}' is not valid UTF-8 text ({exc.reason} at byte offset {exc.start}).", catalog=context.catalog
+        )
     verified_hash = blob["content_hash"]
     if verified_hash is None:
         raise AuditIntegrityError("Ready blob content has no verified hash")
     if validated.expected_content_hash is not None and not hmac.compare_digest(validated.expected_content_hash, verified_hash):
-        return _failure_result(state, "Blob content changed; restart inspection with its current content hash.")
+        return _failure_result(state, "Blob content changed; restart inspection with its current content hash.", catalog=context.catalog)
     payload: AttachmentContentPayload = {
         "blob_id": blob_id,
         "filename": blob["filename"],
@@ -2228,18 +2247,19 @@ def _execute_read_attachment(arguments: dict[str, Any], state: CompositionState,
         "end_char": len(content),
         "next_offset_chars": None,
     }
-    refusal = _credential_safe_blob_discovery_result(state, payload, surface="composer_read_attachment")
+    refusal = _credential_safe_blob_discovery_result(state, payload, surface="composer_read_attachment", catalog=context.catalog)
     if refusal is not None:
         return refusal
     from elspeth.web.composer.discovery_response import admit_discovery_result, serialize_admitted_discovery_result
 
-    result = _discovery_result(state, payload)
+    result = _discovery_result(state, payload, catalog=context.catalog)
     encoded = serialize_admitted_discovery_result(admit_discovery_result("read_attachment", result))
     if len(encoded.encode("utf-8")) > READ_ATTACHMENT_MAX_UTF8_BYTES:
         return _failure_result(
             state,
             f"The attachment's complete serialized response exceeds {READ_ATTACHMENT_MAX_UTF8_BYTES} UTF-8 bytes; "
             "no content was returned. Use get_blob_content for selected pages.",
+            catalog=context.catalog,
         )
     return result
 

@@ -22,6 +22,7 @@ from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.composer import yaml_generator
+from elspeth.web.composer.analysis import ComposerAnalysis
 from elspeth.web.composer.application_policy import PluginPolicyContextFactory
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.discovery_cache import RuntimePreflightCache
@@ -309,6 +310,7 @@ class ComposerPreflight:
         recorder: BufferingRecorder,
         plugin_snapshot: PluginAvailabilitySnapshot | None = None,
         session_operation_context: SessionOperationContext | None = None,
+        analysis: ComposerAnalysis | None = None,
     ) -> ValidationResult | None:
         """A turn's deterministic verdict; structurally empty states are absent."""
         if state_is_structurally_empty(state):
@@ -324,6 +326,7 @@ class ComposerPreflight:
             llm_calls=recorder.llm_calls,
             plugin_snapshot=plugin_snapshot,
             session_operation_context=session_operation_context,
+            analysis=analysis,
         )
 
     async def reuse_or_recompute_runtime_preflight(
@@ -339,6 +342,7 @@ class ComposerPreflight:
         llm_calls: tuple[ComposerLLMCall, ...],
         plugin_snapshot: PluginAvailabilitySnapshot | None,
         session_operation_context: SessionOperationContext | None = None,
+        analysis: ComposerAnalysis | None = None,
     ) -> ValidationResult | None:
         """The shared reuse rule for completion, repair, and advisor gates."""
         if state.version > initial_version:
@@ -367,16 +371,19 @@ class ComposerPreflight:
                 plugin_snapshot=plugin_snapshot,
                 session_operation_context=session_operation_context,
             )
-        if state.sources and state.outputs and not state.validate().is_valid:
-            return await self.cached_runtime_preflight(
-                state,
-                user_id=user_id,
-                session_id=session_id,
-                cache=runtime_preflight_cache,
-                initial_version=initial_version,
-                session_scope=session_scope,
-                llm_calls=llm_calls,
-                plugin_snapshot=plugin_snapshot,
-                session_operation_context=session_operation_context,
-            )
+        if state.sources and state.outputs:
+            raw_analysis = ComposerAnalysis() if analysis is None else analysis
+            authored_validation = await raw_analysis.validate_raw_async(state)
+            if not authored_validation.is_valid:
+                return await self.cached_runtime_preflight(
+                    state,
+                    user_id=user_id,
+                    session_id=session_id,
+                    cache=runtime_preflight_cache,
+                    initial_version=initial_version,
+                    session_scope=session_scope,
+                    llm_calls=llm_calls,
+                    plugin_snapshot=plugin_snapshot,
+                    session_operation_context=session_operation_context,
+                )
         return None

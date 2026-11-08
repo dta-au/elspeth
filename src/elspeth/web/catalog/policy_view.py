@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING
 
 from elspeth.contracts.plugin_capabilities import PluginCapability
@@ -13,7 +13,8 @@ from elspeth.web.plugin_policy.profiles import LoweredPluginConfig, OperatorProf
 
 if TYPE_CHECKING:
     from elspeth.contracts.plugin_assistance import PluginAssistance
-    from elspeth.web.composer.state import CompositionState
+    from elspeth.web.composer.analysis import ComposerAnalysis
+    from elspeth.web.composer.state import CompositionState, ValidationSummary
     from elspeth.web.plugin_policy.validation import PluginPolicyValidationResult, ProfileAwareValidationResult
 
 
@@ -23,10 +24,15 @@ class PolicyCatalogView:
         full: CatalogService,
         snapshot: PluginAvailabilitySnapshot,
         profiles: OperatorProfileRegistry,
+        *,
+        analysis: ComposerAnalysis | None = None,
     ) -> None:
+        from elspeth.web.composer.analysis import ComposerAnalysis
+
         self._full = full
         self.snapshot = snapshot
         self._profiles: OperatorProfileRegistry | None = profiles
+        self._analysis = analysis if analysis is not None else ComposerAnalysis()
         self._full_items_cache: dict[PluginKind, list[PluginSummary]] = {}
 
     @classmethod
@@ -34,16 +40,39 @@ class PolicyCatalogView:
         cls,
         full: CatalogService,
         snapshot: PluginAvailabilitySnapshot,
+        *,
+        analysis: ComposerAnalysis | None = None,
     ) -> PolicyCatalogView:
         """Return the explicit full-catalog projection for the local MCP."""
         if not snapshot.is_trained_operator:
             raise ValueError("trained_operator_snapshot_required")
+        from elspeth.web.composer.analysis import ComposerAnalysis
+
         view = cls.__new__(cls)
         view._full = full
         view.snapshot = snapshot
         view._profiles = None
+        view._analysis = analysis if analysis is not None else ComposerAnalysis()
         view._full_items_cache = {}
         return view
+
+    @property
+    def analysis(self) -> ComposerAnalysis:
+        """The explicitly bound operation facade, uncached by default."""
+        return self._analysis
+
+    def with_analysis(self, analysis: ComposerAnalysis) -> PolicyCatalogView:
+        """Bind another request-owned view without mutating this projection."""
+        if self._profiles is None:
+            return type(self).for_trained_operator(self._full, self.snapshot, analysis=analysis)
+        return type(self)(self._full, self.snapshot, self._profiles, analysis=analysis)
+
+    def validate_raw_state(self, state: CompositionState) -> ValidationSummary:
+        return self._analysis.validate_raw(state)
+
+    async def run_in_worker[**P, T](self, func: Callable[P, T], *args: P.args, **kwargs: P.kwargs) -> T:
+        """Run captured policy/tool work with actual session-owner lifetime."""
+        return await self._analysis.run_in_worker(func, *args, **kwargs)
 
     def _full_items(self, kind: PluginKind) -> list[PluginSummary]:
         """Return this kind's unrestricted catalog listing, fetched at most once per view.
@@ -246,6 +275,10 @@ class PolicyCatalogView:
             catalog=self._full,
         )
 
+    async def validate_composition_state_async(self, state: CompositionState) -> ProfileAwareValidationResult:
+        """Keep fresh policy, lowering and graph CPU off the event loop."""
+        return await self.run_in_worker(self.validate_composition_state, state)
+
     def validate_composition_state(self, state: CompositionState) -> ProfileAwareValidationResult:
         """Return the shared authored/executable validation projection."""
         from elspeth.web.plugin_policy.validation import validate_authored_composition_state
@@ -255,6 +288,8 @@ class PolicyCatalogView:
             snapshot=self.snapshot,
             profile_registry=self._profiles,
             catalog=self._full,
+            analysis=self._analysis,
+            profile_generation=self._profiles.generation if self._profiles is not None else None,
         )
 
     def post_call_hints(

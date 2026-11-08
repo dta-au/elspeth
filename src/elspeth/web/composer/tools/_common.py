@@ -27,7 +27,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from types import MappingProxyType
-from typing import Any, Final, Literal, NotRequired, TypedDict, cast
+from typing import TYPE_CHECKING, Any, Final, Literal, NotRequired, TypedDict, cast
 
 from pydantic import BaseModel, ConfigDict, JsonValue
 from pydantic import ValidationError as PydanticValidationError
@@ -129,6 +129,9 @@ from elspeth.web.sessions.protocol import SessionOperationAuthority
 from elspeth.web.validation import (
     INTERPRETATION_PLACEHOLDER_RE,
 )
+
+if TYPE_CHECKING:
+    from elspeth.web.composer.analysis import ComposerAnalysis
 
 
 class EmptyToolArgumentsModel(BaseModel):
@@ -1137,6 +1140,7 @@ def diff_states(
     baseline: CompositionState,
     current: CompositionState,
     *,
+    analysis: ComposerAnalysis | None = None,
     baseline_validation: ValidationSummary | None = None,
     current_validation: ValidationSummary | None = None,
 ) -> dict[str, Any]:
@@ -1215,9 +1219,9 @@ def diff_states(
 
     # Validation delta — reuse pre-computed validations when available
     if baseline_validation is None:
-        baseline_validation = baseline.validate()
+        baseline_validation = baseline.validate() if analysis is None else analysis.validate_raw(baseline)
     if current_validation is None:
-        current_validation = current.validate()
+        current_validation = current.validate() if analysis is None else analysis.validate_raw(current)
     baseline_warnings = {e.message for e in baseline_validation.warnings}
     current_warnings = {e.message for e in current_validation.warnings}
     changes["warnings_introduced"] = sorted(current_warnings - baseline_warnings)
@@ -1276,9 +1280,14 @@ def _attach_post_call_hints(
     return replace(result, post_call_hints=hints)
 
 
-def _discovery_result(state: CompositionState, data: Any) -> ToolResult:
+def _discovery_result(
+    state: CompositionState,
+    data: Any,
+    *,
+    catalog: PolicyCatalogView | None = None,
+) -> ToolResult:
     """Build a result with unchanged composition state, including blob-only writes."""
-    validation = state.validate()
+    validation = state.validate() if catalog is None else catalog.validate_composition_state(state).validation
     return ToolResult(
         success=True,
         updated_state=state,
@@ -1299,6 +1308,7 @@ class _RejectionOperation(Enum):
         state: CompositionState,
         error_msg: str,
         *,
+        catalog: PolicyCatalogView | None = None,
         error_code: str,
         rejected_component: str | None,
         plugin_identity: tuple[str, str] | None = None,
@@ -1310,6 +1320,7 @@ class _RejectionOperation(Enum):
             state,
             error_msg,
             operation=self,
+            catalog=catalog,
             error_code=error_code,
             rejected_component=rejected_component,
             plugin_identity=plugin_identity,
@@ -1321,6 +1332,7 @@ def _candidate_rejection_result(
     state: CompositionState,
     error_msg: str,
     *,
+    catalog: PolicyCatalogView | None = None,
     error_code: str,
     rejected_component: str | None,
     plugin_identity: tuple[str, str] | None = None,
@@ -1330,6 +1342,7 @@ def _candidate_rejection_result(
     return _RejectionOperation.CANDIDATE.reject(
         state,
         error_msg,
+        catalog=catalog,
         error_code=error_code,
         rejected_component=rejected_component,
         plugin_identity=plugin_identity,
@@ -1341,6 +1354,7 @@ def _saved_graph_rejection_result(
     state: CompositionState,
     error_msg: str,
     *,
+    catalog: PolicyCatalogView | None = None,
     error_code: str,
     rejected_component: str | None,
     plugin_identity: tuple[str, str] | None = None,
@@ -1350,6 +1364,7 @@ def _saved_graph_rejection_result(
     return _RejectionOperation.SAVED_GRAPH.reject(
         state,
         error_msg,
+        catalog=catalog,
         error_code=error_code,
         rejected_component=rejected_component,
         plugin_identity=plugin_identity,
@@ -1361,6 +1376,7 @@ def _build_rejection_result(
     state: CompositionState,
     error_msg: str,
     *,
+    catalog: PolicyCatalogView | None = None,
     operation: _RejectionOperation,
     error_code: str | None,
     rejected_component: str | None,
@@ -1370,7 +1386,7 @@ def _build_rejection_result(
     match operation:
         case _RejectionOperation.SAVED_GRAPH:
             validation = _prepend_rejection_entry(
-                state.validate(),
+                state.validate() if catalog is None else catalog.validate_composition_state(state).validation,
                 error_msg,
                 error_code=error_code,
                 plugin_identity=plugin_identity,
@@ -1400,6 +1416,7 @@ def _failure_result(
     state: CompositionState,
     error_msg: str,
     *,
+    catalog: PolicyCatalogView | None = None,
     error_code: str | None = None,
     with_state_validation: bool = True,
     plugin_identity: tuple[str, str] | None = None,
@@ -1435,6 +1452,7 @@ def _failure_result(
         state,
         error_msg,
         operation=_RejectionOperation.SAVED_GRAPH if with_state_validation else _RejectionOperation.CANDIDATE,
+        catalog=catalog,
         error_code=error_code,
         rejected_component=rejected_component,
         plugin_identity=plugin_identity,
@@ -1713,6 +1731,7 @@ def _mutation_result(
     new_state: CompositionState,
     affected: tuple[str, ...],
     *,
+    catalog: PolicyCatalogView | None = None,
     prior_validation: ValidationSummary | None = None,
     data: Any = None,
     post_call_hints: tuple[str, ...] = (),
@@ -1737,7 +1756,7 @@ def _mutation_result(
     replace, and the model already holds those bytes verbatim in the call it
     just made.
     """
-    validation = new_state.validate()
+    validation = new_state.validate() if catalog is None else catalog.validate_composition_state(new_state).validation
     return ToolResult(
         success=True,
         updated_state=new_state,
@@ -1935,6 +1954,7 @@ def _build_credential_wiring_contract_failure(
     plugin_type: PluginKind | None = None,
     plugin_name: str | None = None,
     options: Any,
+    catalog: PolicyCatalogView | None = None,
 ) -> ToolResult | None:
     """Reject literal credentials before a mutation writes them into state.
 
@@ -2006,6 +2026,7 @@ def _build_credential_wiring_contract_failure(
         rejected_component=subject,
         plugin_identity=None,
         review_reference=None,
+        catalog=catalog,
     )
     return replace(
         result,
@@ -2040,6 +2061,7 @@ def _candidate_credential_wiring_contract_failure(
     plugin_type: PluginKind | None = None,
     plugin_name: str | None = None,
     options: Any,
+    catalog: PolicyCatalogView | None = None,
 ) -> ToolResult | None:
     """Refuse a candidate's literal credentials before storing any effect."""
     return _build_credential_wiring_contract_failure(
@@ -2051,6 +2073,7 @@ def _candidate_credential_wiring_contract_failure(
         plugin_type=plugin_type,
         plugin_name=plugin_name,
         options=options,
+        catalog=catalog,
     )
 
 
@@ -2062,6 +2085,7 @@ def _saved_graph_credential_wiring_contract_failure(
     plugin_type: PluginKind | None = None,
     plugin_name: str | None = None,
     options: Any,
+    catalog: PolicyCatalogView | None = None,
 ) -> ToolResult | None:
     """Refuse literal credentials while retaining the surviving saved graph."""
     return _build_credential_wiring_contract_failure(
@@ -2073,6 +2097,7 @@ def _saved_graph_credential_wiring_contract_failure(
         plugin_type=plugin_type,
         plugin_name=plugin_name,
         options=options,
+        catalog=catalog,
     )
 
 
@@ -2085,6 +2110,7 @@ def _credential_wiring_contract_failure(
     plugin_name: str | None = None,
     options: Any,
     with_state_validation: bool = True,
+    catalog: PolicyCatalogView | None = None,
 ) -> ToolResult | None:
     """Legacy credential operation for producer families awaiting migration."""
     return _build_credential_wiring_contract_failure(
@@ -2096,6 +2122,7 @@ def _credential_wiring_contract_failure(
         plugin_type=plugin_type,
         plugin_name=plugin_name,
         options=options,
+        catalog=catalog,
     )
 
 
@@ -2253,6 +2280,7 @@ def _plugin_policy_failure(
     component: str | None = None,
     with_state_validation: bool = True,
     rejected_component: str | None = None,
+    catalog: PolicyCatalogView | None = None,
 ) -> ToolResult:
     message = violation.message if component is None else f"{component}: {violation.message}"
     return _failure_result(
@@ -2261,6 +2289,7 @@ def _plugin_policy_failure(
         error_code=violation.error_code.value,
         with_state_validation=with_state_validation,
         rejected_component=rejected_component,
+        catalog=catalog,
     )
 
 
@@ -2270,6 +2299,7 @@ def _candidate_plugin_policy_failure(
     *,
     component: str | None,
     rejected_component: str | None,
+    catalog: PolicyCatalogView | None = None,
 ) -> ToolResult:
     message = violation.message if component is None else f"{component}: {violation.message}"
     return _candidate_rejection_result(
@@ -2277,6 +2307,7 @@ def _candidate_plugin_policy_failure(
         message,
         error_code=violation.error_code.value,
         rejected_component=rejected_component,
+        catalog=catalog,
     )
 
 
@@ -2286,6 +2317,7 @@ def _saved_graph_plugin_policy_failure(
     *,
     component: str | None,
     rejected_component: str | None,
+    catalog: PolicyCatalogView | None = None,
 ) -> ToolResult:
     message = violation.message if component is None else f"{component}: {violation.message}"
     return _saved_graph_rejection_result(
@@ -2293,6 +2325,7 @@ def _saved_graph_plugin_policy_failure(
         message,
         error_code=violation.error_code.value,
         rejected_component=rejected_component,
+        catalog=catalog,
     )
 
 
@@ -3790,6 +3823,11 @@ class ToolContext:
     executing_proposal_id: str | None = None
     _interpretation_requirements_are_internal: bool = False
 
+    @property
+    def analysis(self) -> ComposerAnalysis:
+        """Use the operation's explicitly bound analysis in synchronous tools."""
+        return self.catalog.analysis
+
 
 ToolHandler = Callable[
     [dict[str, Any], CompositionState, ToolContext],
@@ -3801,19 +3839,17 @@ def normalize_tool_result_validation(
     result: ToolResult,
     catalog: PolicyCatalogView,
 ) -> ToolResult:
-    """Normalize a result through the request-scoped profile authority once.
+    """Normalize a result through the current request's profile authority.
 
-    Handlers remain small state-transition functions and may construct their
-    provisional envelope with ``CompositionState.validate()``. Candidate
+    Handlers remain small state-transition functions and construct their
+    envelopes through the bound policy view when available. Candidate
     builders may call this authority before dispatch so they can make an
     honest accept/reject decision. The outward dispatch boundary calls it
-    again to verify the result, but reuses validation already produced for
-    the same immutable plugin-availability snapshot. A different snapshot
-    always revalidates.
+    again to verify the result. The analysis gateway reuses only summaries
+    keyed by the exact current state; policy admission and lowering stay
+    current even when a result was already normalized.
     """
     snapshot_hash = catalog.snapshot.snapshot_hash
-    if result._validation_snapshot_hash == snapshot_hash:
-        return result
     rejections = tuple(entry for entry in result.validation.errors if entry.component == "rejected_mutation")
     if rejections and result._state_validation_withheld:
         # Full-replacement rejection: updated_state is the untouched input
@@ -3923,6 +3959,8 @@ _MUTATION_BLOCKING_INVARIANT_CODES: Final[frozenset[str]] = _ROW_UNION_INTRINSIC
 
 def _post_mutation_invariant_error(
     proposed_state: CompositionState,
+    *,
+    analysis: ComposerAnalysis | None = None,
 ) -> tuple[str, str] | None:
     """Return an invariant a mutation must not persist.
 
@@ -3933,7 +3971,8 @@ def _post_mutation_invariant_error(
     contracts. Callers return the original state on failure, giving the tools
     one rollback discipline without weakening ordinary validation telemetry.
     """
-    for entry in proposed_state.validate().errors:
+    validation = proposed_state.validate() if analysis is None else analysis.validate_raw(proposed_state)
+    for entry in validation.errors:
         if entry.error_code in _MUTATION_BLOCKING_INVARIANT_CODES:
             assert entry.error_code is not None
             return entry.message, entry.error_code

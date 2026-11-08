@@ -318,9 +318,9 @@ def _handle_get_plugin_schema(
     name = validated.name
     policy_error = _plugin_selection_violation(context, plugin_type, name)
     if policy_error is not None:
-        return _saved_graph_plugin_policy_failure(state, policy_error, component=None, rejected_component=None)
+        return _saved_graph_plugin_policy_failure(state, policy_error, component=None, rejected_component=None, catalog=context.catalog)
     schema = context.catalog.get_schema(plugin_type, name)
-    return _discovery_result(state, schema)
+    return _discovery_result(state, schema, catalog=context.catalog)
 
 
 _GET_PLUGIN_SCHEMA_DECLARATION = ToolDeclaration(
@@ -385,12 +385,11 @@ def _handle_get_expression_grammar(
     context: ToolContext,
 ) -> ToolResult:
     _validate_mutation_arguments(EmptyToolArgumentsModel, arguments, "get_expression_grammar arguments")
-    del context  # unused; signature uniformity with the other handlers.
     # A closed one-key payload, not the bare reference string: ``ToolResult``
     # admits only mapping / sequence / model payloads (elspeth-e405ad7cd2,
     # D2), and a scalar was the one discovery shape that slipped past the
     # scoped gate runs until the planner suite constructed this result.
-    return _discovery_result(state, {"grammar": get_expression_grammar()})
+    return _discovery_result(state, {"grammar": get_expression_grammar()}, catalog=context.catalog)
 
 
 _GET_EXPRESSION_GRAMMAR_DECLARATION = ToolDeclaration(
@@ -2339,7 +2338,7 @@ def _execute_get_plugin_assistance(
 
     policy_error = _plugin_selection_violation(context, plugin_type, plugin_name)
     if policy_error is not None:
-        return _saved_graph_plugin_policy_failure(state, policy_error, component=None, rejected_component=None)
+        return _saved_graph_plugin_policy_failure(state, policy_error, component=None, rejected_component=None, catalog=context.catalog)
     context.catalog.get_schema(plugin_type, plugin_name)
 
     manager = get_shared_plugin_manager()
@@ -2364,7 +2363,7 @@ def _execute_get_plugin_assistance(
             "examples": [],
             "composer_hints": [],
         }
-        return _discovery_result(state, payload)
+        return _discovery_result(state, payload, catalog=context.catalog)
 
     payload = {
         "plugin_type": plugin_type,
@@ -2375,7 +2374,7 @@ def _execute_get_plugin_assistance(
         "examples": [_serialize_plugin_assistance_example(ex) for ex in assistance.examples],
         "composer_hints": list(assistance.composer_hints),
     }
-    return _discovery_result(state, payload)
+    return _discovery_result(state, payload, catalog=context.catalog)
 
 
 _GET_PLUGIN_ASSISTANCE_DECLARATION = ToolDeclaration(
@@ -2485,7 +2484,6 @@ def _execute_get_audit_info(
     never reaches the LLM context. The model paraphrases `summary`; it
     does not need the URL itself.
     """
-    del context  # unused; signature uniformity with the other handlers.
     payload = {
         "enabled": True,
         "composer_modifiable": False,
@@ -2510,7 +2508,7 @@ def _execute_get_audit_info(
             "composer is building."
         ),
     }
-    return _discovery_result(state, payload)
+    return _discovery_result(state, payload, catalog=context.catalog)
 
 
 _GET_AUDIT_INFO_DECLARATION = ToolDeclaration(
@@ -2560,7 +2558,6 @@ def _execute_list_models(
     the bundled litellm list because no per-provider live primer exists
     yet.
     """
-    del context  # unused; signature uniformity with the other handlers.
     all_models: list[str] = list(read_litellm_model_list())
 
     # ``args`` is LLM tool-call arguments (Tier 3). Both ``provider`` and
@@ -2630,7 +2627,7 @@ def _execute_list_models(
             "hint": "Use provider parameter to list models for a specific provider. An empty string key means models without a provider prefix.",
         }
 
-    return _discovery_result(state, data)
+    return _discovery_result(state, data, catalog=context.catalog)
 
 
 _LIST_MODELS_DECLARATION = ToolDeclaration(
@@ -4530,6 +4527,7 @@ def _execute_preview_pipeline(
             exc.reason,
             error_code="source_blob_identity_invalid",
             rejected_component=source_producer_id(exc.source_name),
+            catalog=context.catalog,
         )
     validation = context.catalog.validate_composition_state(state).validation
     _AUTHORING_VALIDATION_COUNTER.add(
@@ -4657,7 +4655,7 @@ def _execute_diff_pipeline(
     in hand.
     """
     baseline = context.baseline
-    current_validation = context.current_validation
+    current_validation = context.catalog.validate_composition_state(state).validation
     if baseline is None:
         # A failure, not a success carrying an ``error`` key: ``error`` is a
         # failure-only key on every surface (elspeth-e405ad7cd2 D5). The
@@ -4667,6 +4665,7 @@ def _execute_diff_pipeline(
             "No baseline available. Load or create a session first.",
             error_code="diff_baseline_unavailable",
             rejected_component=None,
+            catalog=context.catalog,
         )
 
     baseline_validation = context.catalog.validate_composition_state(baseline).validation
@@ -4675,8 +4674,9 @@ def _execute_diff_pipeline(
         state,
         baseline_validation=baseline_validation,
         current_validation=current_validation,
+        analysis=context.analysis,
     )
-    return _discovery_result(state, changes)
+    return _discovery_result(state, changes, catalog=context.catalog)
 
 
 _DIFF_PIPELINE_DECLARATION = ToolDeclaration(

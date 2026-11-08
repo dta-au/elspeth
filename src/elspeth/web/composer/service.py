@@ -82,6 +82,7 @@ from elspeth.web.composer.advisor_decision import (
     AdvisorGateDecision,
 )
 from elspeth.web.composer.advisor_transcript import AdvisorTranscriptHistory
+from elspeth.web.composer.analysis import ComposerAnalysis
 from elspeth.web.composer.anti_anchor import AntiAnchorTracker
 from elspeth.web.composer.application_policy import PluginPolicyContextFactory
 from elspeth.web.composer.audit import BufferingRecorder, ComposerToolCancellation, ComposerToolFailure
@@ -156,7 +157,7 @@ from elspeth.web.composer.recovery_controls import (
     recovery_tool_definitions,
 )
 from elspeth.web.composer.schema_disclosure import SchemaDisclosureTracker
-from elspeth.web.composer.session_cache import ComposerSessionCacheRegistry
+from elspeth.web.composer.session_cache import ComposerSessionCacheRegistry, SessionCacheKey
 from elspeth.web.composer.session_tool import SessionToolOwner
 from elspeth.web.composer.skills import assert_skill_hash_unchanged_on_disk
 from elspeth.web.composer.state import CompositionState, ValidationSummary
@@ -1228,8 +1229,12 @@ class ComposerServiceImpl:
                     return (record, raw) if record is not None and raw is not None else None
 
                 turn_evidence.transcript.use_blob_reader(read_advisor_history_blob)
-            plugin_snapshot, policy_catalog = self._policy_context.build(user_id)
+            plugin_snapshot, policy_catalog = await run_sync_in_worker(self._policy_context.build, user_id)
+            cache_lease = self._session_caches.borrow(
+                SessionCacheKey(plugin_snapshot.principal_scope, session_id) if user_id is not None and session_id is not None else None
+            )
             try:
+                policy_catalog = policy_catalog.with_analysis(ComposerAnalysis(cache_lease.cache))
                 # Route by graph/session prerequisites. The provider decides
                 # whether the request calls for authoring, explanation, or a
                 # question; user wording does not select its tool surface.
@@ -1389,6 +1394,8 @@ class ComposerServiceImpl:
                     ),
                 )
                 raise
+            finally:
+                cache_lease.close()
 
     def _enforce_tool_call_cap(
         self,
@@ -1727,6 +1734,7 @@ class ComposerServiceImpl:
         # 2026-09-22). ``None`` = none known: the END gate reviews as before.
         completion_gates: CompletionGateFacts | None = None,
         provider_owner: ProviderInvocationOwner | None = None,
+        analysis: ComposerAnalysis | None = None,
     ) -> _ClassifyOutcome:
         """Phase P5 of the compose loop — anti-anchor + turn accounting.
 
@@ -1785,6 +1793,7 @@ class ComposerServiceImpl:
                 source_stop = cast(ProofUnavailable | MalformedSourceProofClaim, assessment)
         if source_stop is not None:
             stopped = await self._completion._terminate_source_proof(
+                analysis=analysis,
                 proof=source_stop,
                 state=state,
                 assistant_message=dispatch.assistant_message,
@@ -1920,6 +1929,7 @@ class ComposerServiceImpl:
                 state.sources
                 and state.outputs
                 and await self._completion._attempt_preflight_repair(
+                    analysis=analysis,
                     state=state,
                     llm_messages=llm_messages,
                     user_id=user_id,
@@ -1962,6 +1972,7 @@ class ComposerServiceImpl:
                     raise RuntimeError("pending interpretation surfacing requires the compose operation context")
                 await self._interpretation_surfacing.surface_pending_interpretation_reviews(
                     state,
+                    analysis=analysis,
                     session_id=session_id,
                     current_state_id=persist.current_state_id,
                     session_operation_context=session_operation_context,
@@ -2036,6 +2047,7 @@ class ComposerServiceImpl:
                 if reply is not None:
                     try:
                         advisor_gate = await self._completion._evaluate_terminal_no_tool_advisor_gate(
+                            analysis=analysis,
                             state=state,
                             turn_evidence=turn_evidence,
                             session_operation_context=session_operation_context,
@@ -2085,6 +2097,7 @@ class ComposerServiceImpl:
                     result = advisor_gate.result
                 else:
                     result = await self._completion._surface_and_finalize_no_tools(
+                        analysis=analysis,
                         session_operation_context=session_operation_context,
                         assistant_message=reply if reply is not None else _AdmittedAssistantMessage(content=""),
                         state=state,
@@ -2223,6 +2236,7 @@ class ComposerServiceImpl:
                         turn_evidence.confirm_delivery(final_delivery, recorder.llm_calls)
                     try:
                         advisor_gate = await self._completion._evaluate_terminal_no_tool_advisor_gate(
+                            analysis=analysis,
                             state=state,
                             turn_evidence=turn_evidence,
                             session_operation_context=session_operation_context,
@@ -2240,6 +2254,7 @@ class ComposerServiceImpl:
                             allow_repair_continue=False,
                             user_message=message,
                             runtime_preflight=await self._preflight.turn_runtime_preflight(
+                                analysis=analysis,
                                 state=state,
                                 user_id=user_id,
                                 session_id=session_id,
@@ -2300,6 +2315,7 @@ class ComposerServiceImpl:
                     # holds. Thread the already-consumed repair budget through
                     # this alternate terminal return just as P2 does.
                     result = await self._completion._surface_and_finalize_no_tools(
+                        analysis=analysis,
                         session_operation_context=session_operation_context,
                         assistant_message=assistant_message,
                         state=state,
@@ -2453,7 +2469,8 @@ class ComposerServiceImpl:
         # still gate behind a per-instance flag so steady-state compose()
         # calls don't churn the connection pool.
         await self._maybe_upsert_skill_markdown_history()
-        llm_messages = self._build_messages(
+        llm_messages = await policy_catalog.run_in_worker(
+            self._build_messages,
             messages,
             state,
             message,
@@ -2615,6 +2632,7 @@ class ComposerServiceImpl:
                     superseded_reply_index = len(llm_messages)
                     llm_messages.append({"role": "assistant", "content": superseded_reply})
                 terminate = await self._completion._try_terminate_no_tools(
+                    analysis=policy_catalog.analysis,
                     assistant_message=call_model.completion.message,
                     turn_evidence=turn_evidence,
                     session_operation_context=session_operation_context,
@@ -3124,6 +3142,7 @@ class ComposerServiceImpl:
                 raise persist.effect_verification_failure
 
             classify = await self._classify_and_budget_turn(
+                analysis=policy_catalog.analysis,
                 dispatch=dispatch,
                 turn_evidence=turn_evidence,
                 session_operation_context=session_operation_context,

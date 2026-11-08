@@ -4,19 +4,29 @@ from __future__ import annotations
 
 from dataclasses import replace
 from typing import NoReturn
+from unittest.mock import patch
 
 import pytest
 
 from elspeth.contracts.plugin_capabilities import ControlMode
 from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
-from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, PipelineMetadata, SourceSpec
+from elspeth.web.catalog.policy_view import PolicyCatalogView
+from elspeth.web.composer.analysis import ComposerAnalysis
+from elspeth.web.composer.session_cache import ComposerSessionCacheRegistry, SessionCacheKey
+from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, PipelineMetadata, SourceSpec, ValidationSummary
 from elspeth.web.config import WebSettings
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.plugin_policy.availability import build_plugin_snapshot
 from elspeth.web.plugin_policy.compiler import compile_web_plugin_policy
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry, RuntimeWebPluginConfig
-from elspeth.web.plugin_policy.validation import validate_authored_composition_state
+from elspeth.web.plugin_policy.validation import (
+    PluginPolicyFinding,
+    PluginPolicyValidationResult,
+    validate_authored_composition_state,
+    validate_plugin_policy,
+)
+from tests.fixtures.composer_session_cache import count_composer_work
 
 _SHIELD = PluginId("transform", "aws_bedrock_prompt_shield")
 _PRIVATE_IDENTIFIER = "privateguardrailmarker"
@@ -322,3 +332,164 @@ def test_unrelated_pipeline_remains_valid_without_profile_aliases() -> None:
 
     assert result.validation.is_valid
     assert result.validation.errors == ()
+
+
+def test_session_summary_reuse_keeps_every_policy_lowering_fresh() -> None:
+    catalog, profiles, snapshot = _context()
+    state = _state()
+    expected = validate_authored_composition_state(state, snapshot=snapshot, profile_registry=profiles, catalog=catalog)
+    caches = ComposerSessionCacheRegistry()
+    with caches.borrow(SessionCacheKey("web:alice", "profile-session")) as lease:
+        analysis = ComposerAnalysis(lease.cache)
+        view = PolicyCatalogView(catalog, snapshot, profiles, analysis=analysis)
+        with patch.object(profiles, "lower_options", wraps=profiles.lower_options) as lower, count_composer_work() as work:
+            first = view.validate_composition_state(state)
+            second = view.validate_composition_state(state)
+        assert first == second == expected
+        assert lower.call_count == 2
+        assert work.validation_walks == 1
+        assert caches.snapshot().hits == 1
+        assert lease.cache is not None
+        retained = tuple((key, entry.value) for key, entry in lease.cache.validations._entries.items())
+        assert len(retained) == 1
+        assert _PRIVATE_IDENTIFIER not in repr(retained)
+        assert "guardrail_identifier" not in repr(retained)
+        assert isinstance(retained[0][1], ValidationSummary)
+        assert retained[0][0].content_hash
+        assert retained[0][0].profile_generation == profiles.generation
+
+
+def test_profile_generation_and_snapshot_changes_separate_summaries() -> None:
+    catalog, first_profiles, first_snapshot = _context()
+    _other_catalog, second_profiles, changed_snapshot = _context(control_mode=ControlMode.REQUIRED)
+    state = _state()
+    caches = ComposerSessionCacheRegistry()
+    with caches.borrow(SessionCacheKey("web:alice", "profile-session")) as lease:
+        analysis = ComposerAnalysis(lease.cache)
+        with count_composer_work() as work:
+            for snapshot, profiles in (
+                (first_snapshot, first_profiles),
+                (first_snapshot, first_profiles),
+                (changed_snapshot, first_profiles),
+                (changed_snapshot, second_profiles),
+            ):
+                result = validate_authored_composition_state(
+                    state,
+                    snapshot=snapshot,
+                    profile_registry=profiles,
+                    catalog=catalog,
+                    analysis=analysis,
+                    profile_generation=profiles.generation,
+                )
+                assert result.validation.is_valid
+        assert first_snapshot.snapshot_hash != changed_snapshot.snapshot_hash
+        assert first_profiles.generation != second_profiles.generation
+        assert work.validation_walks == 3
+        assert caches.snapshot().retained_entries == 3
+
+
+def test_missing_profile_revision_bypasses_retention_without_hashing_lowered_state() -> None:
+    catalog, profiles, snapshot = _context()
+    state = _state()
+    caches = ComposerSessionCacheRegistry()
+    with caches.borrow(SessionCacheKey("web:alice", "profile-session")) as lease:
+        analysis = ComposerAnalysis(lease.cache)
+        with count_composer_work() as work:
+            for _ in range(2):
+                result = validate_authored_composition_state(
+                    state,
+                    snapshot=snapshot,
+                    profile_registry=profiles,
+                    catalog=catalog,
+                    analysis=analysis,
+                )
+                assert result.validation.is_valid
+                assert result.executable_state._content_hash_memo is None
+        assert work.validation_walks == 2
+        assert caches.snapshot().retained_entries == 0
+
+
+def test_evidence_and_blocking_findings_are_current_outside_retained_summary() -> None:
+    catalog, profiles, snapshot = _context()
+    state = _state()
+    calls = [0]
+
+    def current_policy(*args: object, **kwargs: object) -> PluginPolicyValidationResult:
+        calls[0] += 1
+        policy = validate_plugin_policy(state, snapshot=snapshot, profile_registry=profiles, catalog=catalog)
+        if calls[0] < 3:
+            finding = PluginPolicyFinding(
+                stage="required_control_coverage",
+                component_id=None,
+                component_type=None,
+                error_code="required_control_coverage",
+                message=f"current evidence {calls[0]}",
+            )
+        else:
+            finding = PluginPolicyFinding(
+                stage="plugin_enablement",
+                component_id="shield",
+                component_type="transform",
+                error_code="plugin_unavailable",
+                message="current blocking finding",
+            )
+        return replace(policy, findings=(finding,))
+
+    caches = ComposerSessionCacheRegistry()
+    with caches.borrow(SessionCacheKey("web:alice", "profile-session")) as lease:
+        view = PolicyCatalogView(catalog, snapshot, profiles, analysis=ComposerAnalysis(lease.cache))
+        with (
+            patch("elspeth.web.plugin_policy.validation.validate_plugin_policy", side_effect=current_policy),
+            count_composer_work() as work,
+        ):
+            first = view.validate_composition_state(state)
+            second = view.validate_composition_state(state)
+            blocked = view.validate_composition_state(state)
+        assert work.validation_walks == 1
+        assert calls == [3]
+        assert first.validation.warnings[0].message == "current evidence 1"
+        assert second.validation.warnings[0].message == "current evidence 2"
+        assert not blocked.validation.is_valid
+        assert blocked.validation.errors[0].message == "current blocking finding"
+        assert lease.cache is not None
+        assert all(not entry.value.warnings for entry in lease.cache.validations._entries.values())
+
+
+def test_lowered_langfuse_dependency_bypasses_shared_summary() -> None:
+    catalog, profiles, snapshot = _context()
+    state = _unshielded_llm_state()
+    calls = [0]
+
+    def current_policy(*args: object, **kwargs: object) -> PluginPolicyValidationResult:
+        calls[0] += 1
+        policy = validate_plugin_policy(state, snapshot=snapshot, profile_registry=profiles, catalog=catalog)
+        node = policy.executable_state.nodes[0]
+        private = replace(node, options={**node.options, "tracing": {"provider": "langfuse", "enabled": False}})
+        return replace(policy, executable_state=replace(policy.executable_state, nodes=(private,)))
+
+    caches = ComposerSessionCacheRegistry()
+    with caches.borrow(SessionCacheKey("web:alice", "profile-session")) as lease:
+        view = PolicyCatalogView(catalog, snapshot, profiles, analysis=ComposerAnalysis(lease.cache))
+        with (
+            patch("elspeth.web.plugin_policy.validation.validate_plugin_policy", side_effect=current_policy),
+            patch.object(CompositionState, "validate", return_value=ValidationSummary(True, ())) as validate,
+        ):
+            view.validate_composition_state(state)
+            view.validate_composition_state(state)
+        assert calls == [2]
+        assert validate.call_count == 2
+        assert caches.snapshot().retained_entries == 0
+        assert "tracing" not in state.nodes[0].options
+
+
+def test_unlowered_policy_and_raw_consumers_share_same_analysis_key() -> None:
+    catalog, profiles, snapshot = _context()
+    state = _state(include_shield=False)
+    caches = ComposerSessionCacheRegistry()
+    with caches.borrow(SessionCacheKey("web:alice", "profile-session")) as lease:
+        view = PolicyCatalogView(catalog, snapshot, profiles, analysis=ComposerAnalysis(lease.cache))
+        with count_composer_work() as work:
+            projected = view.validate_composition_state(state)
+            assert view.validate_raw_state(state) == projected.validation
+        assert work.validation_walks == 1
+        assert caches.snapshot().retained_entries == 1

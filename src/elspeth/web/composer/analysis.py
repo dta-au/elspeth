@@ -180,6 +180,17 @@ class ComposerAnalysis:
         self.cache = cache
         self.manager = manager if manager is not None else get_shared_plugin_manager()
 
+    async def run_in_worker[**P, T](self, func: Callable[P, T], *args: P.args, **kwargs: P.kwargs) -> T:
+        """Pin captured session ownership while keeping cancellation prompt."""
+        from elspeth.web.async_workers import run_sync_in_worker, run_sync_in_worker_with_completion
+
+        pin = self.cache.pin_worker() if self.cache is not None else None
+        if pin is None:
+            # A disposed facade is permanently uncached: its retired owner
+            # cannot read, publish or be resurrected by a late invocation.
+            return await run_sync_in_worker(func, *args, **kwargs)
+        return await run_sync_in_worker_with_completion(pin.close, func, *args, **kwargs)
+
     def _compute(self, state: CompositionState) -> ValidationSummary:
         return _validate_with_manager(self.manager, state)
 

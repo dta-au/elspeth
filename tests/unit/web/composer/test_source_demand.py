@@ -10,13 +10,27 @@ demand reaches the source through pass-through nodes), and honest abstention
 from __future__ import annotations
 
 import json
+import threading
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock, MagicMock, patch
+from uuid import uuid4
 
 import pytest
 
+from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.hashing import stable_hash
 from elspeth.web.composer import source_demand
+from elspeth.web.composer.analysis import ComposerAnalysis
+from elspeth.web.composer.interpretation_surfacing import (
+    InterpretationSurfacing,
+    _backend_surface_args_for_site,
+    has_pending_interpretation_review_surfacing_debt,
+    unsurfaceable_pending_interpretation_review_sites,
+)
+from elspeth.web.composer.pipeline_proposal import composition_content_hash
+from elspeth.web.composer.session_cache import ComposerSessionCacheRegistry, SessionCacheKey
 from elspeth.web.composer.source_demand import (
     SOURCE_DATA_CONTRACT_DRAFT_VERSION,
     SOURCE_DATA_CONTRACT_USER_TERM,
@@ -28,7 +42,14 @@ from elspeth.web.composer.source_demand import (
     source_data_contract_artifact_hash,
     stamp_source_options_with_guarantees,
 )
-from elspeth.web.composer.state import SOURCE_AUTHORING_KEY, CompositionState, NodeSpec, PipelineMetadata, SourceSpec
+from elspeth.web.composer.state import SOURCE_AUTHORING_KEY, CompositionState, NodeSpec, PipelineMetadata, SourceSpec, ValidationSummary
+from elspeth.web.interpretation_state import (
+    current_source_data_contract_demand,
+    interpretation_sites,
+    pending_execution_interpretation_sites,
+)
+from elspeth.web.sessions.protocol import SessionServiceProtocol
+from tests.fixtures.composer_session_cache import count_composer_work
 
 
 def _llm_node(
@@ -407,6 +428,135 @@ class TestFanInDemandAttribution:
 
         with pytest.raises(SourceDemandAnalysisLimitError, match="bounded hypothesis-work limit"):
             backtraced_source_demand(state, "src_a")
+
+
+class TestOperationOwnedSourceDemand:
+    def test_exact_hypotheses_are_shared_across_sources_and_pending_site_consumers(self) -> None:
+        state = _fan_in_state({"src_a": _csv_source(_observed("id")), "src_b": _csv_source(_observed("id"))})
+        expected_sites = interpretation_sites(state)
+        expected_pending = pending_execution_interpretation_sites(state)
+        expected_demand = backtraced_source_demand(state, "src_a")
+        hypotheses: list[tuple[int, str]] = []
+        registry = ComposerSessionCacheRegistry()
+        with registry.borrow(SessionCacheKey("source-demand", "fan-in")) as lease:
+            analysis = ComposerAnalysis(lease.cache)
+
+            def validate(current: CompositionState) -> ValidationSummary:
+                hypotheses.append((current.version, composition_content_hash(current)))
+                return analysis.validate_raw(current)
+
+            with count_composer_work() as counts:
+                assert backtraced_source_demand(state, "src_a", raw_validator=validate) == expected_demand == ("colour",)
+                assert counts.validation_walks == 3
+                assert len(set(hypotheses)) == 3
+                assert {version for version, _digest in hypotheses} == {state.version}
+                assert backtraced_source_demand(state, "src_a", raw_validator=validate) == expected_demand
+                assert counts.validation_walks == 3
+                assert current_source_data_contract_demand(state, "src_b", raw_validator=validate) == expected_demand
+                assert counts.validation_walks == 4
+                assert interpretation_sites(state, raw_validator=validate) == expected_sites
+                assert pending_execution_interpretation_sites(state, raw_validator=validate) == expected_pending
+                assert counts.validation_walks == 4
+            assert len(set(hypotheses)) == 4
+
+    def test_changed_same_version_consumer_gets_its_own_hypotheses(self) -> None:
+        state = _fan_in_state({"src_a": _csv_source(_observed("id")), "src_b": _csv_source(_observed("id"))})
+        changed = replace(
+            state,
+            nodes=(state.nodes[0], replace(state.nodes[1], options={**state.nodes[1].options, "required_input_fields": ["size"]})),
+        )
+        expected = backtraced_source_demand(changed, "src_a")
+        registry = ComposerSessionCacheRegistry()
+        with registry.borrow(SessionCacheKey("source-demand", "changed")) as lease:
+            analysis = ComposerAnalysis(lease.cache)
+            with count_composer_work() as counts:
+                assert backtraced_source_demand(state, "src_a", raw_validator=analysis.validate_raw) == ("colour",)
+                assert backtraced_source_demand(changed, "src_a", raw_validator=analysis.validate_raw) == expected == ("size",)
+                assert changed.version == state.version
+                assert counts.validation_walks == 6
+                assert backtraced_source_demand(changed, "src_a", raw_validator=analysis.validate_raw) == expected
+                assert counts.validation_walks == 6
+
+    def test_callers_without_operation_analysis_still_validate_fresh(self) -> None:
+        state = _fan_in_state({"src_a": _csv_source(_observed("id")), "src_b": _csv_source(_observed("id"))})
+        with count_composer_work() as counts:
+            assert current_source_data_contract_demand(state, "src_a") == ("colour",)
+            assert counts.validation_walks == 3
+            assert current_source_data_contract_demand(state, "src_a") == ("colour",)
+            assert counts.validation_walks == 6
+
+    def test_surfacing_reuses_raw_hypotheses_but_reads_current_sample(self, tmp_path: Path) -> None:
+        sample = tmp_path / "sample.csv"
+        sample.write_text("colour\nred\n", encoding="utf-8")
+        state = _state({"path": str(sample)}, (_llm_node(required=["colour"]),))
+        source_site = next(site for site in interpretation_sites(state) if site.kind is InterpretationKind.SOURCE_DATA_CONTRACT)
+        expected_unsurfaceable = unsurfaceable_pending_interpretation_review_sites(state)
+        registry = ComposerSessionCacheRegistry()
+        with registry.borrow(SessionCacheKey("source-demand", "sample")) as lease:
+            analysis = ComposerAnalysis(lease.cache)
+            with count_composer_work() as counts:
+                first = _backend_surface_args_for_site(state, source_site, raw_validator=analysis.validate_raw)
+                assert first is not None
+                assert counts.validation_walks == 2
+                sample.write_text("size\nsmall\n", encoding="utf-8")
+                second = _backend_surface_args_for_site(state, source_site, raw_validator=analysis.validate_raw)
+                assert second is not None
+                assert json.loads(first[2])["sample_header"] == ["colour"]
+                assert json.loads(second[2])["sample_header"] == ["size"]
+                assert parse_source_data_contract_accepted_fields(first[2]) == parse_source_data_contract_accepted_fields(second[2])
+                assert (
+                    unsurfaceable_pending_interpretation_review_sites(state, raw_validator=analysis.validate_raw) == expected_unsurfaceable
+                )
+                assert counts.validation_walks == 2
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("use_analysis", (False, True), ids=("callback-compatibility", "operation-analysis"))
+    async def test_async_surfacing_reads_fresh_events_and_runs_graph_work_off_loop(self, use_analysis: bool) -> None:
+        state = _fan_in_state({"src_a": _csv_source(_observed("id")), "src_b": _csv_source(_observed("id"))})
+        sessions = MagicMock(spec=SessionServiceProtocol)
+        sessions.list_interpretation_events = AsyncMock(return_value=[])
+        surfacing = InterpretationSurfacing(
+            sessions_service=sessions,
+            per_term_cap=4,
+            per_session_day_cap=20,
+            model_identifier="fixture",
+            provider="fixture",
+            composer_skill_hash="fixture",
+        )
+        session_id, state_id = str(uuid4()), str(uuid4())
+        loop_thread = threading.get_ident()
+        validation_threads: list[int] = []
+        registry = ComposerSessionCacheRegistry()
+        with registry.borrow(SessionCacheKey("source-demand", session_id)) as lease:
+            analysis = ComposerAnalysis(lease.cache)
+            raw_validate = analysis.validate_raw
+
+            def validate(current: CompositionState) -> ValidationSummary:
+                validation_threads.append(threading.get_ident())
+                return raw_validate(current)
+
+            with patch.object(analysis, "validate_raw", side_effect=validate), count_composer_work() as counts:
+                first = await surfacing._missing_pending_interpretation_review_sites(
+                    state, session_id=session_id, raw_validator=validate, analysis=analysis if use_analysis else None
+                )
+                second = await surfacing._missing_pending_interpretation_review_sites(
+                    state, session_id=session_id, raw_validator=validate, analysis=analysis if use_analysis else None
+                )
+                assert first == second
+                assert any(kind is InterpretationKind.SOURCE_DATA_CONTRACT for _component, _term, kind in first)
+                assert await has_pending_interpretation_review_surfacing_debt(
+                    state,
+                    sessions_service=sessions,
+                    session_id=session_id,
+                    current_state_id=state_id,
+                    raw_validator=validate,
+                    analysis=analysis if use_analysis else None,
+                )
+                assert counts.validation_walks == 4
+        assert sessions.list_interpretation_events.await_count == 3
+        assert validation_threads
+        assert all(thread != loop_thread for thread in validation_threads)
+        await registry.finish_shutdown()
 
 
 class TestStampSourceOptions:

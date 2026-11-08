@@ -62,7 +62,6 @@ from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.contracts.tool_calls import is_valid_provider_replay_tool_call_id
 from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.core.canonical import canonical_json, stable_hash
-from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import PluginKind
 from elspeth.web.catalog.schemas import PluginSchemaInfo
@@ -3392,7 +3391,7 @@ async def _plan_pipeline_inner(
         if remaining <= 0:
             raise PipelinePlannerError("planner wall-clock budget exhausted", code="TIMEOUT")
         try:
-            return await asyncio.wait_for(run_sync_in_worker(func, *args), timeout=remaining)
+            return await asyncio.wait_for(policy_catalog.run_in_worker(func, *args), timeout=remaining)
         except TimeoutError as exc:
             raise PipelinePlannerError("planner wall-clock budget exhausted", code="TIMEOUT") from exc
 
@@ -4943,7 +4942,7 @@ async def _plan_pipeline_inner(
                         ToolResult(
                             success=False,
                             updated_state=current_state,
-                            validation=current_state.validate(),
+                            validation=(await policy_catalog.validate_composition_state_async(current_state)).validation,
                             affected_nodes=(),
                         ),
                         argument_error_response(exc),

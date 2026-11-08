@@ -4499,8 +4499,201 @@ class TestComposerMultipleToolCallsPerTurn:
 class TestDiscoveryCache:
     """Tests for the discovery cache (F1)."""
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("enabled", [True, False], ids=("session-retention", "retention-disabled-control"))
+    async def test_one_session_shares_exact_graph_across_compose_planner_and_completion(
+        self, enabled: bool, tmp_path: Path, tool_context: Any
+    ) -> None:
+        from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+        from elspeth.web.catalog.service import CatalogServiceImpl
+        from elspeth.web.composer.analysis import ComposerAnalysis
+        from elspeth.web.composer.pipeline_planner import PlannerCustodyConfig, PlannerDeclined, PlannerOriginatingMessage
+        from elspeth.web.composer.pipeline_proposal import composition_content_hash
+        from elspeth.web.composer.session_cache import ComposerSessionCacheRegistry, SessionCacheKey
+        from tests.fixtures.composer_session_cache import make_small_composer_state
+        from tests.unit.web.composer.test_pipeline_planner import _plan, _response, _ScriptedCompletion, _text_response
+
+        state = make_small_composer_state()
+        target_hash = composition_content_hash(state)
+        reference = state.validate()
+        assert reference.is_valid
+        catalog = CatalogServiceImpl(get_shared_plugin_manager())
+        service, session_id = _composer_service_with_session(catalog, _make_settings())
+        service._session_caches = ComposerSessionCacheRegistry(enabled=enabled)
+        engine = service._session_engine
+        assert engine is not None
+        captured_views: list[PolicyCatalogView] = []
+        bind_analysis = PolicyCatalogView.with_analysis
+        raw_validate = CompositionState.validate
+        counter_lock = threading.Lock()
+        target_walks = 0
+        target_summaries: list[ValidationSummary] = []
+
+        def capture_view(view: PolicyCatalogView, analysis: ComposerAnalysis) -> PolicyCatalogView:
+            bound = bind_analysis(view, analysis)
+            captured_views.append(bound)
+            return bound
+
+        def count_target(current: CompositionState) -> ValidationSummary:
+            nonlocal target_walks
+            summary = raw_validate(current)
+            if composition_content_hash(current) == target_hash:
+                with counter_lock:
+                    target_walks += 1
+                    target_summaries.append(summary)
+            return summary
+
+        outer_text = "Described the shipped draft."
+        planner_text = "Which transformation should we discuss next?"
+        responses = [
+            _make_llm_response(tool_calls=[{"id": "outer-grammar", "name": "get_expression_grammar", "arguments": {}}]),
+            _make_llm_response(content=outer_text),
+        ]
+        planner_provider = _ScriptedCompletion(_response(("get_expression_grammar", {})), _text_response(planner_text))
+        planner_audit = BufferingRecorder()
+        try:
+            with patch.object(CompositionState, "validate", count_target):
+                # The production counter must see a direct target walk and
+                # ignore a different same-version graph before it measures reuse.
+                assert state.validate() == reference
+                assert target_walks == 1
+                different = replace(state, metadata=PipelineMetadata(name="Counter negative control"))
+                assert different.version == state.version
+                assert composition_content_hash(different) != target_hash
+                different.validate()
+                assert target_walks == 1
+                with counter_lock:
+                    target_walks = 0
+                    target_summaries.clear()
+
+                with (
+                    patch.object(PolicyCatalogView, "with_analysis", capture_view),
+                    patch.object(service._provider_gateway, "_call_llm", side_effect=responses) as outer_provider,
+                ):
+                    outer = await service.compose("Describe the tools", [], state, session_id=session_id, user_id="test-user")
+                after_outer = target_walks
+                assert outer_provider.await_count == 2
+                assert outer.state is state and outer.raw_assistant_content == outer_text
+                _assert_checkpoint_reply(outer, outer_text, count=0)
+                assert [(call.tool_name, call.status) for call in outer.tool_invocations] == [
+                    ("get_expression_grammar", ComposerToolStatus.SUCCESS)
+                ]
+                assert captured_views
+                operation_view = captured_views[-1]
+                snapshot = operation_view.snapshot
+                with service._session_caches.borrow(SessionCacheKey(snapshot.principal_scope, session_id)) as lease:
+                    assert lease.cache is operation_view.analysis.cache
+                    bound_view = operation_view.with_analysis(ComposerAnalysis(lease.cache))
+                    origin_text = "Explain the existing pipeline's tools."
+                    origin = PlannerOriginatingMessage(
+                        session_id=session_id,
+                        message_id=_insert_user_message(engine, session_id, origin_text),
+                        content=origin_text,
+                        user_id="test-user",
+                    )
+                    with pytest.raises(PlannerDeclined) as declined:
+                        await _plan(
+                            tmp_path=tmp_path,
+                            tool_context=tool_context,
+                            completion=planner_provider,
+                            recorder=planner_audit,
+                            policy_override=(bound_view, snapshot),
+                            current_state=state,
+                            provider_current_state=state.to_dict(),
+                            originating_message=origin,
+                            custody_config=PlannerCustodyConfig(
+                                data_dir=str(tmp_path),
+                                session_engine=engine,
+                                max_storage_per_session=1_000_000,
+                                secret_service=None,
+                                runtime_preflight=None,
+                            ),
+                        )
+                    after_planner = target_walks
+                    assert declined.value.decline_text == planner_text
+                    assert len(planner_provider.requests) == len(planner_audit.llm_calls) == 2
+                    assert [(call.tool_name, call.status) for call in planner_audit.invocations] == [
+                        ("get_expression_grammar", ComposerToolStatus.SUCCESS)
+                    ]
+                    with (
+                        patch.object(service._preflight, "runtime_preflight") as runtime,
+                        patch.object(service._preflight, "cached_runtime_preflight") as cached_runtime,
+                        patch.object(bound_view.analysis, "validate_raw_async", wraps=bound_view.analysis.validate_raw_async) as raw_lookup,
+                    ):
+                        completion = await service._preflight.reuse_or_recompute_runtime_preflight(
+                            state=state,
+                            user_id="test-user",
+                            session_id=session_id,
+                            last_runtime_preflight=None,
+                            runtime_preflight_cache=service._preflight.new_cache(),
+                            initial_version=state.version,
+                            session_scope=f"session:{session_id}",
+                            llm_calls=(),
+                            plugin_snapshot=snapshot,
+                            analysis=bound_view.analysis,
+                        )
+                    after_completion = target_walks
+                    assert completion is None
+                    raw_lookup.assert_awaited_once_with(state)
+                    runtime.assert_not_called()
+                    cached_runtime.assert_not_called()
+                    assert bound_view.validate_composition_state(state).validation == reference
+
+                assert target_summaries and all(summary == reference for summary in target_summaries)
+                if enabled:
+                    assert after_outer == after_planner == after_completion == target_walks == 1
+                else:
+                    # The same consumer chain must fail the single-walk
+                    # criterion when retention is disabled, with equal output.
+                    assert 1 < after_outer < after_planner < after_completion < target_walks
+        finally:
+            await service._session_caches.finish_shutdown()
+            engine.dispose()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("enabled", [True, False])
+    async def test_session_analysis_reused_across_real_compose_operations(self, enabled: bool) -> None:
+        from elspeth.web.composer.session_cache import ComposerSessionCacheRegistry
+        from tests.fixtures.composer_session_cache import count_composer_work
+
+        service, session_id = _composer_service_with_session(_mock_catalog(), _make_settings())
+        service._session_caches = ComposerSessionCacheRegistry(enabled=enabled)
+        state = _empty_state()
+        changed = replace(state, metadata=PipelineMetadata(name="Different content at the same version"))
+        responses = [
+            _make_llm_response(tool_calls=[{"id": call_id, "name": "get_expression_grammar", "arguments": {}}])
+            for call_id in ("first", "repeat")
+        ] + [
+            _make_llm_response(content="Described the tools."),
+            _make_llm_response(tool_calls=[{"id": "next-operation", "name": "get_expression_grammar", "arguments": {}}]),
+            _make_llm_response(content="Described the tools again."),
+            _make_llm_response(tool_calls=[{"id": "changed", "name": "get_expression_grammar", "arguments": {}}]),
+            _make_llm_response(content="Described the changed draft."),
+        ]
+        with count_composer_work() as counts, patch.object(service._provider_gateway, "_call_llm", side_effect=responses) as provider:
+            first = await service.compose("Describe the tools", [], state, session_id=session_id, user_id="test-user")
+            first_walks = counts.validation_walks
+            second = await service.compose("Describe the tools again", [], state, session_id=session_id, user_id="test-user")
+            unchanged_walks = counts.validation_walks
+            third = await service.compose("Describe the changed draft", [], changed, session_id=session_id, user_id="test-user")
+
+        assert provider.await_count == 7
+        assert first.state is second.state is state
+        assert third.state is changed
+        assert first.state.version == third.state.version
+        if enabled:
+            assert first_walks == unchanged_walks == 1
+            assert counts.validation_walks == 2
+        else:
+            assert first_walks > 1
+            assert unchanged_walks > first_walks
+            assert counts.validation_walks > unchanged_walks
+        statistics = service._session_caches.snapshot()
+        assert statistics.active_sessions == 1
+        assert statistics.borrows == statistics.pins == statistics.queued_jobs == 0
+
     def test_cache_reconstruction_binds_current_graph_and_policy(self) -> None:
-        """Current policy is projected once; a later snapshot still revalidates."""
+        """Every use projects current policy, including after a snapshot change."""
         from elspeth.web.composer.discovery_cache import CachedDiscoveryPayload, result_from_cached_discovery_payload
         from elspeth.web.composer.tools._common import normalize_tool_result_validation
 
@@ -4515,21 +4708,21 @@ class TestDiscoveryCache:
             result = result_from_cached_discovery_payload(state, cached, catalog=view)
             assert result.updated_state is state
             assert result._validation_snapshot_hash == snapshot.snapshot_hash
-            assert normalize_tool_result_validation(result, view) is result
-            assert validate.call_count == 1
+            assert normalize_tool_result_validation(result, view) == result
+            assert validate.call_count == 2
             other_snapshot = replace(snapshot, snapshot_hash="another-current-policy")
             other_view = PolicyCatalogView.for_trained_operator(catalog, other_snapshot)
             revalidated = normalize_tool_result_validation(result, other_view)
 
-        assert [(call.args[0], call.args[1]) for call in validate.call_args_list] == [(view, state), (other_view, state)]
+        assert [(call.args[0], call.args[1]) for call in validate.call_args_list] == [(view, state), (view, state), (other_view, state)]
         assert revalidated._validation_snapshot_hash == other_snapshot.snapshot_hash
         assert revalidated.validation == state.validate()
         assert revalidated.updated_state is state
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("tool_name", ["list_sources", "get_expression_grammar"])
-    async def test_cache_hit_validates_once_off_event_loop(self, tool_name: str) -> None:
-        """A cache hit performs one current-policy projection without blocking the loop."""
+    async def test_cache_hit_reuses_analysis_off_event_loop(self, tool_name: str) -> None:
+        """A warm hit rechecks policy in workers without another raw walk."""
         service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
         state = _empty_state()
         responses = iter(
@@ -4566,13 +4759,12 @@ class TestDiscoveryCache:
             patch.object(PolicyCatalogView, "validate_composition_state", validate_policy),
             patch.object(CompositionState, "validate", validate_raw),
         ):
-            result = await service.compose("Describe the pipeline tools", [], state, session_id=session_id)
+            result = await service.compose("Describe the pipeline tools", [], state, session_id=session_id, user_id="test-user")
 
         assert [invocation.cache_hit for invocation in result.tool_invocations] == [False, True]
-        assert len(policy_threads) == 1
-        assert len(raw_threads) == 1
-        assert policy_threads[0] is not event_loop_thread
-        assert raw_threads[0] is policy_threads[0]
+        assert len(policy_threads) == 2
+        assert raw_threads == []
+        assert all(thread is not event_loop_thread for thread in policy_threads)
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("full_replacement", [False, True])

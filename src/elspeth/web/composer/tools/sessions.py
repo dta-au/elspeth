@@ -25,6 +25,8 @@ from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.sink import FILE_SINK_PLUGIN_SLASH_TEXT
 from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
 from elspeth.core.canonical import stable_hash
+from elspeth.web.async_workers import run_sync_in_worker
+from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.path_canonicalization import canonical_sink_local_paths
 from elspeth.web.composer.protocol import (
     INTERPRETATION_RATE_CAP_PER_SESSION_DAY_EXPECTATION,
@@ -59,6 +61,7 @@ from elspeth.web.composer.state import (
     OutputSpec,
     PipelineMetadata,
     SourceSpec,
+    ValidationSummary,
     _batch_aware_placement_error,
     _batch_aware_required_input_fields_error,
     _validate_gate_expression,
@@ -735,6 +738,7 @@ def build_set_pipeline_candidate(
                 plugin_identity=plugin_identity,
                 rejected_component=rejected_component,
                 review_reference=review_reference,
+                catalog=context.catalog,
             )
         )
 
@@ -751,6 +755,7 @@ def build_set_pipeline_candidate(
                 violation,
                 component=component,
                 rejected_component=rejected_component,
+                catalog=context.catalog,
             )
         )
 
@@ -1023,7 +1028,10 @@ def build_set_pipeline_candidate(
         manual_authoring_error = _reject_manual_source_authoring(legacy_src_options, tool_name="set_pipeline")
         if manual_authoring_error is not None:
             return _failure_result(
-                state, manual_authoring_error, error_code="interpretation_requirements_invalid", rejected_component="source"
+                state,
+                manual_authoring_error,
+                error_code="interpretation_requirements_invalid",
+                rejected_component="source",
             )
         manual_blobs_error = _reject_manual_source_blobs(legacy_src_options, tool_name="set_pipeline")
         if manual_blobs_error is not None:
@@ -1077,7 +1085,10 @@ def build_set_pipeline_candidate(
             )
             if guarantee_stamp_error is not None:
                 return _failure_result(
-                    state, guarantee_stamp_error, error_code="source_data_contract_required", rejected_component="source"
+                    state,
+                    guarantee_stamp_error,
+                    error_code="source_data_contract_required",
+                    rejected_component="source",
                 )
         if source_blob_id is not None:
             resolved = _resolve_source_blob(
@@ -1149,7 +1160,12 @@ def build_set_pipeline_candidate(
                 session_id=session_id,
             )
             if header_conflict is not None:
-                return _failure_result(state, header_conflict.message, error_code=header_conflict.error_code, rejected_component="source")
+                return _failure_result(
+                    state,
+                    header_conflict.message,
+                    error_code=header_conflict.error_code,
+                    rejected_component="source",
+                )
             # A user-verbatim inline blob (paste-through) is sample evidence
             # like an upload; only an LLM-authored one is hash-bound to its
             # author's schema claim.
@@ -1161,7 +1177,10 @@ def build_set_pipeline_candidate(
             )
             if guarantee_stamp_error is not None:
                 return _failure_result(
-                    state, guarantee_stamp_error, error_code="source_data_contract_required", rejected_component="source"
+                    state,
+                    guarantee_stamp_error,
+                    error_code="source_data_contract_required",
+                    rejected_component="source",
                 )
 
             # ``prepared_inline_blob.mime_type`` was validated by
@@ -1220,7 +1239,12 @@ def build_set_pipeline_candidate(
             )
         endpoint_policy_error = web_aws_s3_endpoint_url_policy_error(src_plugin, legacy_src_options)
         if endpoint_policy_error is not None:
-            return _failure_result(state, endpoint_policy_error, error_code="aws_s3_endpoint_url_not_allowed", rejected_component="source")
+            return _failure_result(
+                state,
+                endpoint_policy_error,
+                error_code="aws_s3_endpoint_url_not_allowed",
+                rejected_component="source",
+            )
         plugin_error = _validate_plugin_name(context, "source", src_plugin)
         if plugin_error is not None:
             return _plugin_policy_failure(state, plugin_error, rejected_component="source")
@@ -1231,6 +1255,7 @@ def build_set_pipeline_candidate(
             plugin_type="source",
             plugin_name=src_plugin,
             options=legacy_src_options,
+            catalog=context.catalog,
         )
         if credential_error is not None:
             return _candidate(credential_error)
@@ -1394,7 +1419,10 @@ def build_set_pipeline_candidate(
             if endpoint_policy_error is not None:
                 _record_component_rejection(
                     _failure_result(
-                        state, endpoint_policy_error, error_code="aws_s3_endpoint_url_not_allowed", rejected_component=source_ref
+                        state,
+                        endpoint_policy_error,
+                        error_code="aws_s3_endpoint_url_not_allowed",
+                        rejected_component=source_ref,
                     )
                 )
                 continue
@@ -1405,14 +1433,22 @@ def build_set_pipeline_candidate(
             manual_blob_ref_error = None if reviewed_source else _reject_manual_source_blob_ref(src_options, tool_name="set_pipeline")
             if manual_blob_ref_error is not None:
                 _record_component_rejection(
-                    _failure_result(state, manual_blob_ref_error, error_code="plugin_options_invalid", rejected_component=source_ref)
+                    _failure_result(
+                        state,
+                        manual_blob_ref_error,
+                        error_code="plugin_options_invalid",
+                        rejected_component=source_ref,
+                    )
                 )
                 continue
             manual_authoring_error = None if reviewed_source else _reject_manual_source_authoring(src_options, tool_name="set_pipeline")
             if manual_authoring_error is not None:
                 _record_component_rejection(
                     _failure_result(
-                        state, manual_authoring_error, error_code="interpretation_requirements_invalid", rejected_component=source_ref
+                        state,
+                        manual_authoring_error,
+                        error_code="interpretation_requirements_invalid",
+                        rejected_component=source_ref,
                     )
                 )
                 continue
@@ -1428,13 +1464,23 @@ def build_set_pipeline_candidate(
             )
             if guarantee_stamp_error is not None:
                 _record_component_rejection(
-                    _failure_result(state, guarantee_stamp_error, error_code="source_data_contract_required", rejected_component=source_ref)
+                    _failure_result(
+                        state,
+                        guarantee_stamp_error,
+                        error_code="source_data_contract_required",
+                        rejected_component=source_ref,
+                    )
                 )
                 continue
             manual_blobs_error = None if reviewed_source else _reject_manual_source_blobs(src_options, tool_name="set_pipeline")
             if manual_blobs_error is not None:
                 _record_component_rejection(
-                    _failure_result(state, manual_blobs_error, error_code="plugin_options_invalid", rejected_component=source_ref)
+                    _failure_result(
+                        state,
+                        manual_blobs_error,
+                        error_code="plugin_options_invalid",
+                        rejected_component=source_ref,
+                    )
                 )
                 continue
             credential_error = _candidate_credential_wiring_contract_failure(
@@ -1444,6 +1490,7 @@ def build_set_pipeline_candidate(
                 plugin_type="source",
                 plugin_name=src_plugin,
                 options=src_options,
+                catalog=context.catalog,
             )
             if credential_error is not None:
                 _record_component_rejection(_candidate(credential_error))
@@ -1566,7 +1613,12 @@ def build_set_pipeline_candidate(
         review_parse_error = authored_node_interpretation_requirement_parse_error(node_id, review_options)
         if review_parse_error is not None:
             _record_component_rejection(
-                _failure_result(state, review_parse_error, error_code="interpretation_requirements_invalid", rejected_component=node_ref)
+                _failure_result(
+                    state,
+                    review_parse_error,
+                    error_code="interpretation_requirements_invalid",
+                    rejected_component=node_ref,
+                )
             )
             continue
         credential_error = _candidate_credential_wiring_contract_failure(
@@ -1576,6 +1628,7 @@ def build_set_pipeline_candidate(
             plugin_type="transform" if node_plugin is not None else None,
             plugin_name=node_plugin,
             options=review_options,
+            catalog=context.catalog,
         )
         if credential_error is not None:
             _record_component_rejection(_candidate(credential_error))
@@ -1591,13 +1644,23 @@ def build_set_pipeline_candidate(
             batch_placement_error = _batch_aware_placement_error(node_id, node_type, node_plugin, node.output_mode)
             if batch_placement_error is not None:
                 _record_component_rejection(
-                    _failure_result(state, batch_placement_error, error_code="batch_transform_misplaced", rejected_component=node_ref)
+                    _failure_result(
+                        state,
+                        batch_placement_error,
+                        error_code="batch_transform_misplaced",
+                        rejected_component=node_ref,
+                    )
                 )
                 continue
             batch_required_error = _batch_aware_required_input_fields_error(node_id, node_plugin, review_options)
             if batch_required_error is not None:
                 _record_component_rejection(
-                    _failure_result(state, batch_required_error, error_code="batch_required_fields_invalid", rejected_component=node_ref)
+                    _failure_result(
+                        state,
+                        batch_required_error,
+                        error_code="batch_required_fields_invalid",
+                        rejected_component=node_ref,
+                    )
                 )
                 continue
 
@@ -1614,7 +1677,12 @@ def build_set_pipeline_candidate(
             )
             if prompt_surface_error is not None:
                 _record_component_rejection(
-                    _failure_result(state, prompt_surface_error, error_code="llm_authored_inline_blob_content", rejected_component=node_ref)
+                    _failure_result(
+                        state,
+                        prompt_surface_error,
+                        error_code="llm_authored_inline_blob_content",
+                        rejected_component=node_ref,
+                    )
                 )
                 continue
 
@@ -1655,7 +1723,12 @@ def build_set_pipeline_candidate(
                 provider_policy_error = _validate_transform_provider_config_policy(review_options, plugin=node_plugin)
                 if provider_policy_error is not None:
                     _record_component_rejection(
-                        _failure_result(state, provider_policy_error, error_code="llm_retry_budget_policy", rejected_component=node_ref)
+                        _failure_result(
+                            state,
+                            provider_policy_error,
+                            error_code="llm_retry_budget_policy",
+                            rejected_component=node_ref,
+                        )
                     )
                     continue
 
@@ -1746,7 +1819,12 @@ def build_set_pipeline_candidate(
         endpoint_policy_error = web_aws_s3_endpoint_url_policy_error(out_plugin, out_options)
         if endpoint_policy_error is not None:
             _record_component_rejection(
-                _failure_result(state, endpoint_policy_error, error_code="aws_s3_endpoint_url_not_allowed", rejected_component=output_ref)
+                _failure_result(
+                    state,
+                    endpoint_policy_error,
+                    error_code="aws_s3_endpoint_url_not_allowed",
+                    rejected_component=output_ref,
+                )
             )
             continue
         plugin_error = _validate_plugin_name(context, "sink", out_plugin)
@@ -1804,6 +1882,7 @@ def build_set_pipeline_candidate(
             plugin_type="sink",
             plugin_name=out_plugin,
             options=out_options,
+            catalog=context.catalog,
         )
         if credential_error is not None:
             _record_component_rejection(_candidate(credential_error))
@@ -1838,7 +1917,12 @@ def build_set_pipeline_candidate(
         )
         if out_collision_error is not None:
             _record_component_rejection(
-                _failure_result(state, out_collision_error, error_code="file_sink_write_policy_invalid", rejected_component=output_ref)
+                _failure_result(
+                    state,
+                    out_collision_error,
+                    error_code="file_sink_write_policy_invalid",
+                    rejected_component=output_ref,
+                )
             )
             continue
 
@@ -1965,7 +2049,7 @@ def build_set_pipeline_candidate(
         metadata=metadata_spec,
         version=state.version + 1,
     )
-    invariant_error = _post_mutation_invariant_error(new_state)
+    invariant_error = _post_mutation_invariant_error(new_state, analysis=context.analysis)
     if invariant_error is not None:
         message, error_code = invariant_error
         return _failure_result(state, message, error_code=error_code, rejected_component=None)
@@ -2050,6 +2134,7 @@ def build_set_pipeline_candidate(
             affected,
             data=data,
             full_replacement=True,
+            catalog=context.catalog,
         )
     )
 
@@ -2074,6 +2159,7 @@ def _execute_set_pipeline(
             "set_pipeline source.inline_blob requires session context.",
             error_code="source_binding_context_unavailable",
             rejected_component="source",
+            catalog=context.catalog,
         )
     quota_error = _persist_prepared_blob_create(
         prepared_inline_blob,
@@ -2084,7 +2170,9 @@ def _execute_set_pipeline(
         session_operation_authority=context.session_operation_authority,
     )
     if quota_error is not None:
-        return _candidate_rejection_result(state, quota_error, error_code="BLOB_QUOTA_EXCEEDED", rejected_component="source")
+        return _candidate_rejection_result(
+            state, quota_error, error_code="BLOB_QUOTA_EXCEEDED", rejected_component="source", catalog=context.catalog
+        )
 
     inline_payload = {"inline_blob": _blob_create_payload(prepared_inline_blob)}
     if result.data is None:
@@ -2476,6 +2564,7 @@ def _execute_get_pipeline_state(
             state,
             CREDENTIAL_REFUSAL_DETAIL,
             error_code="credential_material_rejected",
+            catalog=context.catalog,
         )
     component = validated.component
     data: Any
@@ -2487,6 +2576,7 @@ def _execute_get_pipeline_state(
                 state,
                 f"Pipeline cannot be represented as exact set_pipeline arguments: {round_trip_error}.",
                 error_code="round_trip_unavailable",
+                catalog=context.catalog,
             )
         assert exact_arguments is not None
         data = exact_arguments
@@ -2508,12 +2598,13 @@ def _execute_get_pipeline_state(
                     state,
                     f"Component '{component}' not found. Specify 'source', a node ID, an output name, "
                     "or a full-state alias ('full', 'all', 'pipeline', or empty string).",
+                    catalog=context.catalog,
                 )
     else:
         data = _serialize_full_pipeline_state(state, requested_component=None)
 
     data = redact_source_storage_path(data)
-    return _discovery_result(state, data)
+    return _discovery_result(state, data, catalog=context.catalog)
 
 
 _GET_PIPELINE_STATE_DECLARATION = ToolDeclaration(
@@ -2579,10 +2670,12 @@ def _matching_interpretation_sites(
     affected_node_id: str,
     kind: InterpretationKind,
     user_term: str,
+    *,
+    raw_validator: Callable[[CompositionState], ValidationSummary] | None = None,
 ) -> list[str]:
     normalized_user_term = user_term.strip()
     try:
-        sites = interpretation_sites(state)
+        sites = interpretation_sites(state, raw_validator=raw_validator)
     except InterpretationReviewCapacityError as exc:
         raise ToolArgumentError(
             argument="affected_node_id",
@@ -2617,6 +2710,8 @@ def _assert_affected_component(
     kind: InterpretationKind,
     user_term: str,
     llm_draft: str | None = None,
+    *,
+    raw_validator: Callable[[CompositionState], ValidationSummary] | None = None,
 ) -> str | None:
     """Tier-3 boundary check on the LLM-supplied review component.
 
@@ -2662,7 +2757,7 @@ def _assert_affected_component(
                 expected=f"source to contain a pending {kind.value} requirement for the requested term",
                 actual_type=f"missing pending {kind.value} review site",
             )
-        matched_terms = _matching_interpretation_sites(state, affected_node_id, kind, user_term)
+        matched_terms = _matching_interpretation_sites(state, affected_node_id, kind, user_term, raw_validator=raw_validator)
         if not matched_terms:
             raise ToolArgumentError(
                 argument="affected_node_id",
@@ -2711,7 +2806,7 @@ def _assert_affected_component(
                 expected=SOURCE_DATA_CONTRACT_EXISTING_SOURCE_EXPECTATION,
                 actual_type=SOURCE_DATA_CONTRACT_MISSING_SOURCE_ACTUAL_TYPE,
             )
-        matched_terms = _matching_interpretation_sites(state, affected_node_id, kind, user_term)
+        matched_terms = _matching_interpretation_sites(state, affected_node_id, kind, user_term, raw_validator=raw_validator)
         if not matched_terms:
             raise ToolArgumentError(
                 argument="affected_node_id",
@@ -2721,7 +2816,7 @@ def _assert_affected_component(
         # The draft is SERVER-COMPUTED from the graph's demand backtrace and
         # the source's illustrative sample header — never planner-supplied
         # (the planner may REQUEST the review; the field set is the server's).
-        demand = current_source_data_contract_demand(state, source_name)
+        demand = current_source_data_contract_demand(state, source_name, raw_validator=raw_validator)
         computed_draft = build_source_data_contract_draft(demand, sample_header_for_source(source))
         if llm_draft is not None and llm_draft != computed_draft:
             raise ToolArgumentError(
@@ -2733,7 +2828,7 @@ def _assert_affected_component(
 
     if kind is InterpretationKind.PIPELINE_DECISION:
         node = _find_node_or_raise(state, affected_node_id)
-        matched_terms = _matching_interpretation_sites(state, affected_node_id, kind, user_term)
+        matched_terms = _matching_interpretation_sites(state, affected_node_id, kind, user_term, raw_validator=raw_validator)
         if not matched_terms:
             raise ToolArgumentError(
                 argument="affected_node_id",
@@ -2799,7 +2894,7 @@ def _assert_affected_component(
     else:
         prompt_template = None
 
-    matched_terms = _matching_interpretation_sites(state, affected_node_id, kind, user_term)
+    matched_terms = _matching_interpretation_sites(state, affected_node_id, kind, user_term, raw_validator=raw_validator)
     if not matched_terms:
         expected_kind = kind.value
         raise ToolArgumentError(
@@ -3041,6 +3136,7 @@ async def _check_duplicate_interpretation(
     affected_node_id: str,
     state: CompositionState,
     list_events_fn: Callable[..., Awaitable[list[InterpretationEventRecord]]],
+    catalog: PolicyCatalogView | None = None,
 ) -> ToolResult | None:
     """Dedup a re-stage of an existing logical interpretation review.
 
@@ -3102,7 +3198,11 @@ async def _check_duplicate_interpretation(
         return ToolResult(
             success=True,
             updated_state=state,  # no state change — original review is still pending
-            validation=state.validate(),
+            validation=(
+                await run_sync_in_worker(state.validate)
+                if catalog is None
+                else (await catalog.validate_composition_state_async(state)).validation
+            ),
             affected_nodes=(affected_node_id,),
             data={
                 "_kind": "interpretation_review_pending_idempotent",
@@ -3226,6 +3326,7 @@ async def _handle_request_interpretation_review(
     composer_skill_hash: str,
     create_pending_interpretation_event: Callable[..., Awaitable[InterpretationEventRecord]],
     list_interpretation_events: Callable[..., Awaitable[list[InterpretationEventRecord]]],
+    catalog: PolicyCatalogView | None = None,
 ) -> ToolResult:
     """Stage a pending interpretation event for user review.
 
@@ -3272,7 +3373,25 @@ async def _handle_request_interpretation_review(
     # the LLM must never need to re-emit staged draft bytes through
     # tool-call JSON, where escape-sequence round-trips made byte-identical
     # re-emission deterministically fail).
-    resolved_draft = _assert_affected_component(state, parsed.affected_node_id, parsed.kind, parsed.user_term, parsed.llm_draft)
+    if catalog is None:
+        resolved_draft = await run_sync_in_worker(
+            _assert_affected_component,
+            state,
+            parsed.affected_node_id,
+            parsed.kind,
+            parsed.user_term,
+            parsed.llm_draft,
+        )
+    else:
+        resolved_draft = await catalog.run_in_worker(
+            _assert_affected_component,
+            state,
+            parsed.affected_node_id,
+            parsed.kind,
+            parsed.user_term,
+            parsed.llm_draft,
+            raw_validator=catalog.validate_raw_state,
+        )
     if resolved_draft is None:
         raise ToolArgumentError(
             argument="llm_draft",
@@ -3302,6 +3421,7 @@ async def _handle_request_interpretation_review(
         affected_node_id=parsed.affected_node_id,
         state=state,
         list_events_fn=list_interpretation_events,
+        catalog=catalog,
     )
     if idempotent_result is not None:
         return idempotent_result
@@ -3371,7 +3491,11 @@ async def _handle_request_interpretation_review(
         return ToolResult(
             success=True,
             updated_state=state,
-            validation=state.validate(),
+            validation=(
+                await run_sync_in_worker(state.validate)
+                if catalog is None
+                else (await catalog.validate_composition_state_async(state)).validation
+            ),
             affected_nodes=(),
             data={
                 "_kind": "interpretation_review_suppressed_by_opt_out",
@@ -3385,7 +3509,11 @@ async def _handle_request_interpretation_review(
     return ToolResult(
         success=True,
         updated_state=state,  # no state change yet — /resolve advances version
-        validation=state.validate(),
+        validation=(
+            await run_sync_in_worker(state.validate)
+            if catalog is None
+            else (await catalog.validate_composition_state_async(state)).validation
+        ),
         affected_nodes=(parsed.affected_node_id,),
         data={
             "_kind": "interpretation_review_pending",

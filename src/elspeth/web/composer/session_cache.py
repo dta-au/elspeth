@@ -461,6 +461,21 @@ class ComposerSessionCache:
         self._touch()
         self._registry._dispose_if_drained(self)
 
+    def pin_worker(self) -> SessionCacheWorkerPin | None:
+        """Retain a captured owner through an outer worker's actual lifetime.
+
+        Like a request lease, this handle belongs to the caller/actual executor
+        invocation, not a new resident collection. Registry metadata adds only
+        a refcount; the existing bounded worker admission owns future callbacks.
+        An already-drained owner is never resurrected.
+        """
+        with self._registry._lock:
+            if self not in self._registry._owners:
+                return None
+            self._pins += 1
+            self._touch()
+            return SessionCacheWorkerPin(self)
+
     def schemas_loaded(self, snapshot_hash: str) -> frozenset[tuple[str, str]]:
         with self._registry._lock:
             if self._retired or self._schema_revision != snapshot_hash:
@@ -513,6 +528,19 @@ class SessionCacheLease:
                 self.cache._borrows -= 1
                 self.cache._touch()
                 registry._dispose_if_drained(self.cache)
+
+
+class SessionCacheWorkerPin:
+    def __init__(self, cache: ComposerSessionCache) -> None:
+        self._cache = cache
+        self._closed = False
+
+    def close(self) -> None:
+        with self._cache._registry._lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._cache._release_pin()
 
 
 class SessionRetirement:

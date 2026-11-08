@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
-from typing import Literal, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol
 
 from jsonschema import Draft202012Validator
 
@@ -26,6 +26,9 @@ from elspeth.web.plugin_policy.coverage import (
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId, PluginUnavailableReason
 from elspeth.web.plugin_policy.profiles import LoweredPluginConfig
 from elspeth.web.provider_config_policy import web_aws_s3_endpoint_url_policy_error
+
+if TYPE_CHECKING:
+    from elspeth.web.composer.analysis import ComposerAnalysis
 
 
 class ProfileValidationCatalog(Protocol):
@@ -728,14 +731,16 @@ def validate_authored_composition_state(
     snapshot: PluginAvailabilitySnapshot,
     profile_registry: ProfileValidationRegistry | None,
     catalog: ProfileValidationCatalog,
+    analysis: ComposerAnalysis | None = None,
+    profile_generation: str | int | None = None,
 ) -> ProfileAwareValidationResult:
-    """Validate authored state once through the principal's policy boundary."""
+    """Recheck current policy/lowering and reuse only immutable base analysis."""
     if snapshot.is_trained_operator:
         return ProfileAwareValidationResult(
             authored_state=state,
             executable_state=state,
             policy_findings=(),
-            validation=state.validate(),
+            validation=analysis.validate_raw(state) if analysis is not None else state.validate(),
         )
 
     policy = validate_plugin_policy(
@@ -756,7 +761,29 @@ def validate_authored_composition_state(
             warnings=evidence_entries,
         )
     else:
-        executable_summary = policy.executable_state.validate()
+        if analysis is None:
+            executable_summary = policy.executable_state.validate()
+        elif policy.executable_state == state:
+            executable_summary = analysis.validate_raw(state)
+        elif profile_generation is not None:
+            # Key by authored content and non-secret binding revisions. The
+            # private executable state is inspected only for dependency bypass
+            # and temporarily captured by this invocation's computation.
+            executable_summary = analysis.validate_profile_summary(
+                state,
+                policy.executable_state.validate,
+                snapshot_hash=snapshot.snapshot_hash,
+                profile_generation=profile_generation,
+                dependency_state=policy.executable_state,
+            )
+        else:
+            # Detached profile registries without an explicit public revision
+            # have no complete cache identity. Preserve manager scoping while
+            # validating the private lowered state without hashing it.
+            from elspeth.plugins.infrastructure.manager import scoped_plugin_manager
+
+            with scoped_plugin_manager(analysis.manager):
+                executable_summary = policy.executable_state.validate()
         summary = replace(
             executable_summary,
             warnings=(*evidence_entries, *executable_summary.warnings),

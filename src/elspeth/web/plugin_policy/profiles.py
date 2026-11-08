@@ -9,6 +9,7 @@ from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import StrEnum
+from itertools import count
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal, Protocol, Self, final
 
@@ -53,6 +54,7 @@ if TYPE_CHECKING:
 
 
 _S3_MAX_BUCKET_CHARS = 2048
+_PROFILE_REGISTRY_GENERATIONS = count(1)
 
 
 class AWSS3SourceProfileSettings(BaseModel):
@@ -1537,6 +1539,9 @@ class OperatorProfileRegistry:
         from elspeth.web.plugin_policy.models import PluginId
 
         self._policy = policy
+        # Process-local identity for this immutable policy/config binding.
+        # It contains no profile values and cannot be reused like id(self).
+        self._generation = next(_PROFILE_REGISTRY_GENERATIONS)
         llm_transform_resolver = _LLMProfileResolver(
             settings.llm_profiles,
             preferred_alias=settings.default_llm_profile,
@@ -1579,6 +1584,11 @@ class OperatorProfileRegistry:
             )
         if settings.azure_search_profiles:
             self._resolvers[PluginId("transform", "azure_ai_search")] = _AzureSearchProfileResolver(settings.azure_search_profiles)
+
+    @property
+    def generation(self) -> int:
+        """Non-secret revision for one frozen registry construction."""
+        return self._generation
 
     def public_schema(
         self,

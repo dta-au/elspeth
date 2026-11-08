@@ -21,6 +21,7 @@ from elspeth.contracts.composer_progress import ComposerProgressEvent, ComposerP
 from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.session_operation import SessionOperationContext
+from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.composer import advisor_context as _advisor_context
 from elspeth.web.composer import advisor_policy as _advisor_policy
 from elspeth.web.composer._compose_loop_carriers import (
@@ -45,6 +46,7 @@ from elspeth.web.composer.advisor_decision import (
     AdvisorGateDecision,
     AdvisorGatePassed,
 )
+from elspeth.web.composer.analysis import ComposerAnalysis
 from elspeth.web.composer.audit import (
     BufferingRecorder,
 )
@@ -97,7 +99,7 @@ from elspeth.web.composer.protocol import (
     ComposerResult,
 )
 from elspeth.web.composer.provider_quota import ProviderInvocationOwner
-from elspeth.web.composer.state import CompositionState
+from elspeth.web.composer.state import CompositionState, ValidationSummary
 from elspeth.web.composer.tools.generation import (
     ComposerProofContext,
     MalformedSourceProofClaim,
@@ -173,6 +175,8 @@ def _source_proof_unavailable_validation(
     state: CompositionState,
     proof: ProofUnavailable | MalformedSourceProofClaim,
     prior: ValidationResult | None,
+    *,
+    authored_validation: ValidationSummary | None = None,
 ) -> ValidationResult:
     """Retain known validation, distinguishing invalid claims from unavailable bytes."""
     evaluated_configuration_invalid = False
@@ -218,7 +222,7 @@ def _source_proof_unavailable_validation(
             )
         evaluated_configuration_invalid = any(error.error_code != "source_blob_unavailable" for error in additions)
     if prior is None:
-        authored = state.validate()
+        authored = state.validate() if authored_validation is None else authored_validation
         prior = ValidationResult(
             is_valid=authored.is_valid,
             checks=[],
@@ -1174,9 +1178,14 @@ class CompositionCompletion:
         failed_turn: FailedTurnMetadata | None,
         completion_gates: CompletionGateFacts | None,
         provider_owner: ProviderInvocationOwner | None,
+        analysis: ComposerAnalysis | None = None,
     ) -> _TerminateOutcome:
         """Close authoring on the bound observation, retaining END and card duties."""
-        runtime = _source_proof_unavailable_validation(state, proof, last_runtime_preflight)
+        authored_validation = None
+        if last_runtime_preflight is None:
+            raw_analysis = ComposerAnalysis() if analysis is None else analysis
+            authored_validation = await raw_analysis.validate_raw_async(state)
+        runtime = _source_proof_unavailable_validation(state, proof, last_runtime_preflight, authored_validation=authored_validation)
         orphan = await self._surface_pt_and_gate_orphans_or_none(
             state=state,
             session_id=session_id,
@@ -1185,6 +1194,7 @@ class CompositionCompletion:
             assistant_message=assistant_message,
             recorder=recorder,
             progress=progress,
+            analysis=analysis,
         )
         if orphan is not None:
             orphan_runtime = orphan.runtime_preflight
@@ -1232,6 +1242,7 @@ class CompositionCompletion:
                 deadline=deadline,
                 completion_gates=completion_gates,
                 provider_owner=provider_owner,
+                analysis=analysis,
             )
         except _AdvisorCheckpointComposeDeadlineExpired:
             await self._persist_withheld_reply(
@@ -1325,6 +1336,7 @@ class CompositionCompletion:
         repair_turns_used: int,
         plugin_snapshot: PluginAvailabilitySnapshot | None = None,
         session_operation_context: SessionOperationContext | None = None,
+        analysis: ComposerAnalysis | None = None,
     ) -> bool:
         """Pre-finalize runtime-preflight gate (Fix 2).
 
@@ -1365,8 +1377,9 @@ class CompositionCompletion:
         (reuse ``last_runtime_preflight``; recompute via
         ``_cached_runtime_preflight`` only when the state mutated this turn) so
         this gate and the eventual finalize observe the SAME result. The
-        per-turn cache (keyed on ``state.version``) makes the double call free
-        for an unchanged version. ``_cached_runtime_preflight`` may raise the
+        per-turn runtime cache uses the complete preflight identity, so the
+        double call shares its result for the same state and dependencies.
+        ``_cached_runtime_preflight`` may raise the
         same ``ComposerRuntimePreflightError`` finalize would — the enclosing
         ``_try_terminate_no_tools`` handler is shared, so moving the call
         earlier does not change the failure envelope.
@@ -1391,6 +1404,7 @@ class CompositionCompletion:
             recorder=recorder,
             plugin_snapshot=plugin_snapshot,
             session_operation_context=session_operation_context,
+            analysis=analysis,
         )
 
         if runtime_result is None or runtime_result.is_valid:
@@ -1470,6 +1484,7 @@ class CompositionCompletion:
         llm_calls: tuple[ComposerLLMCall, ...] = (),
         plugin_snapshot: PluginAvailabilitySnapshot | None = None,
         session_operation_context: SessionOperationContext | None = None,
+        analysis: ComposerAnalysis | None = None,
     ) -> ComposerResult:
         """Apply the deterministic final-gate check and build a ComposerResult.
 
@@ -1494,6 +1509,7 @@ class CompositionCompletion:
             llm_calls=llm_calls,
             plugin_snapshot=plugin_snapshot,
             session_operation_context=session_operation_context,
+            analysis=analysis,
         )
 
     async def _try_terminate_no_tools(
@@ -1535,6 +1551,7 @@ class CompositionCompletion:
         # 2026-09-22). ``None`` = none known: the END gate reviews as before.
         completion_gates: CompletionGateFacts | None = None,
         provider_owner: ProviderInvocationOwner | None = None,
+        analysis: ComposerAnalysis | None = None,
     ) -> _TerminateOutcome:
         """Phase P2 of the compose loop — handle the no-tool-calls branch.
 
@@ -1587,11 +1604,13 @@ class CompositionCompletion:
                 failed_turn=failed_turn,
                 completion_gates=completion_gates,
                 provider_owner=provider_owner,
+                analysis=analysis,
             )
         if not confirmed_stop and repair_turns_used < _MAX_REPAIR_TURNS:
             missing_interpretation_sites = await self._interpretation_surfacing._missing_pending_interpretation_review_sites(
                 state,
                 session_id=session_id,
+                analysis=analysis,
             )
             if missing_interpretation_sites:
                 # Prompt-template and source-data-contract reviews are surfaced
@@ -1690,6 +1709,7 @@ class CompositionCompletion:
                 repair_turns_used=repair_turns_used,
                 plugin_snapshot=plugin_snapshot,
                 session_operation_context=session_operation_context,
+                analysis=analysis,
             )
         ):
             return _TerminateOutcome(action="continue", repair_turns_delta=1)
@@ -1707,6 +1727,7 @@ class CompositionCompletion:
                 assistant_message=assistant_message,
                 recorder=recorder,
                 progress=progress,
+                analysis=analysis,
             )
             if orphan is not None:
                 orphan_runtime = orphan.runtime_preflight
@@ -1755,6 +1776,7 @@ class CompositionCompletion:
                     recorder=recorder,
                     plugin_snapshot=plugin_snapshot,
                     session_operation_context=session_operation_context,
+                    analysis=analysis,
                 ),
                 user_id=user_id,
                 runtime_preflight_cache=runtime_preflight_cache,
@@ -1765,6 +1787,7 @@ class CompositionCompletion:
                 deadline=deadline,
                 completion_gates=completion_gates,
                 provider_owner=provider_owner,
+                analysis=analysis,
             )
         except _AdvisorCheckpointComposeDeadlineExpired:
             # The model had already replied; the timeout envelope carries no
@@ -1875,6 +1898,7 @@ class CompositionCompletion:
             repair_turns_used=repair_turns_used,
             plugin_snapshot=plugin_snapshot,
             deadline=deadline,
+            analysis=analysis,
         )
         result = _with_advisor_gate_decision(
             result, completion_gates, advisor_gate.advisor_gate_decision, advisor_gate.graph_review_identity
@@ -1905,6 +1929,7 @@ class CompositionCompletion:
         recorder: BufferingRecorder,
         progress: ComposerProgressSink | None,
         runtime_findings: ValidationResult | None = None,
+        analysis: ComposerAnalysis | None = None,
     ) -> ComposerResult | None:
         """Auto-surface backend-derived reviews + run the UNFILTERED orphan gate.
 
@@ -1971,10 +1996,12 @@ class CompositionCompletion:
                 session_id=session_id,
                 current_state_id=current_state_id,
                 session_operation_context=session_operation_context,
+                analysis=analysis,
             )
         orphaned_sites = await self._interpretation_surfacing._missing_pending_interpretation_review_sites(
             state,
             session_id=session_id,
+            analysis=analysis,
         )
         if not orphaned_sites:
             return None
@@ -2043,6 +2070,7 @@ class CompositionCompletion:
         session_operation_context: SessionOperationContext | None = None,
         plugin_snapshot: PluginAvailabilitySnapshot | None = None,
         deadline: float | None = None,
+        analysis: ComposerAnalysis | None = None,
     ) -> ComposerResult:
         """Auto-surface backend-derived reviews, gate orphans, and finalize.
 
@@ -2063,7 +2091,17 @@ class CompositionCompletion:
             no_tool_response = parse_no_tool_response(assistant_message.content or "")
         assistant_message = replace(assistant_message, content=no_tool_response.body)
         runtime_findings = None
-        if state.sources and state.outputs and interpretation_sites(state):
+        if (
+            state.sources
+            and state.outputs
+            and bool(
+                await (
+                    run_sync_in_worker(interpretation_sites, state)
+                    if analysis is None
+                    else analysis.run_in_worker(interpretation_sites, state, raw_validator=analysis.validate_raw)
+                )
+            )
+        ):
             runtime_findings = await self._preflight.pending_handoff_outstanding_findings(
                 state,
                 user_id=user_id,
@@ -2085,6 +2123,7 @@ class CompositionCompletion:
             recorder=recorder,
             progress=progress,
             runtime_findings=runtime_findings,
+            analysis=analysis,
         )
         if orphan_result is not None:
             return orphan_result
@@ -2116,6 +2155,7 @@ class CompositionCompletion:
             llm_calls=recorder.llm_calls,
             plugin_snapshot=plugin_snapshot,
             session_operation_context=session_operation_context,
+            analysis=analysis,
         )
 
         runtime_result = result.runtime_preflight
@@ -2229,6 +2269,7 @@ class CompositionCompletion:
         # 2026-09-22). ``None`` = none known: the END gate reviews as before.
         completion_gates: CompletionGateFacts | None = None,
         provider_owner: ProviderInvocationOwner | None = None,
+        analysis: ComposerAnalysis | None = None,
     ) -> _TerminalNoToolAdvisorGateOutcome:
         """Run the shared terminal no-tool END advisor gate for P2 and P5.
 
@@ -2267,6 +2308,7 @@ class CompositionCompletion:
         orphaned_precheck = await self._interpretation_surfacing._missing_pending_interpretation_review_sites(
             state,
             session_id=session_id,
+            analysis=analysis,
         )
         # Backend-auto-surfaceable sites are pseudo-orphans: the
         # surface+unfiltered-gate pair runs on EVERY terminal no-tool return, so
@@ -2390,7 +2432,17 @@ class CompositionCompletion:
                 )
                 assistant_message = _AdmittedAssistantMessage(content=turn_evidence.render_saved_scope())
             runtime_findings = None
-            if state.sources and state.outputs and interpretation_sites(state):
+            if (
+                state.sources
+                and state.outputs
+                and bool(
+                    await (
+                        run_sync_in_worker(interpretation_sites, state)
+                        if analysis is None
+                        else analysis.run_in_worker(interpretation_sites, state, raw_validator=analysis.validate_raw)
+                    )
+                )
+            ):
                 if deadline is not None and deadline - asyncio.get_running_loop().time() <= 0:
                     raise _AdvisorCheckpointComposeDeadlineExpired
                 runtime_findings = await self._preflight.pending_handoff_outstanding_findings(
@@ -2419,6 +2471,7 @@ class CompositionCompletion:
                     assistant_message=assistant_message,
                     recorder=recorder,
                     progress=progress,
+                    analysis=analysis,
                 )
             if orphan_result is not None:
                 orphan_result = _with_advisor_gate_decision(orphan_result, completion_gates, None)

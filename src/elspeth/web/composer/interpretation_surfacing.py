@@ -6,7 +6,7 @@ provenance at construction; state and operation fences remain per call.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, cast
@@ -16,13 +16,14 @@ from elspeth.contracts.composer_interpretation import InterpretationKind, Interp
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.contracts.trust_boundary import observation_boundary
+from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.composer.invariants import InvariantError
 from elspeth.web.composer.source_demand import (
     build_source_data_contract_draft,
     parse_source_data_contract_accepted_fields,
     sample_header_for_source,
 )
-from elspeth.web.composer.state import CompositionState
+from elspeth.web.composer.state import CompositionState, ValidationSummary
 from elspeth.web.composer.tools.sessions import interpretation_rate_cap_hit
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.interpretation_state import (
@@ -39,7 +40,20 @@ from elspeth.web.interpretation_state import (
 )
 
 if TYPE_CHECKING:
+    from elspeth.web.composer.analysis import ComposerAnalysis
     from elspeth.web.sessions.protocol import PreparedInterpretationEventDraft, SessionServiceProtocol
+
+
+async def _run_surfacing_work[**P, T](
+    analysis: ComposerAnalysis | None,
+    func: Callable[P, T],
+    *args: P.args,
+    **kwargs: P.kwargs,
+) -> T:
+    """Retain operation analysis through the actual worker's completion."""
+    if analysis is None:
+        return await run_sync_in_worker(func, *args, **kwargs)
+    return await analysis.run_in_worker(func, *args, **kwargs)
 
 
 def _has_pending_prompt_template_requirement(options: Mapping[str, Any], *, user_term: str) -> bool:
@@ -194,6 +208,8 @@ async def _auto_surface_prompt_template_reviews_for_state(
     session_operation_context: SessionOperationContext,
     already_surfaced: frozenset[tuple[str, str, InterpretationKind]] = frozenset(),
     repair_mode: bool = False,
+    raw_validator: Callable[[CompositionState], ValidationSummary] | None = None,
+    analysis: ComposerAnalysis | None = None,
 ) -> None:
     """Canonical ``llm_prompt_template`` surfacing pass (see the instance method).
 
@@ -204,10 +220,13 @@ async def _auto_surface_prompt_template_reviews_for_state(
 
     from elspeth.web.sessions.protocol import InterpretationResolveError
 
-    for site in interpretation_sites(state):
+    if analysis is not None:
+        raw_validator = analysis.validate_raw
+    sites = await _run_surfacing_work(analysis, interpretation_sites, state, raw_validator=raw_validator)
+    for site in sites:
         if site.kind is not InterpretationKind.LLM_PROMPT_TEMPLATE:
             continue
-        surfaced = _backend_surface_args_for_site(state, site)
+        surfaced = await _run_surfacing_work(analysis, _backend_surface_args_for_site, state, site, raw_validator=raw_validator)
         if surfaced is None:
             continue
         affected_node_id, user_term, review_draft = surfaced
@@ -251,6 +270,8 @@ async def _auto_surface_prompt_template_reviews_for_state(
 def _backend_surface_args_for_site(
     state: CompositionState,
     site: InterpretationReviewSite,
+    *,
+    raw_validator: Callable[[CompositionState], ValidationSummary] | None = None,
 ) -> tuple[str, str, str] | None:
     """Return ``(affected_node_id, user_term, llm_draft)`` for a site, or
     ``None`` when the writer-boundary precondition does not hold.
@@ -291,7 +312,7 @@ def _backend_surface_args_for_site(
         source = state.sources[source_name] if source_name in state.sources else None
         if source is None or SOURCE_AUTHORING_KEY in source.options:
             return None
-        demand = current_source_data_contract_demand(state, source_name)
+        demand = current_source_data_contract_demand(state, source_name, raw_validator=raw_validator)
         if not demand:
             return None
         draft = build_source_data_contract_draft(demand, sample_header_for_source(source))
@@ -380,6 +401,8 @@ def _backend_surface_args_for_site(
 
 def unsurfaceable_pending_interpretation_review_sites(
     state: CompositionState,
+    *,
+    raw_validator: Callable[[CompositionState], ValidationSummary] | None = None,
 ) -> tuple[InterpretationReviewSite, ...]:
     """Return execution-blocking review sites the backend cannot eventize.
 
@@ -389,7 +412,11 @@ def unsurfaceable_pending_interpretation_review_sites(
     state whose fail-closed execution debt has no consumable review card.
     """
 
-    return tuple(site for site in interpretation_sites(state) if _backend_surface_args_for_site(state, site) is None)
+    return tuple(
+        site
+        for site in interpretation_sites(state, raw_validator=raw_validator)
+        if _backend_surface_args_for_site(state, site, raw_validator=raw_validator) is None
+    )
 
 
 def prepare_pending_interpretation_event_drafts_for_state(
@@ -400,6 +427,7 @@ def prepare_pending_interpretation_event_drafts_for_state(
     model_version: str | None,
     provider: str | None,
     composer_skill_hash: str | None,
+    raw_validator: Callable[[CompositionState], ValidationSummary] | None = None,
 ) -> tuple[PreparedInterpretationEventDraft, ...]:
     """Prepare the generic surfacer's event cohort for atomic settlement.
 
@@ -411,14 +439,14 @@ def prepare_pending_interpretation_event_drafts_for_state(
     """
     from elspeth.web.sessions.protocol import PreparedInterpretationEventDraft
 
-    sites = interpretation_sites(state)
+    sites = interpretation_sites(state, raw_validator=raw_validator)
     ordered_sites = (
         *(site for site in sites if site.kind is InterpretationKind.LLM_PROMPT_TEMPLATE),
         *(site for site in sites if site.kind is not InterpretationKind.LLM_PROMPT_TEMPLATE),
     )
     drafts: list[PreparedInterpretationEventDraft] = []
     for site in ordered_sites:
-        surfaced = _backend_surface_args_for_site(state, site)
+        surfaced = _backend_surface_args_for_site(state, site, raw_validator=raw_validator)
         if surfaced is None:
             raise InvariantError("atomic interpretation cohort contains an unsurfaceable pending site")
         affected_node_id, user_term, llm_draft = surfaced
@@ -453,6 +481,8 @@ async def surface_pending_interpretation_reviews_for_state(
     composer_skill_hash: str | None,
     session_operation_context: SessionOperationContext,
     only_missing_evidence: bool = False,
+    raw_validator: Callable[[CompositionState], ValidationSummary] | None = None,
+    analysis: ComposerAnalysis | None = None,
 ) -> None:
     """Kind-general pending-review surfacer over one persisted state (B1).
 
@@ -475,6 +505,8 @@ async def surface_pending_interpretation_reviews_for_state(
 
     if session_id is None or current_state_id is None:
         return
+    if analysis is not None:
+        raw_validator = analysis.validate_raw
     already_surfaced: frozenset[tuple[str, str, InterpretationKind]] = frozenset()
     if only_missing_evidence:
         already_surfaced = await _surfaced_evidence_keys(
@@ -482,7 +514,7 @@ async def surface_pending_interpretation_reviews_for_state(
             session_id=session_id,
             current_state_id=current_state_id,
         )
-    if not _has_unsurfaced_site(state, already_surfaced):
+    if not await _run_surfacing_work(analysis, _has_unsurfaced_site, state, already_surfaced, raw_validator=raw_validator):
         return
     # Surfacing is a write: the interpretation writer admits only COMPOSE or
     # PROPOSAL authority. A caller holding a shareable BLOB_READ admission
@@ -511,6 +543,8 @@ async def surface_pending_interpretation_reviews_for_state(
                 already_surfaced=already_surfaced,
                 only_missing_evidence=only_missing_evidence,
                 session_operation_context=write_lease.context,
+                raw_validator=raw_validator,
+                analysis=analysis,
             )
         finally:
             await write_lease.close()
@@ -528,16 +562,20 @@ async def surface_pending_interpretation_reviews_for_state(
         already_surfaced=already_surfaced,
         only_missing_evidence=only_missing_evidence,
         session_operation_context=session_operation_context,
+        raw_validator=raw_validator,
+        analysis=analysis,
     )
 
 
 def _has_unsurfaced_site(
     state: CompositionState,
     already_surfaced: frozenset[tuple[str, str, InterpretationKind]],
+    *,
+    raw_validator: Callable[[CompositionState], ValidationSummary] | None = None,
 ) -> bool:
     """Whether the surfacer would write at least once: one predicate for both arms."""
-    for site in interpretation_sites(state):
-        surfaced = _backend_surface_args_for_site(state, site)
+    for site in interpretation_sites(state, raw_validator=raw_validator):
+        surfaced = _backend_surface_args_for_site(state, site, raw_validator=raw_validator)
         if surfaced is None:
             continue
         affected_node_id, user_term, _draft = surfaced
@@ -552,6 +590,8 @@ async def has_pending_interpretation_review_surfacing_debt(
     sessions_service: SessionServiceProtocol,
     session_id: str,
     current_state_id: str,
+    raw_validator: Callable[[CompositionState], ValidationSummary] | None = None,
+    analysis: ComposerAnalysis | None = None,
 ) -> bool:
     """Read whether this committed state's surfaceable sites lack evidence.
 
@@ -560,12 +600,14 @@ async def has_pending_interpretation_review_surfacing_debt(
     A caller finding debt must acquire its own writer authority and run the
     surfacer, which rereads evidence under that authority before writing.
     """
+    if analysis is not None:
+        raw_validator = analysis.validate_raw
     already_surfaced = await _surfaced_evidence_keys(
         sessions_service,
         session_id=session_id,
         current_state_id=current_state_id,
     )
-    return _has_unsurfaced_site(state, already_surfaced)
+    return await _run_surfacing_work(analysis, _has_unsurfaced_site, state, already_surfaced, raw_validator=raw_validator)
 
 
 async def _surface_pending_interpretation_reviews_under_writer(
@@ -582,10 +624,14 @@ async def _surface_pending_interpretation_reviews_under_writer(
     already_surfaced: frozenset[tuple[str, str, InterpretationKind]],
     only_missing_evidence: bool,
     session_operation_context: SessionOperationContext,
+    raw_validator: Callable[[CompositionState], ValidationSummary] | None = None,
+    analysis: ComposerAnalysis | None = None,
 ) -> None:
     """Both surfacing arms under one writer's authority."""
     from elspeth.web.sessions.protocol import InterpretationResolveError
 
+    if analysis is not None:
+        raw_validator = analysis.validate_raw
     # llm_prompt_template is already handled by the existing surfacer,
     # which carries the exact draft-aware dedup the writer boundary needs.
     await _auto_surface_prompt_template_reviews_for_state(
@@ -601,11 +647,14 @@ async def _surface_pending_interpretation_reviews_under_writer(
         already_surfaced=already_surfaced,
         repair_mode=only_missing_evidence,
         session_operation_context=session_operation_context,
+        raw_validator=raw_validator,
+        analysis=analysis,
     )
-    for site in interpretation_sites(state):
+    sites = await _run_surfacing_work(analysis, interpretation_sites, state, raw_validator=raw_validator)
+    for site in sites:
         if site.kind is InterpretationKind.LLM_PROMPT_TEMPLATE:
             continue  # handled above
-        surfaced = _backend_surface_args_for_site(state, site)
+        surfaced = await _run_surfacing_work(analysis, _backend_surface_args_for_site, state, site, raw_validator=raw_validator)
         if surfaced is None:
             continue
         affected_node_id, user_term, llm_draft = surfaced
@@ -724,10 +773,14 @@ class InterpretationSurfacing:
         state: CompositionState,
         *,
         session_id: str | None,
+        raw_validator: Callable[[CompositionState], ValidationSummary] | None = None,
+        analysis: ComposerAnalysis | None = None,
     ) -> tuple[tuple[str, str, InterpretationKind], ...]:
         """Return pending interpretation handoffs that cannot be resolved."""
 
-        sites = interpretation_sites(state)
+        if analysis is not None:
+            raw_validator = analysis.validate_raw
+        sites = await _run_surfacing_work(analysis, interpretation_sites, state, raw_validator=raw_validator)
         if session_id is None:
             return ()
         sessions_service = self._sessions_service_required()
@@ -762,6 +815,8 @@ class InterpretationSurfacing:
         session_id: str | None,
         current_state_id: str | None,
         session_operation_context: SessionOperationContext | None = None,
+        raw_validator: Callable[[CompositionState], ValidationSummary] | None = None,
+        analysis: ComposerAnalysis | None = None,
     ) -> None:
         """Surface a pending ``llm_prompt_template`` review EVENT, backend-derived.
 
@@ -799,11 +854,18 @@ class InterpretationSurfacing:
             provider=self._provider,  # (D2)
             composer_skill_hash=self._composer_skill_hash,  # (D2)
             session_operation_context=session_operation_context,
+            raw_validator=raw_validator,
+            analysis=analysis,
         )
 
-    def prepare_pending_interpretation_reviews(self, state: CompositionState) -> tuple[PreparedInterpretationEventDraft, ...]:
+    def prepare_pending_interpretation_reviews(
+        self,
+        state: CompositionState,
+        *,
+        raw_validator: Callable[[CompositionState], ValidationSummary] | None = None,
+    ) -> tuple[PreparedInterpretationEventDraft, ...]:
         """Freeze the planner candidate's review cohort before its atomic write."""
-        if unsurfaceable_pending_interpretation_review_sites(state):
+        if unsurfaceable_pending_interpretation_review_sites(state, raw_validator=raw_validator):
             raise InvariantError("pipeline candidate has an unsurfaceable pending interpretation site")
         return prepare_pending_interpretation_event_drafts_for_state(
             state,
@@ -812,6 +874,7 @@ class InterpretationSurfacing:
             model_version=self._model_identifier,
             provider=self._provider,
             composer_skill_hash=self._composer_skill_hash,
+            raw_validator=raw_validator,
         )
 
     async def surface_pending_interpretation_reviews(
@@ -822,6 +885,8 @@ class InterpretationSurfacing:
         current_state_id: str | None,
         only_missing_evidence: bool = False,
         session_operation_context: SessionOperationContext,
+        raw_validator: Callable[[CompositionState], ValidationSummary] | None = None,
+        analysis: ComposerAnalysis | None = None,
     ) -> None:
         """Kind-general backend surfacer for persisted composition state.
 
@@ -866,4 +931,6 @@ class InterpretationSurfacing:
             composer_skill_hash=self._composer_skill_hash,
             only_missing_evidence=only_missing_evidence,
             session_operation_context=session_operation_context,
+            raw_validator=raw_validator,
+            analysis=analysis,
         )

@@ -27,7 +27,6 @@ from elspeth.contracts.secrets import WebSecretResolver
 from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.core.canonical import canonical_json, stable_hash
-from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.audit import BufferingRecorder, begin_dispatch, dispatch_with_audit
 from elspeth.web.composer.authority_hashing import (
@@ -423,7 +422,7 @@ async def prepare_pipeline_proposal_commit(
         if remaining <= 0:
             raise PipelineCommitError("pipeline commit preparation timed out", code="TIMEOUT")
         try:
-            return await asyncio.wait_for(run_sync_in_worker(func, *args, **kwargs), timeout=remaining)
+            return await asyncio.wait_for(policy_catalog.run_in_worker(func, *args, **kwargs), timeout=remaining)
         except TimeoutError as exc:
             raise PipelineCommitError("pipeline commit preparation timed out", code="TIMEOUT") from exc
 

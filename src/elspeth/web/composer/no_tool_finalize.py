@@ -12,6 +12,7 @@ from __future__ import annotations
 from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall
 from elspeth.contracts.session_operation import SessionOperationContext
+from elspeth.web.composer.analysis import ComposerAnalysis
 from elspeth.web.composer.composer_preflight import ComposerPreflight
 from elspeth.web.composer.discovery_cache import RuntimePreflightCache as _RuntimePreflightCache
 from elspeth.web.composer.no_tool_policy import (
@@ -65,6 +66,7 @@ async def finalize_no_tool_response(
     llm_calls: tuple[ComposerLLMCall, ...] = (),
     plugin_snapshot: PluginAvailabilitySnapshot | None = None,
     session_operation_context: SessionOperationContext | None = None,
+    analysis: ComposerAnalysis | None = None,
 ) -> ComposerResult:
     """Apply the deterministic final-gate check and build a ComposerResult.
 
@@ -229,6 +231,7 @@ async def finalize_no_tool_response(
         llm_calls=llm_calls,
         plugin_snapshot=plugin_snapshot,
         session_operation_context=session_operation_context,
+        analysis=analysis,
     )
 
     if runtime_result is not None and not runtime_result.is_valid and not _is_pending_interpretation_handoff(runtime_result):

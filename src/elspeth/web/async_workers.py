@@ -650,6 +650,26 @@ async def run_sync_in_worker[**P, T](func: Callable[P, T], *args: P.args, **kwar
     return await _await_worker_future(concurrent_future, cancel_queued=True)
 
 
+async def run_sync_in_worker_with_completion[**P, T](
+    on_complete: Callable[[], None], func: Callable[P, T], /, *args: P.args, **kwargs: P.kwargs
+) -> T:
+    """Release ordinary worker ownership at physical completion.
+
+    The caller acquires its resource before entering this bridge. Submission
+    failures use the existing custody resolution before releasing it; successful
+    submissions attach release to the actual concurrent future before any next
+    await. Request cancellation stays prompt and queued work stays cancellable,
+    exactly as in ``run_sync_in_worker``. The callback must be idempotent.
+    """
+    try:
+        concurrent_future = await _submit_shared(functools.partial(func, *args, **kwargs))
+    except BaseException:
+        on_complete()
+        raise
+    concurrent_future.add_done_callback(lambda _future: on_complete())
+    return await _await_worker_future(concurrent_future, cancel_queued=True)
+
+
 async def run_stream_read_in_worker[**P, T](func: Callable[P, T], *args: P.args, **kwargs: P.kwargs) -> T:
     """Keep a stream read's awaiter alive until its actual shared-pool work ends.
 

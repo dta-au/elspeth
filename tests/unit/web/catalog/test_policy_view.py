@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
+from unittest.mock import patch
 
 import pytest
 from pydantic import SecretBytes
 
 from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
 from elspeth.web.catalog.policy_view import PolicyCatalogView
+from elspeth.web.composer.analysis import ComposerAnalysis
+from elspeth.web.composer.session_cache import ComposerSessionCacheRegistry, SessionCacheKey
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.composer.tools._common import ToolContext
 from elspeth.web.composer.tools.generation import _execute_get_plugin_assistance
@@ -16,6 +20,8 @@ from elspeth.web.plugin_policy.availability import build_plugin_snapshot
 from elspeth.web.plugin_policy.compiler import compile_web_plugin_policy
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId, PluginUnavailableReason
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry, RuntimeWebPluginConfig
+from elspeth.web.plugin_policy.validation import PluginPolicyValidationResult, validate_plugin_policy
+from tests.fixtures.composer_session_cache import make_small_composer_state
 
 
 @dataclass
@@ -411,3 +417,72 @@ def test_web_username_matching_trained_operator_marker_cannot_create_unrestricte
 
     with pytest.raises(ValueError, match="trained_operator_snapshot_required"):
         PolicyCatalogView.for_trained_operator(create_catalog_service(), web_view.snapshot)
+
+
+def test_analysis_binding_clones_view_and_preserves_policy_ownership(view: PolicyCatalogView) -> None:
+    caches = ComposerSessionCacheRegistry()
+    with caches.borrow(SessionCacheKey("local:alice", "view-session")) as lease:
+        analysis = ComposerAnalysis(lease.cache)
+        bound = view.with_analysis(analysis)
+        assert bound is not view
+        assert bound.snapshot is view.snapshot
+        assert bound._profiles is view._profiles
+        assert bound._full is view._full
+        assert bound.analysis is analysis
+        assert view.analysis is not analysis
+        assert view.analysis.cache is None
+
+
+def test_trained_operator_clone_preserves_raw_projection() -> None:
+    catalog = create_catalog_service()
+    snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
+    view = PolicyCatalogView.for_trained_operator(catalog, snapshot)
+    caches = ComposerSessionCacheRegistry()
+    state = make_small_composer_state()
+    with caches.borrow(SessionCacheKey("local:operator", "view-session")) as lease:
+        analysis = ComposerAnalysis(lease.cache)
+        bound = view.with_analysis(analysis)
+        assert bound.snapshot is snapshot
+        assert bound._profiles is None
+        assert bound._full is catalog
+        assert bound.analysis is analysis
+        assert bound.validate_composition_state(state).validation == bound.validate_raw_state(state)
+        assert caches.snapshot().hits == 1
+
+
+@pytest.mark.asyncio
+async def test_full_async_projection_runs_current_policy_off_event_loop(view: PolicyCatalogView) -> None:
+    state = make_small_composer_state()
+    loop_thread = threading.get_ident()
+    policy_threads: list[int] = []
+
+    def current_policy(*args: object, **kwargs: object) -> PluginPolicyValidationResult:
+        policy_threads.append(threading.get_ident())
+        return validate_plugin_policy(state, snapshot=view.snapshot, profile_registry=view._profiles, catalog=view._full)
+
+    with patch("elspeth.web.plugin_policy.validation.validate_plugin_policy", side_effect=current_policy):
+        first = await view.validate_composition_state_async(state)
+        second = await view.validate_composition_state_async(state)
+    assert first == second
+    assert len(policy_threads) == 2
+    assert all(worker != loop_thread for worker in policy_threads)
+
+
+@pytest.mark.asyncio
+async def test_async_projection_uses_bound_analysis_worker_pin(view: PolicyCatalogView) -> None:
+    state = make_small_composer_state()
+    caches = ComposerSessionCacheRegistry()
+    with caches.borrow(SessionCacheKey("local:alice", "view-worker")) as lease:
+        analysis = ComposerAnalysis(lease.cache)
+        bound = view.with_analysis(analysis)
+        pins: list[int] = []
+
+        def current_policy(*args: object, **kwargs: object) -> PluginPolicyValidationResult:
+            pins.append(caches.snapshot().pins)
+            return validate_plugin_policy(state, snapshot=bound.snapshot, profile_registry=bound._profiles, catalog=bound._full)
+
+        with patch("elspeth.web.plugin_policy.validation.validate_plugin_policy", side_effect=current_policy):
+            result = await bound.validate_composition_state_async(state)
+        assert result.validation == bound.validate_composition_state(state).validation
+        assert pins == [1]
+        assert caches.snapshot().pins == 0

@@ -13,6 +13,7 @@ from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
 from elspeth.contracts.errors import FrameworkBugError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.secrets import SecretInventoryItem, SecretScope, SecretUnavailabilityReason
+from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.redaction import _OmittableString
 from elspeth.web.composer.response_contracts import SelectedResponseContract
@@ -205,11 +206,12 @@ def _handle_list_secret_refs(
             "Secret tools require secret service context.",
             error_code="secret_context_unavailable",
             rejected_component=None,
+            catalog=context.catalog,
         )
     items = context.secret_service.list_refs(context.user_id)
     # Return inventory dicts — NEVER include values
     data = [_inventory_item_payload(item) for item in items]
-    return _discovery_result(state, data)
+    return _discovery_result(state, data, catalog=context.catalog)
 
 
 _LIST_SECRET_REFS_DECLARATION = ToolDeclaration(
@@ -237,6 +239,7 @@ def _handle_validate_secret_ref(
             "Secret tools require secret service context.",
             error_code="secret_context_unavailable",
             rejected_component=None,
+            catalog=context.catalog,
         )
     try:
         validated = _ValidateSecretRefArgumentsModel.model_validate(arguments)
@@ -259,8 +262,8 @@ def _handle_validate_secret_ref(
         payload = _inventory_item_payload(matching_item)
         payload["available"] = available
         payload["reason"] = None if available else _live_validation_failure_reason(matching_item)
-        return _discovery_result(state, payload)
-    return _discovery_result(state, {"name": name, "available": available})
+        return _discovery_result(state, payload, catalog=context.catalog)
+    return _discovery_result(state, {"name": name, "available": available}, catalog=context.catalog)
 
 
 _VALIDATE_SECRET_REF_DECLARATION = ToolDeclaration(
@@ -288,6 +291,8 @@ def _reconciled_secret_wire_result(
     state: CompositionState,
     new_state: CompositionState,
     affected: tuple[str, ...],
+    *,
+    catalog: PolicyCatalogView | None = None,
 ) -> ToolResult:
     """Publish a secret wire only after authoritative review reconciliation.
 
@@ -305,6 +310,7 @@ def _reconciled_secret_wire_result(
             review_reconciliation_failure_message(exc, retry_hint="Re-inspect the pipeline and retry."),
             error_code="review_reconciliation_failed",
             rejected_component=None,
+            catalog=catalog,
         )
     canonical_error = _composition_canonical_interpretation_requirement_error(
         reconciled,
@@ -316,8 +322,9 @@ def _reconciled_secret_wire_result(
             canonical_error,
             error_code="interpretation_requirements_invalid",
             rejected_component=None,
+            catalog=catalog,
         )
-    return _mutation_result(reconciled, affected)
+    return _mutation_result(reconciled, affected, catalog=catalog)
 
 
 def _execute_wire_secret_ref(
@@ -331,6 +338,7 @@ def _execute_wire_secret_ref(
             "Secret tools require secret service context.",
             error_code="secret_context_unavailable",
             rejected_component=None,
+            catalog=context.catalog,
         )
 
     try:
@@ -355,6 +363,7 @@ def _execute_wire_secret_ref(
             f"Secret reference '{name}' not found or not accessible.",
             error_code="missing_secret_ref",
             rejected_component=None,
+            catalog=context.catalog,
         )
 
     marker = {"secret_ref": name}
@@ -366,6 +375,7 @@ def _execute_wire_secret_ref(
                 "No source configured — set a source first.",
                 error_code="source_not_found",
                 rejected_component=None,
+                catalog=context.catalog,
             )
         if target_id is None:
             if len(state.sources) == 1:
@@ -376,6 +386,7 @@ def _execute_wire_secret_ref(
                     "target_id is required for source targets when multiple sources are configured.",
                     error_code="secret_target_required",
                     rejected_component=None,
+                    catalog=context.catalog,
                 )
         else:
             source_name = str(target_id)
@@ -386,6 +397,7 @@ def _execute_wire_secret_ref(
                 f"Source '{source_name}' not found.",
                 error_code="source_not_found",
                 rejected_component=source_component_id(source_name),
+                catalog=context.catalog,
             )
         authorization_error = secret_wiring_authorization_error(
             context.secret_wiring_policy,
@@ -400,6 +412,7 @@ def _execute_wire_secret_ref(
                 authorization_error,
                 error_code="unauthorized_secret_ref",
                 rejected_component=source_component_id(source_name),
+                catalog=context.catalog,
             )
         patched_options = dict(deep_thaw(source.options))
         patched_options[option_key] = marker
@@ -410,6 +423,7 @@ def _execute_wire_secret_ref(
                 endpoint_policy_error,
                 error_code="aws_s3_endpoint_url_not_allowed",
                 rejected_component=source_component_id(source_name),
+                catalog=context.catalog,
             )
         placement_error = _secret_ref_placement_error("source", source.plugin, patched_options)
         if placement_error is not None:
@@ -418,11 +432,12 @@ def _execute_wire_secret_ref(
                 placement_error,
                 error_code="disallowed_secret_ref",
                 rejected_component=source_component_id(source_name),
+                catalog=context.catalog,
             )
         new_source = replace(source, options=patched_options)
         new_state = state.with_named_source(source_name, new_source)
         affected = "source" if source_name == "source" else f"source:{source_name}"
-        return _reconciled_secret_wire_result(state, new_state, (affected,))
+        return _reconciled_secret_wire_result(state, new_state, (affected,), catalog=context.catalog)
 
     elif target == "node":
         if target_id is None:
@@ -431,6 +446,7 @@ def _execute_wire_secret_ref(
                 "target_id is required for node targets.",
                 error_code="secret_target_required",
                 rejected_component=None,
+                catalog=context.catalog,
             )
         node = next((n for n in state.nodes if n.id == target_id), None)
         if node is None:
@@ -439,6 +455,7 @@ def _execute_wire_secret_ref(
                 f"Node '{target_id}' not found.",
                 error_code="node_not_found",
                 rejected_component=f"node:{target_id}",
+                catalog=context.catalog,
             )
         if node.node_type not in ("transform", "aggregation", "collector") or node.plugin is None:
             return _saved_graph_rejection_result(
@@ -446,6 +463,7 @@ def _execute_wire_secret_ref(
                 "Secret references can only be wired into source, transform, aggregation, collector, or output plugin options.",
                 error_code="secret_target_unsupported",
                 rejected_component=f"node:{target_id}",
+                catalog=context.catalog,
             )
         # ``"transform"`` covers aggregation and collector nodes too — the
         # same vocabulary ``_secret_ref_placement_error`` and centralized
@@ -463,6 +481,7 @@ def _execute_wire_secret_ref(
                 authorization_error,
                 error_code="unauthorized_secret_ref",
                 rejected_component=f"node:{target_id}",
+                catalog=context.catalog,
             )
         patched_options = dict(deep_thaw(node.options))
         patched_options[option_key] = marker
@@ -473,10 +492,11 @@ def _execute_wire_secret_ref(
                 placement_error,
                 error_code="disallowed_secret_ref",
                 rejected_component=f"node:{target_id}",
+                catalog=context.catalog,
             )
         new_node = replace(node, options=patched_options)
         new_state = state.with_node(new_node)
-        return _reconciled_secret_wire_result(state, new_state, (target_id,))
+        return _reconciled_secret_wire_result(state, new_state, (target_id,), catalog=context.catalog)
 
     else:
         # ``target == "output"`` — Pydantic ``Literal["source", "node", "output"]``
@@ -488,6 +508,7 @@ def _execute_wire_secret_ref(
                 "target_id is required for output targets.",
                 error_code="secret_target_required",
                 rejected_component=None,
+                catalog=context.catalog,
             )
         output = next((o for o in state.outputs if o.name == target_id), None)
         if output is None:
@@ -496,6 +517,7 @@ def _execute_wire_secret_ref(
                 f"Output '{target_id}' not found.",
                 error_code="output_not_found",
                 rejected_component=f"output:{target_id}",
+                catalog=context.catalog,
             )
         authorization_error = secret_wiring_authorization_error(
             context.secret_wiring_policy,
@@ -510,6 +532,7 @@ def _execute_wire_secret_ref(
                 authorization_error,
                 error_code="unauthorized_secret_ref",
                 rejected_component=f"output:{target_id}",
+                catalog=context.catalog,
             )
         patched_options = dict(deep_thaw(output.options))
         patched_options[option_key] = marker
@@ -520,6 +543,7 @@ def _execute_wire_secret_ref(
                 endpoint_policy_error,
                 error_code="aws_s3_endpoint_url_not_allowed",
                 rejected_component=f"output:{target_id}",
+                catalog=context.catalog,
             )
         placement_error = _secret_ref_placement_error("sink", output.plugin, patched_options)
         if placement_error is not None:
@@ -528,10 +552,11 @@ def _execute_wire_secret_ref(
                 placement_error,
                 error_code="disallowed_secret_ref",
                 rejected_component=f"output:{target_id}",
+                catalog=context.catalog,
             )
         new_output = replace(output, options=patched_options)
         new_state = state.with_output(new_output)
-        return _reconciled_secret_wire_result(state, new_state, (target_id,))
+        return _reconciled_secret_wire_result(state, new_state, (target_id,), catalog=context.catalog)
 
 
 _WIRE_SECRET_REF_DECLARATION = ToolDeclaration(

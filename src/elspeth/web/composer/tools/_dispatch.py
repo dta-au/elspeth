@@ -666,6 +666,7 @@ def _validate_tool_arguments(
     state: CompositionState,
     *,
     raise_on_error: bool = False,
+    catalog: PolicyCatalogView | None = None,
 ) -> ToolResult | None:
     if raise_on_error:
         require_schema_valid_arguments(tool_name, arguments)
@@ -673,7 +674,7 @@ def _validate_tool_arguments(
     errors = _schema_errors(tool_name, arguments)
     if not errors:
         return None
-    return _failure_result(state, f"Invalid arguments for tool '{tool_name}': {_schema_error_summary(errors[0])}.")
+    return _failure_result(state, f"Invalid arguments for tool '{tool_name}': {_schema_error_summary(errors[0])}.", catalog=catalog)
 
 
 def _requires_secret_context(tool_name: str) -> bool:
@@ -775,6 +776,7 @@ def _enforce_composition_interpretation_gate(
     tool_name: str,
     effects: ToolEffects,
     prior_state: CompositionState,
+    catalog: PolicyCatalogView | None = None,
 ) -> ToolResult:
     """Reject a successful public state mutation before its result is published."""
     if not result.success or EffectDomain.GRAPH not in effects.domains:
@@ -789,6 +791,7 @@ def _enforce_composition_interpretation_gate(
         prior_state,
         canonical_error,
         error_code="interpretation_requirements_invalid",
+        catalog=catalog,
     )
 
 
@@ -839,10 +842,9 @@ def execute_tool(
     the ``ToolContext`` constructed below from the caller's kwargs.
 
     Mutation tools are wrapped by ``_inject_prior_validation`` so the
-    returned ToolResult carries the pre-mutation ValidationSummary on
-    ``prior_validation`` (used by the compose loop to compute a delta
-    against the post-mutation validation without re-running
-    ``state.validate()``).
+    returned ToolResult carries the keyed pre-mutation ValidationSummary on
+    ``prior_validation`` for delta computation. Result helpers and outward
+    normalization resolve exact-state advice through the same policy view.
 
     Args:
         data_dir: Base data directory for S2 path allowlist enforcement.
@@ -859,11 +861,10 @@ def execute_tool(
             denies every wiring — deny-by-default, never an allow.
         user_id: Current user ID. Required for secret tools.
         baseline: Baseline state for diff_pipeline comparisons.
-        prior_validation: Pre-computed validation for the current state.
-            When provided, mutation tools reuse this instead of calling
-            state.validate() for the pre-mutation delta. Callers should
-            thread the previous ToolResult.validation forward — the state
-            is immutable, so validation is deterministic.
+        prior_validation: Legacy delta input retained for direct callers.
+            Current-state validation is resolved through the catalog's
+            keyed analysis; a previous failed result can contain rejection
+            feedback rather than findings about the surviving state.
         runtime_preflight: Optional callback for runtime-equivalent preflight.
             Only applied to preview_pipeline. Pre-computed in the async
             compose loop and injected here as a cheap synchronous callback
@@ -918,9 +919,9 @@ def execute_tool(
         **_SECRET_MUTATION_TOOLS,
     }
     if tool_name not in all_handlers:
-        return normalize_tool_result_validation(_failure_result(state, f"Unknown tool: {tool_name}"), catalog)
+        return normalize_tool_result_validation(_failure_result(state, f"Unknown tool: {tool_name}", catalog=catalog), catalog)
     handler = all_handlers[tool_name]
-    current_validation = prior_validation or catalog.validate_composition_state(state).validation
+    current_validation = catalog.validate_composition_state(state).validation
 
     if validate_arguments or raise_schema_argument_errors:
         argument_error = _validate_tool_arguments(
@@ -928,6 +929,7 @@ def execute_tool(
             arguments,
             state,
             raise_on_error=raise_schema_argument_errors,
+            catalog=catalog,
         )
         if argument_error is not None:
             return normalize_tool_result_validation(argument_error, catalog)
@@ -939,16 +941,15 @@ def execute_tool(
                 "Secret tools require secret service context.",
                 error_code="secret_context_unavailable",
                 rejected_component=None,
+                catalog=catalog,
             ),
             catalog,
         )
         return _augment_with_validation_guidance(result, tool_name)
 
-    # ``current_validation`` carries the live state's ValidationSummary
-    # into ``diff_pipeline`` so its delta against the baseline is computed
-    # using the caller's pre-mutation validation rather than re-running
-    # ``state.validate()`` inside the handler. For every other handler,
-    # the field is unused.
+    # This is keyed advice about the current state, independent of any
+    # rejection feedback carried from a previous tool. Handlers receive the
+    # same bound policy view and analysis when they need another state.
     context = ToolContext(
         catalog=catalog,
         plugin_snapshot=plugin_snapshot,
@@ -985,6 +986,7 @@ def execute_tool(
         tool_name=tool_name,
         effects=effects,
         prior_state=state,
+        catalog=catalog,
     )
 
     return finalize_tool_result(
@@ -1024,7 +1026,7 @@ def execute_discovery_tool_with_context(
             code="DISCOVERY_ONLY",
         )
     handler = discovery_handlers[tool_name]
-    argument_error = _validate_tool_arguments(tool_name, arguments, state, raise_on_error=True)
+    argument_error = _validate_tool_arguments(tool_name, arguments, state, raise_on_error=True, catalog=context.catalog)
     assert argument_error is None
     if _requires_secret_context(tool_name) and (context.secret_service is None or context.user_id is None):
         return normalize_tool_result_validation(
@@ -1033,10 +1035,11 @@ def execute_discovery_tool_with_context(
                 "Secret tools require secret service context.",
                 error_code="secret_context_unavailable",
                 rejected_component=None,
+                catalog=context.catalog,
             ),
             context.catalog,
         )
-    prior_validation = context.current_validation or context.catalog.validate_composition_state(state).validation
+    prior_validation = context.catalog.validate_composition_state(state).validation
     result = handler(dict(arguments), state, context)
     return finalize_tool_result(
         result,
