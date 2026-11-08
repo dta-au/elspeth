@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 from uuid import UUID, uuid4
 
 import pytest
@@ -314,13 +314,15 @@ async def test_settlement_rejects_rewritten_state_keyed_by_parent_blob(engine, t
 
 def _wire_state_projection(app) -> None:
     """The catalog wiring ``GET /state`` needs (as the sibling route tests do)."""
+    from elspeth.web.composer.session_cache import ComposerSessionCacheRegistry
     from elspeth.web.dependencies import create_catalog_service
     from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
-    from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
+    from tests.unit.web.composer.test_tools import _empty_operator_profiles
 
     catalog = create_catalog_service()
     app.state.catalog_service = catalog
-    app.state.operator_profile_registry = MagicMock(spec=OperatorProfileRegistry)
+    app.state.operator_profile_registry = _empty_operator_profiles()
+    app.state.composer_session_cache_registry = ComposerSessionCacheRegistry()
     app.state.plugin_snapshot_factory = lambda _user: PluginAvailabilitySnapshot.for_trained_operator(catalog)
 
 

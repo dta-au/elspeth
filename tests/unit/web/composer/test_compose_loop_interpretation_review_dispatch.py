@@ -695,11 +695,22 @@ def _build_composer(
 ) -> ComposerServiceImpl:
     from unittest.mock import MagicMock
 
-    from elspeth.web.catalog.protocol import CatalogService
-    from elspeth.web.catalog.schemas import PluginSummary
+    from elspeth.web.catalog.protocol import CatalogService, PluginKind
+    from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
     from elspeth.web.config import WebSettings
 
     catalog = MagicMock(spec=CatalogService)
+
+    def schema(plugin_type: PluginKind, name: str) -> PluginSchemaInfo:
+        return PluginSchemaInfo(
+            name=name,
+            plugin_type=plugin_type,
+            description=f"{name} {plugin_type}",
+            json_schema={"properties": {}},
+            knob_schema={"fields": []},
+        )
+
+    catalog.get_schema.side_effect = schema
     catalog.list_sources.return_value = [
         PluginSummary(name="null", description="Null source", plugin_type="source", config_fields=[]),
     ]
@@ -1241,6 +1252,12 @@ async def test_fresh_session_set_pipeline_then_request_interpretation_review_per
         "request_interpretation_review",
     ]
     assert [inv.status.value for inv in invocations] == ["success", "success"]
+    # Invocation SUCCESS also permits an ordinary ToolResult refusal. Prove
+    # the preceding pipeline actually committed before reviewing its state.
+    assert invocations[0].result_canonical is not None
+    assert json.loads(invocations[0].result_canonical)["success"] is True
+    assert invocations[0].version_after is not None
+    assert invocations[0].version_after > invocations[0].version_before
 
     events = await sessions_service.list_interpretation_events(session_id, status="pending")
     # The model staged the vague_term review via the tool; the backend also

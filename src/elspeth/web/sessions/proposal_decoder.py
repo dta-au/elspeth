@@ -183,12 +183,13 @@ def _restore_authoritative_pipeline_proposal(
     private_hash = _pipeline_private_arguments_hash(row.arguments_json)
     if payload["private_arguments_hash"] != private_hash:
         raise AuditIntegrityError("pipeline proposal private arguments binding mismatch")
-    if payload["audit_payload_hash"] != _pipeline_audit_payload_hash(
+    audit_payload_hash = _pipeline_audit_payload_hash(
         summary=row.summary,
         rationale=row.rationale,
         affects=row.affects,
         arguments_redacted_json=row.arguments_redacted_json,
-    ):
+    )
+    if payload["audit_payload_hash"] != audit_payload_hash:
         raise AuditIntegrityError("pipeline proposal audit payload binding mismatch")
     if None in {
         row.composer_model_identifier,
@@ -255,10 +256,16 @@ def _restore_authoritative_pipeline_proposal(
         creation_schema=schema,
         creation_actor=creation_event.actor,
     )
-    return replace(
+    # The comparison above computed this exact immutable row's payload hash.
+    # Reuse only that derived value, never the stored expected commitment.
+    object.__setattr__(authority, "_audit_payload_hash_memo", audit_payload_hash)
+    enriched = replace(
         authority,
         row=replace(row, pipeline_metadata=_pipeline_public_metadata(authority)),
     )
+    # Only public metadata changed; all hash preimage fields are identical.
+    object.__setattr__(enriched, "_audit_payload_hash_memo", audit_payload_hash)
+    return enriched
 
 
 def _classify_authoritative_composition_proposal(
@@ -294,16 +301,20 @@ def _classify_authoritative_composition_proposal(
 
 def _pipeline_public_metadata(authority: AuthoritativePipelineProposal) -> PipelineProposalPublicMetadata:
     payload = authority.proposal
+    audit_payload_hash = authority._audit_payload_hash_memo
+    if audit_payload_hash is None:
+        audit_payload_hash = _pipeline_audit_payload_hash(
+            summary=authority.row.summary,
+            rationale=authority.row.rationale,
+            affects=authority.row.affects,
+            arguments_redacted_json=authority.row.arguments_redacted_json,
+        )
+        object.__setattr__(authority, "_audit_payload_hash_memo", audit_payload_hash)
     return PipelineProposalPublicMetadata(
         draft_hash=payload.draft_hash,
         base=_proposal_base_payload(payload.base),
         repair_count=payload.repair_count,
         skill_hash=payload.skill_hash,
-        audit_payload_hash=_pipeline_audit_payload_hash(
-            summary=authority.row.summary,
-            rationale=authority.row.rationale,
-            affects=authority.row.affects,
-            arguments_redacted_json=authority.row.arguments_redacted_json,
-        ),
+        audit_payload_hash=audit_payload_hash,
         custody_result=authority.custody_result,
     )

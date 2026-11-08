@@ -514,7 +514,7 @@ class TestOperationOwnedSourceDemand:
     async def test_async_surfacing_reads_fresh_events_and_runs_graph_work_off_loop(self, use_analysis: bool) -> None:
         state = _fan_in_state({"src_a": _csv_source(_observed("id")), "src_b": _csv_source(_observed("id"))})
         sessions = MagicMock(spec=SessionServiceProtocol)
-        sessions.list_interpretation_events = AsyncMock(return_value=[])
+        sessions.list_interpretation_events = AsyncMock(spec=SessionServiceProtocol.list_interpretation_events, return_value=[])
         surfacing = InterpretationSurfacing(
             sessions_service=sessions,
             per_term_cap=4,

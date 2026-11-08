@@ -10,7 +10,9 @@ import pytest
 from pydantic import BaseModel
 
 from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager, scoped_plugin_manager
+from elspeth.web.composer.analysis import ComposerAnalysis
 from elspeth.web.composer.pipeline_proposal import composition_content_hash
+from elspeth.web.composer.session_cache import ComposerSessionCacheRegistry, SessionCacheKey
 from elspeth.web.composer.state import CompositionState, ValidationSummary
 from tests.fixtures.composer_session_cache import (
     SCENARIO_NAMES,
@@ -19,6 +21,7 @@ from tests.fixtures.composer_session_cache import (
     make_composer_validation_scenario,
     make_small_composer_state,
     run_validation,
+    validation_for_analysis,
 )
 
 
@@ -129,3 +132,31 @@ def test_supplied_validation_mode_receives_the_exact_benchmark_input() -> None:
 
     assert run_validation(scenario, reference_mode) == scenario.validate()
     assert observed == [scenario.state]
+
+
+@pytest.mark.parametrize("name", SCENARIO_NAMES)
+@pytest.mark.parametrize("enabled", [False, True], ids=["disabled-control", "retained"])
+def test_ten_session_reads_preserve_results_and_remove_repeated_work(name: ScenarioName, enabled: bool) -> None:
+    scenario = make_composer_validation_scenario(name)
+    with count_composer_work() as reference_counts:
+        expected = run_validation(scenario)
+    assert reference_counts.validation_walks == 1
+    registry = ComposerSessionCacheRegistry(enabled=enabled)
+    key = SessionCacheKey("performance-fixture", name)
+    # Borrow anew on every read, as separate requests do; never retain a view
+    # with an expired request lease just to make the benchmark faster.
+    with count_composer_work() as counts:
+        for _ in range(10):
+            with registry.borrow(key) as lease:
+                validator = validation_for_analysis(scenario, ComposerAnalysis(lease.cache))
+                reconstructed = CompositionState.from_dict(scenario.state.to_dict())
+                assert validator(reconstructed) == expected
+    expected_walks = 1 if enabled else 10
+    assert counts.validation_walks == expected_walks
+    assert counts.transform_constructions == reference_counts.transform_constructions * expected_walks
+    snapshot = registry.snapshot()
+    assert snapshot.borrows == snapshot.pins == snapshot.pending_entries == snapshot.queued_jobs == 0
+    assert snapshot.weight_bytes <= registry.limits.total_weight_bytes
+    assert (snapshot.retained_entries > 0) is enabled
+    registry.begin_shutdown()
+    assert registry.snapshot().weight_bytes == 0

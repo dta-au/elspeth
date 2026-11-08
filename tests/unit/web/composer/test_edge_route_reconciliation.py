@@ -19,6 +19,7 @@ from typing import Any, Literal
 
 import pytest
 
+from elspeth.web.composer.analysis import ComposerAnalysis
 from elspeth.web.composer.discovery_cache import serialize_tool_result
 from elspeth.web.composer.error_codes import REGISTERED_ERROR_CODES
 from elspeth.web.composer.pipeline_planner import _allowlisted_candidate_feedback
@@ -839,11 +840,11 @@ def test_graph_late_real_invariant_refuses_private_edge_and_scalar_together(monk
     expected = next(entry for entry in state.validate().errors if entry.error_code == "node_timeout_unsupported")
     original, observed = transforms._post_mutation_invariant_error, []
 
-    def invariant(proposed: CompositionState) -> tuple[str, str] | None:
+    def invariant(proposed: CompositionState, *, analysis: ComposerAnalysis | None = None) -> tuple[str, str] | None:
         assert proposed is not state and proposed.version > state.version
         assert _edge(proposed, "private-route").to_node == "main"
         assert _node(proposed, "after").on_error == "main" and _node(state, "after").on_error == "discard"
-        outcome = original(proposed)
+        outcome = original(proposed, analysis=analysis)
         assert outcome == (expected.message, expected.error_code)
         observed.append(proposed)
         return outcome

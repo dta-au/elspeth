@@ -8,13 +8,14 @@ from __future__ import annotations
 
 import copy
 import json
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from uuid import UUID
 
 import pytest
+import pytest_asyncio
 import structlog
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
@@ -324,8 +325,8 @@ def _build_settings(data_dir: Path) -> WebSettings:
     )
 
 
-@pytest.fixture
-def parity_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ParityEnv:
+@pytest_asyncio.fixture
+async def parity_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[ParityEnv]:
     """Build the real production stack with provider and policy controls."""
     engine = create_session_engine(f"sqlite:///{tmp_path / 'sessions.sqlite3'}")
     initialize_session_schema(engine)
@@ -378,7 +379,10 @@ def parity_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ParityEnv:
         "elspeth.web.composer.service.compute_availability",
         lambda **_kwargs: ComposerAvailability(available=True, provider="test", model="test/planner", reason=None),
     )
-    # Production WEB mode resolves operator profiles through the same policy.
+    # Production WEB mode shares one session owner across Composer and routes.
+    from elspeth.web.composer.session_cache import ComposerSessionCacheRegistry
+
+    session_caches = ComposerSessionCacheRegistry()
     composer = ComposerServiceImpl(
         catalog=catalog,
         settings=settings,
@@ -386,6 +390,7 @@ def parity_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ParityEnv:
         session_engine=engine,
         secret_service=None,
         plugin_snapshot_factory=build_snapshot,
+        session_cache_registry=session_caches,
         operator_profile_registry=operator_profile_registry,
     )
 
@@ -405,7 +410,7 @@ def parity_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ParityEnv:
     app.state.composer_service = composer
     app.state.interpretation_surfacing = composer._interpretation_surfacing
     app.state.planning_application = composer._planning_application
-    app.state.schema_disclosure = composer._schema_disclosure
+    app.state.composer_session_cache_registry = session_caches
     app.state.rate_limiter = ComposerRateLimiter(limit=1000)
     app.state.catalog_service = catalog
     app.state.web_plugin_policy = web_plugin_policy
@@ -425,4 +430,7 @@ def parity_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ParityEnv:
             monkeypatch=monkeypatch,
         )
     finally:
+        session_caches.begin_shutdown()
+        await app.state.composer_async_worker.stop()
+        await session_caches.finish_shutdown()
         engine.dispose()

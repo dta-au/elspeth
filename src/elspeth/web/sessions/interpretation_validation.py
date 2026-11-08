@@ -35,6 +35,7 @@ class _PluginValidationFacts:
     full_schema_json: str = field(repr=False)
     public_schema_json: str = field(repr=False)
     profiles: tuple[tuple[str, DetachedProfileLowering], ...] = field(repr=False)
+    endpoint_default: str | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if type(self.plugin_id) is not PluginId:
@@ -42,6 +43,8 @@ class _PluginValidationFacts:
         _assert_closed_plugin_identity(self.plugin_id.kind, self.plugin_id.name)
         if type(self.full_schema_json) is not str or type(self.public_schema_json) is not str:
             raise TypeError("interpretation validation schemas must be exact JSON strings")
+        if self.endpoint_default is not None and type(self.endpoint_default) is not str:
+            raise TypeError("interpretation endpoint default must be an exact string")
         if type(self.profiles) is not tuple:
             raise TypeError("interpretation validation profiles must be an exact tuple")
         for item in self.profiles:
@@ -93,6 +96,12 @@ class SessionInterpretationValidationInputs:
                     raise AuditIntegrityError("interpretation validation schema identity disagrees with the captured plugin")
                 return PluginSchemaInfo.model_validate_json(entry.public_schema_json, strict=True)
         raise AuditIntegrityError("interpretation validation public schema is absent")
+
+    def default_endpoint_for(self, plugin_id: PluginId) -> str | None:
+        for entry in self.plugins:
+            if entry.plugin_id == plugin_id:
+                return entry.endpoint_default
+        return None
 
     def lower_options(self, plugin_id: PluginId, *, alias: str, safe_options: dict[str, object]) -> LoweredPluginConfig:
         for entry in self.plugins:
@@ -147,8 +156,10 @@ def build_interpretation_validation_inputs(
         raise AuditIntegrityError("interpretation validation snapshot has invalid canonical authority")
     aliases_by_plugin = dict(copied_snapshot.usable_profile_aliases)
     entries: list[_PluginValidationFacts] = []
-    if not copied_snapshot.is_trained_operator:
+    if copied_snapshot.available:
         for plugin_id in sorted(copied_snapshot.available):
+            if copied_snapshot.is_trained_operator and plugin_id != PluginId("transform", "azure_document_intelligence"):
+                continue
             full_schema = catalog.get_schema(plugin_id.kind, plugin_id.name)
             if type(full_schema) is not PluginSchemaInfo:
                 raise TypeError("interpretation validation catalog schema must be exact")
@@ -162,6 +173,7 @@ def build_interpretation_validation_inputs(
                     full_schema_json=full_schema.model_dump_json(warnings="error"),
                     public_schema_json=public_schema.model_dump_json(warnings="error"),
                     profiles=tuple((alias, profile_registry.detach_validation_lowering(plugin_id, alias=alias)) for alias in aliases),
+                    endpoint_default=profile_registry.default_endpoint_for(plugin_id),
                 )
             )
     return SessionInterpretationValidationInputs(snapshot_json, tuple(entries))

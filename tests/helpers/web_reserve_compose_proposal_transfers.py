@@ -386,7 +386,7 @@ def _source3_local_transfers(units):
 # remain explicit common-boundary obligations in the returned receipt.
 _REVIEWED_METHOD_SHAPES = {
     TURN: "d25a75d9b850b14d6eb35f77c5984bd39e9f77149249fcfe09440aaf6258c1ff",
-    SERVICE: "0513878f81043a5838f159ca8cddab63a3209b98c03eebd40356976b5745cd84",
+    SERVICE: "642a8f0c6686166b7fa2566dcd1b548d9975489f452c959afe3afaaa1038e9f9",
     PROPOSALS: "23ef777eef8f72ed82e5943f633d94fdaa6d4f76cab9bd7ef9ec642adc59a8ca",
     SETTLEMENT: "7c7465be32aeab7821c08a1a511541f23bb394aa39cd756b2f2215cda3cde599",
 }

@@ -2128,14 +2128,19 @@ def build_set_pipeline_candidate(
         # matter how many components echoed.
         note_payload = {"server_owned_metadata_note": " ".join(dict.fromkeys(echoed_metadata_notes))}
         data = note_payload if data is None else {**data, **note_payload}
-    return _candidate(
-        _mutation_result(
-            new_state,
-            affected,
-            data=data,
-            full_replacement=True,
-            catalog=context.catalog,
-        )
+    # _mutation_result has just validated this exact final state through the
+    # current policy view. Avoid repeating that synchronous projection here;
+    # outward dispatch still performs its own fresh normalization.
+    result = _mutation_result(
+        new_state,
+        affected,
+        data=data,
+        full_replacement=True,
+        catalog=context.catalog,
+    )
+    return SetPipelineCandidate(
+        result=replace(result, _validation_snapshot_hash=context.catalog.snapshot.snapshot_hash),
+        prepared_inline_blob=prepared_inline_blob,
     )
 
 

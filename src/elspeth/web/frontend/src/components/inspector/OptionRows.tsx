@@ -50,6 +50,8 @@ export const OPTION_LABELS: Readonly<Record<string, string>> = {
   system_prompt: "System prompt",
   profile: "Model profile",
   model: "Model",
+  model_id: "Model",
+  source_mode: "Source mode",
   response_field: "Answer written to",
   path: "File",
   schema: "Row schema",
@@ -148,6 +150,51 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+// Only summarize known document metadata. Incomplete/malformed collections
+// keep the generic renderer, so presentation never drops an invalid entry.
+type DocumentSummary = Record<string, unknown> & {
+  filename: string;
+  mime_type: string;
+  size_bytes: number;
+};
+
+function documentEntries(value: unknown): DocumentSummary[] | null {
+  if (!Array.isArray(value) || value.length === 0) return null;
+  if (!value.every((entry): entry is DocumentSummary =>
+    isRecord(entry)
+    && typeof entry.filename === "string" && entry.filename.length > 0
+    && typeof entry.mime_type === "string" && entry.mime_type.length > 0
+    && typeof entry.size_bytes === "number" && Number.isSafeInteger(entry.size_bytes)
+    && entry.size_bytes >= 0,
+  )) return null;
+  return value;
+}
+
+function Documents({ entries }: { entries: DocumentSummary[] }): JSX.Element {
+  return (
+    <dl className="graph-config-rows">
+      <div>
+        <dt>Documents</dt>
+        <dd>
+          <ol className="graph-config-list">
+            {entries.map((entry, index) => (
+              <li key={index}>
+                <span>{entry.filename}</span>{" — "}
+                <span>{entry.mime_type}</span>{", "}
+                <span>{entry.size_bytes} bytes</span>
+              </li>
+            ))}
+          </ol>
+          <details>
+            <summary>Document metadata</summary>
+            <pre><code>{JSON.stringify(entries, null, 2)}</code></pre>
+          </details>
+        </dd>
+      </div>
+    </dl>
+  );
+}
+
 // A multi-query step has ONE system prompt and one user prompt PER QUERY. Both
 // authoring forms the plugin accepts (a mapping keyed by query name, or a list
 // of named entries) resolve to [name, entry] pairs; a malformed entry is
@@ -239,14 +286,24 @@ export function OptionRows({
   }, [pluginKind, pluginName, catalogKey, loadSchema]);
 
   const isLlmStep = plugin !== null && plugin.kind === "transform" && plugin.name === "llm";
+  const documents = plugin?.kind === "source" && plugin.name === "blob_rows"
+    ? documentEntries(options.blobs)
+    : null;
   const candidateKeys = Object.keys(options).filter(
-    (key) => !INTERNAL_OPTION_KEYS.has(key) && !(isLlmStep && LLM_PROMPT_ROLE_KEYS.includes(key)),
+    (key) => !INTERNAL_OPTION_KEYS.has(key) && !(isLlmStep && LLM_PROMPT_ROLE_KEYS.includes(key))
+      && !(documents !== null && key === "blobs"),
   );
   let visibleKeys: string[];
   let advancedKeys: string[];
   if (schema === undefined) {
-    visibleKeys = FALLBACK_VISIBLE_OPTION_KEYS.filter((key) => candidateKeys.includes(key));
-    advancedKeys = candidateKeys.filter((key) => !FALLBACK_VISIBLE_OPTION_KEYS.includes(key));
+    // ADI names these authored choices differently from LLM's model/mode.
+    // Keep them legible before catalog loading (or after a schema fetch
+    // failure), without promoting connection or credential fields.
+    const fallbackVisibleKeys = plugin?.kind === "transform" && plugin.name === "azure_document_intelligence"
+      ? [...FALLBACK_VISIBLE_OPTION_KEYS, "model_id", "source_mode"]
+      : FALLBACK_VISIBLE_OPTION_KEYS;
+    visibleKeys = fallbackVisibleKeys.filter((key) => candidateKeys.includes(key));
+    advancedKeys = candidateKeys.filter((key) => !fallbackVisibleKeys.includes(key));
   } else {
     // A discriminated schema repeats same-named fields once per variant. Only
     // the active copy participates in tiering, using the catalog's
@@ -274,7 +331,7 @@ export function OptionRows({
   }
   const visible = pick(options, visibleKeys);
   const advanced = pick(options, advancedKeys);
-  const isEmpty = !isLlmStep && Object.keys(visible).length === 0 && advancedKeys.length === 0;
+  const isEmpty = documents === null && !isLlmStep && Object.keys(visible).length === 0 && advancedKeys.length === 0;
 
   return (
     <div className="option-rows" role="region" aria-label={ariaLabel}>
@@ -282,6 +339,7 @@ export function OptionRows({
         <p className="graph-config-empty-value">No settings for this step.</p>
       ) : (
         <>
+          {documents !== null && <Documents entries={documents} />}
           {isLlmStep && <LlmPromptRoles options={options} />}
           {Object.keys(visible).length > 0 && <OptionDl rows={visible} />}
           {advancedKeys.length > 0 && (

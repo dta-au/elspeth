@@ -2645,8 +2645,7 @@ async def test_run_advisor_checkpoint_unavailable_after_retries(make_service, si
 
 @pytest.mark.asyncio
 async def test_exhausted_transport_failure_classified_unavailable_no_provider_text(make_service, simple_state):
-    """P5.3/D13: a transport/timeout outage classifies UNAVAILABLE (escapable at
-    budget exhaustion) and carries NO raw provider exception text."""
+    """Timeout remains blocked, with truthful fixed wording and no provider text."""
     service = make_service()
     service._advisor_checkpoint._call_advisor_with_audit = _AsyncRecorder(side_effect=TimeoutError("provider deadline details"))
     verdict = await service._advisor_checkpoint._run_advisor_checkpoint(
@@ -2654,7 +2653,8 @@ async def test_exhausted_transport_failure_classified_unavailable_no_provider_te
     )
     assert verdict.ok is False
     assert verdict.failure_class == "unavailable"
-    assert verdict.findings_text == ADVISOR_UNAVAILABLE_USER_DETAIL
+    assert verdict.timed_out is True
+    assert verdict.findings_text == "the advisor review timed out before returning a verdict"
     assert "TimeoutError" not in verdict.findings_text
     assert "provider deadline details" not in verdict.findings_text
 
@@ -2676,7 +2676,8 @@ async def test_exhausted_litellm_timeout_classified_unavailable(make_service, si
     )
     assert verdict.ok is False
     assert verdict.failure_class == "unavailable"
-    assert verdict.findings_text == ADVISOR_UNAVAILABLE_USER_DETAIL
+    assert verdict.timed_out is True
+    assert verdict.findings_text == "the advisor review timed out before returning a verdict"
     assert "sk-secret" not in verdict.findings_text
     assert "provider.example" not in verdict.findings_text
 
@@ -2686,6 +2687,7 @@ async def test_exhausted_litellm_timeout_classified_unavailable(make_service, si
     ("outcome", "failure_class", "attempts", "audit_status"),
     [
         ("bad_request", "request_rejected", 1, "BAD_REQUEST_ERROR"),
+        ("timeout", "unavailable", 1, "TIMEOUT"),
         ("api_error", "unavailable", 2, "API_ERROR"),
         ("outage", "unavailable", 2, "API_ERROR"),
         ("malformed_text", "malformed", 2, "SUCCESS"),
@@ -2697,12 +2699,13 @@ async def test_checkpoint_sdk_failure_requires_response_evidence_for_malformed(
 ):
     """Request rejection is not evidence that the advisor returned bad content."""
     import litellm
-    from litellm.exceptions import APIError, BadRequestError, ServiceUnavailableError
+    from litellm.exceptions import APIError, BadRequestError, ServiceUnavailableError, Timeout
 
     from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
 
     private_detail = "PRIVATE_PROVIDER_DIAGNOSTIC"
     failures = {
+        "timeout": Timeout(private_detail, model="advisor", llm_provider="openai"),
         "bad_request": BadRequestError(private_detail, model="advisor", llm_provider="openai"),
         "api_error": APIError(status_code=503, message=private_detail, model="advisor", llm_provider="openai"),
         "outage": ServiceUnavailableError(private_detail, model="advisor", llm_provider="openai"),
@@ -2738,9 +2741,12 @@ async def test_checkpoint_sdk_failure_requires_response_evidence_for_malformed(
     assert [call.status for call in recorder.llm_calls] == [ComposerLLMCallStatus[audit_status]] * attempts
     assert verdict.ok is False and verdict.publication_verdict is None
     assert verdict.failure_class == failure_class
+    assert verdict.timed_out is (outcome == "timeout")
     assert verdict.findings_text == (
         verdict.provider_failure.details.explanation
         if failure_class == "request_rejected"
+        else "the advisor review timed out before returning a verdict"
+        if outcome == "timeout"
         else ADVISOR_UNAVAILABLE_USER_DETAIL
         if failure_class == "unavailable"
         else ADVISOR_MALFORMED_USER_DETAIL
@@ -3066,6 +3072,8 @@ async def test_checkpoint_deadline_cancels_provider_and_retains_timeout_audit(
     assert provider_cleanup_seen.is_set()
     assert verdict.ok is False
     assert verdict.failure_class == "unavailable"
+    assert verdict.timed_out is True
+    assert verdict.findings_text == "the advisor review timed out before returning a verdict"
     assert len(recorder.llm_calls) == 1
     assert recorder.llm_calls[0].status is ComposerLLMCallStatus.TIMEOUT
     with physical_advisor.engine.connect() as connection:
@@ -7548,3 +7556,98 @@ async def test_reviewed_explanation_keeps_prior_graph_completion_withheld(make_s
     assert outcome.result.message == "Here are your options."
     assert outcome.result.runtime_preflight.readiness.completion_ready is False
     assert outcome.result.runtime_preflight.readiness.execution_ready is True
+
+
+@pytest.mark.parametrize("preflight_kind", ["green", "red", "absent"])
+def test_timeout_blocker_is_truthful_and_keeps_completion_and_prose_blocked(make_service, clean_runnable_state, preflight_kind):
+    preflight = _green_preflight() if preflight_kind == "green" else _red_preflight() if preflight_kind == "red" else None
+    verdict = AdvisorCheckpointVerdict(
+        ok=False,
+        blocking=False,
+        failure_class="unavailable",
+        timed_out=True,
+        findings_text="the advisor review timed out before returning a verdict",
+    )
+    result = make_service()._advisor_checkpoint._advisor_blocked_result(
+        reason="unavailable",
+        verdict=verdict,
+        state=clean_runnable_state,
+        assistant_message=_ExplainingAssistantMessage(),
+        recorder=make_recorder(),
+        repair_turns_used=0,
+        persisted_assistant_message_id=None,
+        persisted_assistant_content=None,
+        persisted_tool_call_turn=False,
+        runtime_preflight=preflight,
+        outstanding_findings=None,
+    )
+    blocker = _advisor_blocker(result)
+    assert "timed out" in blocker.detail
+    assert blocker.suggestion is not None
+    assert "next message" in blocker.suggestion
+    assert "configuration" not in blocker.suggestion
+    assert "unavailable" not in blocker.detail
+    assert result.runtime_preflight.readiness.completion_ready is False
+    assert _ExplainingAssistantMessage.content not in result.message
+    assert result.raw_assistant_content == ""
+    if preflight_kind != "red":
+        assert "timed out" in result.message
+        assert "configuration" not in result.message
+    if preflight_kind == "absent":
+        assert "readiness was not re-verified" in result.message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("last_outcome", ["malformed", "ordinary-outage"])
+async def test_timeout_presentation_does_not_survive_a_different_final_failure(make_service, simple_state, last_outcome):
+    service = make_service()
+    calls = 0
+
+    def fail_then_finish(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise TimeoutError("private-first-timeout")
+        if last_outcome == "ordinary-outage":
+            raise ConnectionError("private-final-outage")
+        return "not a structured advisor verdict", {}
+
+    service._advisor_checkpoint._call_advisor_with_audit = _AsyncRecorder(side_effect=fail_then_finish)
+    verdict = await service._advisor_checkpoint._run_advisor_checkpoint(
+        phase="end", state=simple_state, **_fenced_session(service), recorder=make_recorder()
+    )
+    assert calls == 2
+    assert verdict.ok is False
+    assert verdict.timed_out is False
+    assert verdict.failure_class == ("malformed" if last_outcome == "malformed" else "unavailable")
+    assert "timed out" not in verdict.findings_text
+    assert "private-" not in verdict.findings_text
+
+
+def test_timeout_preserves_pending_handoff_readiness_and_reports_timeout_in_check(make_service, clean_runnable_state):
+    preflight = _pending_handoff_preflight()
+    result = make_service()._advisor_checkpoint._advisor_blocked_result(
+        reason="unavailable",
+        verdict=AdvisorCheckpointVerdict(
+            ok=False,
+            blocking=False,
+            failure_class="unavailable",
+            timed_out=True,
+            findings_text="the advisor review timed out before returning a verdict",
+        ),
+        state=clean_runnable_state,
+        assistant_message=_ExplainingAssistantMessage(),
+        recorder=make_recorder(),
+        repair_turns_used=0,
+        persisted_assistant_message_id=None,
+        persisted_assistant_content=None,
+        persisted_tool_call_turn=False,
+        runtime_preflight=preflight,
+        outstanding_findings=None,
+    )
+    assert result.runtime_preflight is not None
+    assert result.runtime_preflight.readiness == preflight.readiness
+    checks = [check for check in result.runtime_preflight.checks if check.name == "advisor_signoff"]
+    assert len(checks) == 1
+    assert "timed out" in checks[0].detail
+    assert _ExplainingAssistantMessage.content not in result.message

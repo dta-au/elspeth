@@ -114,6 +114,7 @@ dev = [
     "types-networkx>=3.6,<4",  # NetworkX type hints
     "types-PyYAML>=6.0,<7",  # PyYAML type hints
     "types-jsonschema>=4.26,<5",  # jsonschema type hints (used in LLM schema tests)
+    "types-psycopg2>=2.9,<3",  # Typed structured PostgreSQL driver errors
     # Mutation testing (Phase 3)
     "mutmut>=2.5,<3",  # Mutation testing
     # ChaosLLM test server
@@ -221,6 +222,7 @@ all = [
     "types-networkx>=3.6,<4",
     "types-PyYAML>=6.0,<7",
     "types-jsonschema>=4.26,<5",
+    "types-psycopg2>=2.9,<3",
     "mutmut>=2.5,<3",
     "errorworks>=0.1.3,<1",
     "starlette>=1,<2",

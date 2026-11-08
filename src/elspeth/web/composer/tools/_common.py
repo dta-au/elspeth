@@ -3572,11 +3572,11 @@ def _prevalidate_source_for_context(
         version=1,
     )
     try:
-        profile_validation = context.catalog.validate_composition_state(candidate)
+        profile_validation = context.catalog.project_component_policy(candidate)
     except ValueError as exc:
         return f"Invalid options for source '{plugin_name}': {exc}", "plugin_options_invalid"
     blocking = tuple(
-        finding for finding in profile_validation.policy_findings if finding.stage in {"plugin_enablement", "operator_profile_options"}
+        finding for finding in profile_validation.findings if finding.stage in {"plugin_enablement", "operator_profile_options"}
     )
     if blocking:
         finding = blocking[0]
@@ -3635,7 +3635,7 @@ def _prevalidate_transform_for_context(
         version=1,
     )
     try:
-        profile_validation = context.catalog.validate_composition_state(candidate)
+        profile_validation = context.catalog.project_component_policy(candidate)
     except ValueError as exc:
         # The profile adapter dispatches provider-specific config models
         # (llm get_config_model) BEFORE the guarded prevalidation core — a
@@ -3646,7 +3646,7 @@ def _prevalidate_transform_for_context(
         # Mirror the core's own idiom: surface it as an options message.
         return f"Invalid options for transform '{plugin_name}': {exc}", "plugin_options_invalid"
     blocking = tuple(
-        finding for finding in profile_validation.policy_findings if finding.stage in {"plugin_enablement", "operator_profile_options"}
+        finding for finding in profile_validation.findings if finding.stage in {"plugin_enablement", "operator_profile_options"}
     )
     if blocking:
         # Carry the finding's own explanation — the bare error_code alone

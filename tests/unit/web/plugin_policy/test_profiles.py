@@ -447,6 +447,7 @@ def test_runtime_conversion_consumes_every_universal_setting_field() -> None:
         "aws_textract_profiles",
         "azure_search_profiles",
         "deployment_aws_region",
+        "azure_document_intelligence_endpoint",
     }
     runtime_fields = set(RuntimeWebPluginConfig.__dataclass_fields__)
 

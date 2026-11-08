@@ -32,6 +32,7 @@ from elspeth.contracts.config import RuntimeRetryConfig
 from elspeth.contracts.contexts import TransformContext
 from elspeth.contracts.errors import MaxRetriesExceeded
 from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
+from elspeth.core.canonical import stable_hash
 from elspeth.core.config import ElspethSettings, RetrySettings, SinkSettings, SourceSettings, TransformSettings
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.dag.wiring import WiredTransform
@@ -672,6 +673,9 @@ class TestRetryAuditTrail:
         # Verify all records reference the same token
         token_ids = [row.token_id for row in rows]
         assert all(t == token.token_id for t in token_ids)
+        assert all(row.input_hash == stable_hash(row_data) for row in rows)
+        assert result.input_hash == rows[-1].input_hash
+        assert result.output_hash == rows[-1].output_hash
 
     def test_max_retries_exceeded_all_attempts_recorded(
         self,

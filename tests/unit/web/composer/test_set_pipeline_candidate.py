@@ -14,7 +14,7 @@ from dataclasses import FrozenInstanceError, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 from uuid import UUID, uuid4
 
 import pytest
@@ -80,6 +80,7 @@ from tests.fixtures.identities import ensure_test_identity
 from tests.helpers.composer_fences import fenced_tool_context
 from tests.helpers.session_fences import fenced_operation_context
 from tests.unit.web.composer._probe_lifecycle_helpers import DelegatingPluginManagerDouble
+from tests.unit.web.composer.test_tools import _empty_operator_profiles
 
 
 def _empty_state() -> CompositionState:
@@ -122,6 +123,35 @@ def test_build_set_pipeline_candidate_constructs_without_publishing(tmp_path: Pa
     assert candidate.prepared_inline_blob is None
     assert candidate.result.updated_state is not state
     assert state == _empty_state()
+
+
+def test_successful_candidate_projects_final_state_once_but_outward_policy_stays_live(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    context, catalog = _final_validation_rejecting_context(data_dir=tmp_path)
+    candidate = build_set_pipeline_candidate(_linear_args(tmp_path), _empty_state(), context)
+    assert candidate.acceptable
+    final_state = candidate.result.updated_state
+    assert sum(state is final_state for state in catalog.validated_states) == 1
+    assert candidate.result._validation_snapshot_hash == catalog.snapshot.snapshot_hash
+    original = catalog.validate_composition_state
+
+    def newly_blocked(state: CompositionState) -> ProfileAwareValidationResult:
+        current = original(state)
+        return replace(
+            current,
+            validation=ValidationSummary(
+                is_valid=False,
+                errors=(ValidationEntry(component="policy:changed", message="Current policy refuses this graph.", severity="high"),),
+            ),
+        )
+
+    # Same snapshot identity is not permission to skip the outward boundary.
+    monkeypatch.setattr(catalog, "validate_composition_state", newly_blocked)
+    outward = normalize_tool_result_validation(candidate.result, catalog)
+    assert not outward.validation.is_valid
+    assert outward.validation.errors[0].component == "policy:changed"
+    assert sum(state is final_state for state in catalog.validated_states) == 2
 
 
 def test_omitted_on_error_refuses_transform_and_aggregation_but_preserves_gate_fail_fast(
@@ -330,7 +360,7 @@ def test_blob_resolver_policy_unavailability_does_not_probe_schema(tmp_path: Pat
     )
     context = replace(
         context,
-        catalog=PolicyCatalogView(create_catalog_service(), snapshot, MagicMock(spec=OperatorProfileRegistry)),
+        catalog=PolicyCatalogView(create_catalog_service(), snapshot, _empty_operator_profiles()),
         plugin_snapshot=snapshot,
         session_engine=engine,
         session_id=session_id,
@@ -610,7 +640,7 @@ def _blocked_context(plugin_id: PluginId, *, data_dir: Path) -> ToolContext:
         binding_generation_fingerprint="candidate-characterization-generation",
     )
     return ToolContext(
-        catalog=PolicyCatalogView(catalog, snapshot, MagicMock(spec=OperatorProfileRegistry)),
+        catalog=PolicyCatalogView(catalog, snapshot, _empty_operator_profiles()),
         plugin_snapshot=snapshot,
         data_dir=str(data_dir),
         session_id="test-session",
@@ -643,7 +673,7 @@ class _ProfileRejectingCatalog(PolicyCatalogView):
 def _profile_rejecting_context(*, data_dir: Path) -> ToolContext:
     full = create_catalog_service()
     snapshot = PluginAvailabilitySnapshot.for_trained_operator(full)
-    catalog = _ProfileRejectingCatalog(full, snapshot, MagicMock(spec=OperatorProfileRegistry))
+    catalog = _ProfileRejectingCatalog(full, snapshot, _empty_operator_profiles())
     return ToolContext(catalog=catalog, plugin_snapshot=snapshot, data_dir=str(data_dir), session_id="test-session")
 
 
@@ -651,11 +681,12 @@ class _FinalValidationRejectingCatalog(PolicyCatalogView):
     """Request catalog whose whole-state validation rejects one valid graph."""
 
     validated_states: list[CompositionState]
+    reject_final = True
 
     def validate_composition_state(self, state: CompositionState) -> ProfileAwareValidationResult:
         self.validated_states.append(state)
         raw = state.validate()
-        if raw.is_valid and state.metadata.name == "final-profile-reject":
+        if self.reject_final and raw.is_valid and state.metadata.name == "final-profile-reject":
             validation = ValidationSummary(
                 is_valid=False,
                 errors=(
@@ -1407,18 +1438,31 @@ def test_candidate_uses_final_request_scoped_profile_validation(tmp_path: Path) 
 
     assert candidate.result.success is True
     assert candidate.result.updated_state.validate().is_valid is True
+    # Source admission sees the provisional graph; the success envelope sees
+    # the completed graph once. Packaging that envelope is synchronous and
+    # must not repeat its identical final-state policy projection.
     assert (candidate.acceptable, len(catalog.validated_states)) == (False, 2)
     assert set(catalog.validated_states[0].sources) == {"source"}
-    assert catalog.validated_states[1] is candidate.result.updated_state
+    assert all(saved is candidate.result.updated_state for saved in catalog.validated_states[1:])
     assert candidate.result.validation.errors[0].error_code == "profile_complete_state_rejected"
 
     normalized_again = normalize_tool_result_validation(candidate.result, catalog)
 
-    assert normalized_again is candidate.result
-    assert len(catalog.validated_states) == 2
+    assert normalized_again == candidate.result
+    assert len(catalog.validated_states) == 3
+    assert catalog.validated_states[-1] is candidate.result.updated_state
     assert "_validation_snapshot_hash" not in candidate.result.to_dict()
     assert "_validation_snapshot_hash" not in repr(candidate.result)
 
+    # An unchanged snapshot/result cannot authorize stale policy advice.
+    # Normalization must ask the current request authority on every boundary.
+    catalog.reject_final = False
+    refreshed = normalize_tool_result_validation(candidate.result, catalog)
+    assert refreshed.validation.is_valid
+    assert not candidate.result.validation.is_valid
+    assert len(catalog.validated_states) == 4
+    assert catalog.validated_states[-1] is candidate.result.updated_state
+    catalog.reject_final = True
     catalog.validated_states.clear()
     public_result = execute_tool(
         "set_pipeline",
@@ -1433,14 +1477,14 @@ def test_candidate_uses_final_request_scoped_profile_validation(tmp_path: Path) 
     assert public_result.updated_state == candidate.result.updated_state
     assert public_result.validation == candidate.result.validation
     assert public_result.validation.is_valid is False
-    assert len(catalog.validated_states) == 3
+    assert len(catalog.validated_states) == 4
     assert catalog.validated_states[0] is state
     assert set(catalog.validated_states[1].sources) == {"source"}
-    assert catalog.validated_states[2] is public_result.updated_state
+    assert all(saved is public_result.updated_state for saved in catalog.validated_states[2:])
 
 
 @pytest.mark.parametrize("rejected", [False, True], ids=("success", "rejection"))
-def test_public_set_pipeline_validates_current_and_candidate_exactly_once(
+def test_public_set_pipeline_validates_current_and_candidate_at_each_boundary(
     tmp_path: Path,
     *,
     rejected: bool,
@@ -1466,7 +1510,10 @@ def test_public_set_pipeline_validates_current_and_candidate_exactly_once(
     )
 
     assert result.success is not rejected
-    assert len(catalog.validated_states) == (1 if rejected else 3)
+    # These are live policy admission calls, not raw validation walks: entry,
+    # provisional source, completed success envelope and outward normalization.
+    # Candidate packaging reuses only the immediately preceding projection.
+    assert len(catalog.validated_states) == (1 if rejected else 4)
     assert catalog.validated_states[0] is state
     if rejected:
         # The withheld rejection envelope is never re-derived from the
@@ -1475,7 +1522,7 @@ def test_public_set_pipeline_validates_current_and_candidate_exactly_once(
         assert [entry.component for entry in result.validation.errors] == ["rejected_mutation"]
     else:
         assert set(catalog.validated_states[1].sources) == {"source"}
-        assert catalog.validated_states[2] is result.updated_state
+        assert all(saved is result.updated_state for saved in catalog.validated_states[2:])
 
 
 def test_normalizer_skips_revalidation_for_a_withheld_rejection_across_snapshots(tmp_path: Path) -> None:
@@ -2643,7 +2690,7 @@ def _operator_profile_view(tmp_path: Path) -> ToolContext:
     from elspeth.web.config import WebSettings
     from elspeth.web.plugin_policy.availability import build_plugin_snapshot
     from elspeth.web.plugin_policy.compiler import compile_web_plugin_policy
-    from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry, RuntimeWebPluginConfig
+    from elspeth.web.plugin_policy.profiles import RuntimeWebPluginConfig
 
     settings = WebSettings(
         data_dir=tmp_path,

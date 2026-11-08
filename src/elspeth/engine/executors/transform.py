@@ -877,7 +877,6 @@ class TransformExecutor:
         # Extract dict from PipelineRow for hashing and Landscape recording
         # Landscape stores raw dicts, not PipelineRow objects
         input_dict = token.row_data.to_dict()
-        input_hash = stable_hash(input_dict)
 
         # Detect row-pipelined concurrent transforms (accept/connect_output pattern).
         # ``is_batch_aware`` is intentionally not used here: that flag belongs to
@@ -914,6 +913,8 @@ class TransformExecutor:
                 auto_fail_phase="transform_execution",
             ) as guard,
         ):
+            # The repository hashed this exact input while opening the state.
+            input_hash = guard.state.input_hash
             # --- PREFLIGHT (pre-invocation checks) ---
             # Lifecycle guard, field-collision enforcement, pre-emission
             # declaration-contract dispatch (ADR-010/ADR-013), and input-schema

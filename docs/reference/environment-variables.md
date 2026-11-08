@@ -973,9 +973,20 @@ Used by the `azure_prompt_shield` transform plugin.
 | `AZURE_DOCUMENT_INTELLIGENCE_KEY` | API key for Azure AI Document Intelligence |
 
 Used by the `azure_document_intelligence` transform plugin when the plugin
-option references `${AZURE_DOCUMENT_INTELLIGENCE_KEY}`. Configure the Document
-Intelligence endpoint in the transform's `options.endpoint`; there is no
-implicit endpoint environment variable.
+option references `${AZURE_DOCUMENT_INTELLIGENCE_KEY}`. Credentials retain their
+existing secret-reference handling; configuring an endpoint grants no credential.
+
+An explicit transform `options.endpoint` takes precedence. To supply an operator
+default for omitted endpoints, configure `ELSPETH_WEB__AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT`
+for Web Composer. CLI/YAML uses top-level `azure_document_intelligence_endpoint`,
+overridable through the existing CLI loader by `ELSPETH_AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT`.
+These are newly introduced settings, not previously deployed bindings. All paths
+apply the same HTTPS Azure-origin validation. Explicit blank/null/invalid node
+endpoints are not silently replaced. Effective endpoints are materialized before
+validation and run admission; runtime plugins never read an ambient endpoint.
+Restart the web process when changing its frozen operator configuration. A new
+configuration changes the plugin snapshot binding identity. An admitted run keeps
+its recorded effective endpoint rather than silently adopting a later default.
 
 ### Azure Blob Storage
 

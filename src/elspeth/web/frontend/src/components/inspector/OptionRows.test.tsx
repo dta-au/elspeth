@@ -176,6 +176,60 @@ describe("catalog-tier ordering (elspeth-a6ea581e8a follow-up)", () => {
   const seedCatalog = (schemas: Record<string, unknown>) =>
     usePluginCatalogStore.setState({ key: "alice:fp-1", principal: "alice", fingerprint: "fp-1", schemas } as never);
 
+  it.each([false, true])("shows configured ADI model, source mode and row schema (catalog cached: %s)", (cached) => {
+    if (cached) {
+      seedCatalog({
+        "transform:azure_document_intelligence": {
+          ...LLM_SCHEMA,
+          name: "azure_document_intelligence",
+          knob_schema: { fields: [
+            { name: "schema", tier: "common" },
+            { name: "model_id", tier: "common" },
+            { name: "source_mode", tier: "common" },
+          ] },
+        },
+      });
+    }
+    render(<OptionRows
+      plugin={{ kind: "transform", name: "azure_document_intelligence" }}
+      ariaLabel="document analysis settings"
+      options={{
+        model_id: "prebuilt-layout",
+        source_mode: "url",
+        schema: { mode: "fixed", fields: ["document_text: str"] },
+        api_key: "[REDACTED]",
+      }}
+    />);
+    const region = screen.getByRole("region", { name: "document analysis settings" });
+    for (const value of ["Model", "prebuilt-layout", "Source mode", "url", "Row schema", "document_text: str"]) {
+      expect(within(region).getByText(value).closest("details")).toBeNull();
+    }
+    expect(within(region).getByText("[REDACTED]").closest("details")).not.toHaveAttribute("open");
+    expect(within(region).queryByText("Raw options (JSON)")).not.toBeInTheDocument();
+  });
+
+  it("keeps unknown model and source-mode fields advanced for other plugins", () => {
+    render(<OptionRows
+      plugin={{ kind: "transform", name: "passthrough" }}
+      ariaLabel="other settings"
+      options={{ model_id: "example", source_mode: "url" }}
+    />);
+    const region = screen.getByRole("region", { name: "other settings" });
+    expect(within(region).getByText("example").closest("details")).not.toHaveAttribute("open");
+    expect(within(region).getByText("url").closest("details")).not.toHaveAttribute("open");
+  });
+
+  it("does not invent ADI settings when they are absent", () => {
+    render(<OptionRows
+      plugin={{ kind: "transform", name: "azure_document_intelligence" }}
+      ariaLabel="empty document settings"
+      options={{}}
+    />);
+    expect(screen.getByText("No settings for this step.")).toBeInTheDocument();
+    expect(screen.queryByText("Model")).not.toBeInTheDocument();
+    expect(screen.queryByText("Source mode")).not.toBeInTheDocument();
+  });
+
   const DISCRIMINATED_TIER_SCHEMA = {
     name: "llm",
     plugin_type: "transform",
@@ -476,5 +530,70 @@ describe("llm prompt roles", () => {
     const region = screen.getByRole("region", { name: "tidy options" });
     expect(region.querySelector(".option-rows-prompt-roles")).toBeNull();
     expect(region.textContent).not.toMatch(/System prompt|User prompt/);
+  });
+});
+
+describe("document source summaries", () => {
+  const entry = {
+    blob_id: "f976fd8b-4432-4f8f-bbc3-2d8a9f2114e0",
+    payload_ref: "a".repeat(64),
+    filename: "report.pdf",
+    mime_type: "application/pdf",
+    size_bytes: 0,
+  };
+
+  it.each([false, true])("summarizes stored facts without changing options (catalog cached=%s)", (cached) => {
+    if (cached) {
+      usePluginCatalogStore.setState({
+        key: "alice:fp-1", principal: "alice", fingerprint: "fp-1",
+        schemas: { "source:blob_rows": {
+          name: "blob_rows", plugin_type: "source", description: "", json_schema: {},
+          knob_schema: { fields: [{ name: "blobs", tier: "common" }] },
+        } },
+      } as never);
+    }
+    const options = { blobs: [entry, { ...entry, size_bytes: 42, payload_ref: "b".repeat(64) }] };
+    const before = JSON.stringify(options);
+    render(<OptionRows options={options} plugin={{ kind: "source", name: "blob_rows" }} ariaLabel="documents" />);
+    const region = screen.getByRole("region", { name: "documents" });
+    const summaryList = region.querySelector("ol")!;
+    const items = within(summaryList).getAllByRole("listitem");
+    expect(items.map((item) => item.textContent)).toEqual([
+      "report.pdf — application/pdf, 0 bytes", "report.pdf — application/pdf, 42 bytes",
+    ]);
+    expect(summaryList.closest("details")).toBeNull();
+    const metadata = within(region).getByText("Document metadata").closest("details")!;
+    expect(metadata).not.toHaveAttribute("open");
+    expect(metadata).toHaveTextContent("a".repeat(64));
+    expect(metadata).toHaveTextContent("b".repeat(64));
+    expectNoIdentifiersInDefaultDom(region);
+    expect(JSON.stringify(options)).toBe(before);
+  });
+
+  it.each([null, [], "literal JSON", [null], [{ ...entry, filename: null }],
+    [{ ...entry, size_bytes: -1 }], [{ ...entry, mime_type: 5 }],
+    [{ ...entry, filename: "" }], [{ ...entry, mime_type: "" }],
+    [{ ...entry, size_bytes: 1.5 }], [{ ...entry, size_bytes: Number.MAX_SAFE_INTEGER + 1 }],
+    [entry, { ...entry, size_bytes: "42" }],
+  ])("keeps malformed collections inspectable: %j", (blobs) => {
+    render(<OptionRows options={{ blobs }} plugin={{ kind: "source", name: "blob_rows" }} ariaLabel="documents" />);
+    expect(screen.queryByText("Documents")).not.toBeInTheDocument();
+    expect(screen.getByText("Blobs")).toBeInTheDocument();
+    expect(screen.getByText("Advanced settings (1)")).toBeInTheDocument();
+  });
+
+  it("retains unknown metadata fields and raw options", () => {
+    usePreferencesStore.setState({ showAdvanced: true });
+    render(<OptionRows options={{ blobs: [{ ...entry, extra_field: "inspect me" }] }} plugin={{ kind: "source", name: "blob_rows" }} ariaLabel="documents" />);
+    const metadata = screen.getByText("Document metadata").closest("details")!;
+    expect(metadata).toHaveTextContent("inspect me");
+    expect(screen.getByText("Raw options (JSON)")).toBeInTheDocument();
+  });
+
+  it("leaves unrelated plugins and JSON-looking strings unchanged", () => {
+    render(<OptionRows options={{ blobs: [entry], query: '{"literal":true}' }} plugin={{ kind: "source", name: "json" }} ariaLabel="other" />);
+    expect(screen.queryByText("Documents")).not.toBeInTheDocument();
+    expect(screen.getByText("Blobs")).toBeInTheDocument();
+    expect(screen.getByText('{"literal":true}')).toBeInTheDocument();
   });
 });

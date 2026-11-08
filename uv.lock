@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.12"
 resolution-markers = [
     "python_full_version >= '3.15'",
@@ -1020,6 +1020,7 @@ all = [
     { name = "testcontainers" },
     { name = "types-jsonschema" },
     { name = "types-networkx" },
+    { name = "types-psycopg2" },
     { name = "types-pyyaml" },
     { name = "uvicorn", extra = ["standard"] },
     { name = "websockets" },
@@ -1065,6 +1066,7 @@ dev = [
     { name = "testcontainers" },
     { name = "types-jsonschema" },
     { name = "types-networkx" },
+    { name = "types-psycopg2" },
     { name = "types-pyyaml" },
 ]
 llm = [
@@ -1256,6 +1258,8 @@ requires-dist = [
     { name = "types-jsonschema", marker = "extra == 'dev'", specifier = ">=4.26,<5" },
     { name = "types-networkx", marker = "extra == 'all'", specifier = ">=3.6,<4" },
     { name = "types-networkx", marker = "extra == 'dev'", specifier = ">=3.6,<4" },
+    { name = "types-psycopg2", marker = "extra == 'all'", specifier = ">=2.9,<3" },
+    { name = "types-psycopg2", marker = "extra == 'dev'", specifier = ">=2.9,<3" },
     { name = "types-pyyaml", marker = "extra == 'all'", specifier = ">=6.0,<7" },
     { name = "types-pyyaml", marker = "extra == 'dev'", specifier = ">=6.0,<7" },
     { name = "uvicorn", extras = ["standard"], marker = "extra == 'all'", specifier = ">=0.46,<1" },
@@ -4927,6 +4931,15 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/78/6d/62a2e73b966c77609560800004dd49a926920dd4976a9fdd86cf998e7048/types_protobuf-5.29.1.20250403.tar.gz", hash = "sha256:7ff44f15022119c9d7558ce16e78b2d485bf7040b4fadced4dd069bb5faf77a2", size = 59413, upload-time = "2025-04-02T10:07:17.138Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/69/e3/b74dcc2797b21b39d5a4f08a8b08e20369b4ca250d718df7af41a60dd9f0/types_protobuf-5.29.1.20250403-py3-none-any.whl", hash = "sha256:c71de04106a2d54e5b2173d0a422058fae0ef2d058d70cf369fb797bf61ffa59", size = 73874, upload-time = "2025-04-02T10:07:15.755Z" },
+]
+
+[[package]]
+name = "types-psycopg2"
+version = "2.9.21.20261030"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/99/9d/3d22bd79e5777d6bb11042d5853cfe41617e40aebea5272b048aef070872/types_psycopg2-2.9.21.20261030.tar.gz", hash = "sha256:7850716d731d6bf45c53f2d26179e2bcf7273d1d3acfd56b0201adc1dec4ba20", size = 27973, upload-time = "2026-10-30T07:50:27.642Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/8f/23/eb7f937f9f9346097a31d243b74cc3d23e4d8cc777916cef4a89bfafa6b5/types_psycopg2-2.9.21.20261030-py3-none-any.whl", hash = "sha256:e51ed54722bc7bc3cfb635a8623d9915d1816ed789c926c40b5f61d5f417a4ab", size = 25041, upload-time = "2026-10-30T07:50:26.781Z" },
 ]
 
 [[package]]

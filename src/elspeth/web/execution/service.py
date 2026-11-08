@@ -129,15 +129,15 @@ from elspeth.web.execution.discard_summary import load_discard_summaries_from_db
 from elspeth.web.execution.envelope import (
     ExecutionEnvelope,
     ExecutionEnvelopeRefused,
+    ExecutionRecoveryAuthority,
     RestoredExecutionEnvelope,
     RetainedBlobInput,
     build_run_execution_input,
     capture_execution_envelope,
     discover_execution_blob_inputs,
     read_cancelled_execution_envelope,
-    restore_execution_envelope,
+    restore_run_execution_input,
     runtime_implementation_fingerprint,
-    validate_run_execution_input,
 )
 from elspeth.web.execution.errors import (
     BlobRowsSourceAdmissionError,
@@ -166,7 +166,7 @@ from elspeth.web.execution.preflight import (
     resolve_runtime_yaml_paths,
 )
 from elspeth.web.execution.progress import BroadcastResult, ProgressBroadcaster
-from elspeth.web.execution.protocol import ExecutionService, FrozenRunSettings, StateAccessError, YamlGenerator
+from elspeth.web.execution.protocol import ExecutionService, FrozenRunSettings, StateAccessError, StateValidationAssessment, YamlGenerator
 from elspeth.web.execution.provider_clock import RunProviderAttemptClock
 from elspeth.web.execution.retained_inputs import read_retained_input, retain_execution_inputs, retain_source_bytes
 from elspeth.web.execution.schemas import (
@@ -3004,9 +3004,11 @@ class ExecutionServiceImpl:
         execution_input = await self._session_service.get_run_execution_input(run.id)
         if execution_input is None or ExecutionEnvelope(execution_input.envelope_json).digest != execution_input.canonical_input_digest:
             raise ExecutionEnvelopeRefused(EnvelopeRecoveryReason.INVALID_ENVELOPE)
-        await run_sync_in_worker(validate_run_execution_input, execution_input)
-        snapshot = self._plugin_snapshot_for_user(user_id, operation="run recovery")
-        implementation = await run_sync_in_worker(runtime_implementation_fingerprint, snapshot)
+
+        def current_authority() -> ExecutionRecoveryAuthority:
+            snapshot = self._plugin_snapshot_for_user(user_id, operation="run recovery")
+            implementation = runtime_implementation_fingerprint(snapshot)
+            return ExecutionRecoveryAuthority(snapshot, implementation, implementation)
 
         def verify_blob(item: RetainedBlobInput) -> None:
             if self._blob_service is None:
@@ -3028,14 +3030,12 @@ class ExecutionServiceImpl:
                 raise ExecutionEnvelopeRefused(EnvelopeRecoveryReason.SOURCE_UNAVAILABLE)
 
         return await run_sync_in_worker(
-            restore_execution_envelope,
-            execution_input.envelope_json,
-            current_snapshot=snapshot,
+            restore_run_execution_input,
+            execution_input,
+            current_authority=current_authority,
             user_id=user_id,
             auth_provider_type=auth_provider_type,
             resolver=self._secret_service,
-            implementation_fingerprint=implementation,
-            deployment_generation=implementation,
             blob_verifier=verify_blob,
         )
 
@@ -3261,6 +3261,29 @@ class ExecutionServiceImpl:
         ``completion_ready`` accordingly. ``None`` — no record at hand, or no
         envelope ever written — leaves the recompute untouched.
         """
+        assessment = await self.assess_state(
+            state,
+            session_operation_context=session_operation_context,
+            user_id=user_id,
+            session_id=session_id,
+            completion_gates=completion_gates,
+        )
+        return assessment.validation
+
+    async def assess_state(
+        self,
+        state: CompositionState,
+        *,
+        session_operation_context: SessionOperationContext,
+        user_id: str | None = None,
+        session_id: UUID | None = None,
+        completion_gates: CompletionGateFacts | None = None,
+    ) -> StateValidationAssessment:
+        """Own one fresh principal snapshot for validation and its projections.
+
+        The caller cannot inject an old snapshot. Each assessment checks current
+        credentials and invokes the authoritative blob/fence preflight anew.
+        """
         env_ref_names = (
             frozenset(item.name for item in self._secret_service.list_refs(user_id))
             if self._secret_service is not None and user_id is not None
@@ -3272,7 +3295,7 @@ class ExecutionServiceImpl:
             env_ref_names=env_ref_names,
         )
         plugin_snapshot = self._plugin_snapshot_for_user(user_id, operation="validation")
-        return await self._authoritative_state_preflight(
+        validation = await self._authoritative_state_preflight(
             state,
             plugin_snapshot=plugin_snapshot,
             user_id=user_id,
@@ -3280,6 +3303,7 @@ class ExecutionServiceImpl:
             session_operation_context=session_operation_context,
             completion_gates=completion_gates,
         )
+        return StateValidationAssessment(validation=validation, plugin_snapshot=plugin_snapshot)
 
     async def verify_run_ownership(self, user: UserIdentity, run_id: str) -> bool:
         """Verify that a run belongs to the authenticated user's session.

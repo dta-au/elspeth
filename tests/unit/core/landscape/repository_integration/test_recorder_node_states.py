@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import numpy as np
+import pytest
 from tests.fixtures.landscape import leader_coordination_token
 
 from elspeth.contracts import NodeStateStatus, NodeType
@@ -53,7 +55,8 @@ class TestRecorderFactoryNodeStates:
         assert state.status == NodeStateStatus.OPEN
         assert state.input_hash is not None
 
-    def test_node_state_hash_correctness(self) -> None:
+    @pytest.mark.parametrize("mutate_output", [False, True])
+    def test_node_state_hash_correctness(self, mutate_output: bool) -> None:
         """P1: Verify input/output hashes match stable_hash (not just non-NULL).
 
         Hash correctness is the audit integrity anchor. Tests must validate
@@ -86,6 +89,11 @@ class TestRecorderFactoryNodeStates:
 
         input_data = {"x": 1, "y": 2}
         output_data = {"x": 1, "y": 2, "z": 3}
+        if mutate_output:
+            # These are supported canonical values, but neither deep_freeze
+            # nor PipelineRow detaches an ndarray's mutable backing buffer.
+            output_data["array"] = np.array([1, 2])
+        earlier_output_hash = stable_hash(output_data)
 
         state = factory.execution.begin_node_state(
             token_id=token.token_id,
@@ -98,6 +106,8 @@ class TestRecorderFactoryNodeStates:
         # P1: Verify input_hash matches expected
         expected_input_hash = stable_hash(input_data)
         assert state.input_hash == expected_input_hash, f"input_hash mismatch: expected {expected_input_hash}, got {state.input_hash}"
+        if mutate_output:
+            output_data["array"][0] = 9
 
         completed = factory.execution.complete_node_state(
             state_id=state.state_id,
@@ -113,6 +123,8 @@ class TestRecorderFactoryNodeStates:
         assert completed.output_hash == expected_output_hash, (
             f"output_hash mismatch: expected {expected_output_hash}, got {completed.output_hash}"
         )
+        if mutate_output:
+            assert completed.output_hash != earlier_output_hash
 
     def test_complete_node_state_success(self) -> None:
         from elspeth.contracts import NodeStateStatus

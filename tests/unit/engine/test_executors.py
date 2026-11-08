@@ -86,6 +86,7 @@ from elspeth.contracts.events import EngineSpanCompleted, EngineSpanName, Engine
 from elspeth.contracts.results import ArtifactDescriptor
 from elspeth.contracts.schema_contract import OutputFieldDeclaration, PipelineRow, SchemaContract
 from elspeth.contracts.types import NodeID
+from elspeth.core.canonical import stable_hash
 from elspeth.engine.executors import (
     TransformExecutor,
 )
@@ -184,6 +185,24 @@ def _default_pending() -> PendingOutcome:
 
 class TestTransformExecutor:
     """Tests for TransformExecutor covering success, error, and exception paths."""
+
+    def test_input_digest_is_rebound_for_each_attempt_and_detached_from_later_row_edits(self) -> None:
+        factory = _make_factory()
+        executor = TransformExecutor(factory.execution, _make_span_factory(), _make_step_resolver(), data_flow=factory.data_flow)
+        transform = _make_transform()
+        digests = []
+        for attempt, value in enumerate(("first", "changed")):
+            transform.process.return_value = TransformResult.success(make_row({"value": value}), success_reason={"action": "test"})
+            result, _token, _error_sink = executor.execute_transform(
+                transform, _make_token(data={"value": value}), make_context(), attempt=attempt
+            )
+            expected = stable_hash({"value": value})
+            assert result.input_hash == expected
+            recorded_input = factory.execution.begin_node_state.call_args.kwargs["input_data"]
+            recorded_input["value"] = "later edit"
+            assert result.input_hash == expected
+            digests.append(result.input_hash)
+        assert digests[0] != digests[1]
 
     # --- Init / Validation ---
 
@@ -2085,27 +2104,20 @@ class TestTransformExecutorTerminality:
         token = _make_token()
         ctx = make_context()
 
-        # Monkey-patch stable_hash to fail on the second call (output hash)
-        # First call is input_hash (succeeds), second is output_hash (fails)
+        # Fail on the actual output row, independent of whether input hashing
+        # happens in this module or is reused from the repository's receipt.
         original_stable_hash = stable_hash
-        call_count = 0
 
         def failing_hash(data: Any) -> str:
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                return original_stable_hash(data)  # input hash succeeds
-            raise ValueError("NaN detected in output")
+            if data is good_row:
+                raise ValueError("NaN detected in output")
+            return original_stable_hash(data)
 
-        import elspeth.engine.executors.transform as transform_mod
-
-        original_ref = transform_mod.stable_hash  # type: ignore[attr-defined]
-        transform_mod.stable_hash = failing_hash  # type: ignore[attr-defined, assignment]
-        try:
-            with pytest.raises(PluginContractViolation, match="non-canonical data"):
-                executor.execute_transform(transform, token, ctx, attempt=0)
-        finally:
-            transform_mod.stable_hash = original_ref  # type: ignore[attr-defined]
+        with (
+            patch("elspeth.engine.executors.transform.stable_hash", autospec=True, side_effect=failing_hash),
+            pytest.raises(PluginContractViolation, match="non-canonical data"),
+        ):
+            executor.execute_transform(transform, token, ctx, attempt=0)
 
         # State must be FAILED (auto-completed by guard), not OPEN
         factory.execution.complete_node_state.assert_called_once()

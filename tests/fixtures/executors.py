@@ -16,6 +16,7 @@ from elspeth.contracts.enums import (
     NodeStateStatus,
 )
 from elspeth.contracts.schema_contract import SchemaContract
+from elspeth.core.canonical import stable_hash
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.engine.spans import SpanFactory
 from elspeth.testing import make_field, make_row
@@ -123,6 +124,13 @@ def _make_factory() -> MagicMock:
     factory = MagicMock(spec=RecorderFactory)
     state = SimpleNamespace(state_id="state_001")
     factory.execution.begin_node_state.return_value = state
+
+    def begin_node_state(*, input_data: Any, **_kwargs: Any) -> Any:
+        opened = factory.execution.begin_node_state.return_value
+        opened.input_hash = stable_hash(input_data)
+        return opened
+
+    factory.execution.begin_node_state.side_effect = begin_node_state
     factory.execution.register_artifact.return_value = SimpleNamespace(artifact_id="art_001")
     factory.execution.begin_operation.return_value = SimpleNamespace(operation_id="op_001")
 

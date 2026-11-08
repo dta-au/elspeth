@@ -265,6 +265,18 @@ _ADVISOR_SIGNOFF_MALFORMED_UNVERIFIED_PUBLISHED_FINALIZE_SUFFIX = _bare_trusted_
     _ADVISOR_SIGNOFF_MALFORMED_UNVERIFIED_PUBLISHED_NOTICE
 )
 
+# Timeout is an observed deadline outcome, not evidence of bad configuration.
+_ADVISOR_SIGNOFF_TIMEOUT_PENDING_PUBLISHED_NOTICE: Final = (
+    "The advisor review timed out before returning a verdict. Composer completion is withheld. Send another message to retry the review."
+)
+_ADVISOR_SIGNOFF_TIMEOUT_PENDING_PUBLISHED_FINALIZE_SUFFIX = _bare_trusted_suffix(_ADVISOR_SIGNOFF_TIMEOUT_PENDING_PUBLISHED_NOTICE)
+_ADVISOR_SIGNOFF_TIMEOUT_UNVERIFIED_PUBLISHED_NOTICE: Final = (
+    "The advisor review timed out before returning a verdict. Composer completion is withheld. "
+    + _ADVISOR_SIGNOFF_READINESS_NOT_REVERIFIED_CLAUSE
+    + " Send another message to retry the review."
+)
+_ADVISOR_SIGNOFF_TIMEOUT_UNVERIFIED_PUBLISHED_FINALIZE_SUFFIX = _bare_trusted_suffix(_ADVISOR_SIGNOFF_TIMEOUT_UNVERIFIED_PUBLISHED_NOTICE)
+
 # elspeth-25f7b757e7 (A1, budget displacement): published when the END gate's
 # deterministic pre-scan FLAGGED the USER'S OWN chat message — the one
 # advisory-evidence surface no composer tool call can mutate. Granting the
@@ -607,6 +619,8 @@ def _split_legacy_grounding_correction(suffix: str) -> tuple[VisibleMessageSegme
 _ADVISOR_PUBLISHED_BARE_SUFFIXES: Final[tuple[tuple[str, str], ...]] = (
     (_ADVISOR_SIGNOFF_PENDING_PUBLISHED_FINALIZE_SUFFIX, _ADVISOR_SIGNOFF_PENDING_PUBLISHED_NOTICE),
     (_ADVISOR_SIGNOFF_UNVERIFIED_PUBLISHED_FINALIZE_SUFFIX, _ADVISOR_SIGNOFF_UNVERIFIED_PUBLISHED_NOTICE),
+    (_ADVISOR_SIGNOFF_TIMEOUT_PENDING_PUBLISHED_FINALIZE_SUFFIX, _ADVISOR_SIGNOFF_TIMEOUT_PENDING_PUBLISHED_NOTICE),
+    (_ADVISOR_SIGNOFF_TIMEOUT_UNVERIFIED_PUBLISHED_FINALIZE_SUFFIX, _ADVISOR_SIGNOFF_TIMEOUT_UNVERIFIED_PUBLISHED_NOTICE),
     (_ADVISOR_SIGNOFF_UNAVAILABLE_PENDING_PUBLISHED_FINALIZE_SUFFIX, _ADVISOR_SIGNOFF_UNAVAILABLE_PENDING_PUBLISHED_NOTICE),
     (_ADVISOR_SIGNOFF_MALFORMED_PENDING_PUBLISHED_FINALIZE_SUFFIX, _ADVISOR_SIGNOFF_MALFORMED_PENDING_PUBLISHED_NOTICE),
     (_ADVISOR_SIGNOFF_UNAVAILABLE_UNVERIFIED_PUBLISHED_FINALIZE_SUFFIX, _ADVISOR_SIGNOFF_UNAVAILABLE_UNVERIFIED_PUBLISHED_NOTICE),
@@ -964,7 +978,7 @@ def compose_advisor_signoff_unverified_message(content: str) -> str:
 
 
 def compose_advisor_signoff_unrendered_pending_message(
-    content: str, *, failure_class: Literal["unavailable", "request_rejected", "malformed", "budget_exhausted"]
+    content: str, *, failure_class: Literal["timeout", "unavailable", "request_rejected", "malformed", "budget_exhausted"]
 ) -> str:
     """GREEN preflight + an UNRENDERED advisory verdict (unavailable/malformed).
 
@@ -977,7 +991,9 @@ def compose_advisor_signoff_unrendered_pending_message(
         return _append_advisor_suffix(content, _ADVISOR_REVIEW_BUDGET_SUFFIX)
     if failure_class == "request_rejected":
         return content
-    if failure_class == "unavailable":
+    if failure_class == "timeout":
+        suffix = _ADVISOR_SIGNOFF_TIMEOUT_PENDING_PUBLISHED_FINALIZE_SUFFIX
+    elif failure_class == "unavailable":
         suffix = _ADVISOR_SIGNOFF_UNAVAILABLE_PENDING_PUBLISHED_FINALIZE_SUFFIX
     else:
         suffix = _ADVISOR_SIGNOFF_MALFORMED_PENDING_PUBLISHED_FINALIZE_SUFFIX
@@ -985,7 +1001,7 @@ def compose_advisor_signoff_unrendered_pending_message(
 
 
 def compose_advisor_signoff_unrendered_unverified_message(
-    content: str, *, failure_class: Literal["unavailable", "request_rejected", "malformed", "budget_exhausted"]
+    content: str, *, failure_class: Literal["timeout", "unavailable", "request_rejected", "malformed", "budget_exhausted"]
 ) -> str:
     """ABSENT preflight + an UNRENDERED advisory verdict (unavailable/malformed).
 
@@ -997,7 +1013,9 @@ def compose_advisor_signoff_unrendered_unverified_message(
         return _append_advisor_suffix(content, _ADVISOR_REVIEW_BUDGET_SUFFIX)
     if failure_class == "request_rejected":
         return content
-    if failure_class == "unavailable":
+    if failure_class == "timeout":
+        suffix = _ADVISOR_SIGNOFF_TIMEOUT_UNVERIFIED_PUBLISHED_FINALIZE_SUFFIX
+    elif failure_class == "unavailable":
         suffix = _ADVISOR_SIGNOFF_UNAVAILABLE_UNVERIFIED_PUBLISHED_FINALIZE_SUFFIX
     else:
         suffix = _ADVISOR_SIGNOFF_MALFORMED_UNVERIFIED_PUBLISHED_FINALIZE_SUFFIX

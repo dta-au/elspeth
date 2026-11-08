@@ -89,8 +89,11 @@ async def test_source_proof_fallback_is_async_and_prior_runtime_remains_authorit
         return original_validate(current)
 
     monkeypatch.setattr(CompositionState, "validate", tracked_validate)
-    orphan = AsyncMock(return_value=None)
-    gate = AsyncMock(return_value=_TerminalNoToolAdvisorGateOutcome(action="fall_through"))
+    orphan = AsyncMock(spec=completion._surface_pt_and_gate_orphans_or_none, return_value=None)
+    gate = AsyncMock(
+        spec=completion._evaluate_terminal_no_tool_advisor_gate,
+        return_value=_TerminalNoToolAdvisorGateOutcome(action="fall_through"),
+    )
     monkeypatch.setattr(completion, "_surface_pt_and_gate_orphans_or_none", orphan)
     monkeypatch.setattr(completion, "_evaluate_terminal_no_tool_advisor_gate", gate)
     evidence = TurnEvidence(
@@ -158,7 +161,7 @@ async def test_structural_preflight_uses_exact_cache_key_and_keeps_runtime_verdi
     state = make_small_composer_state()
     changed = replace(state, nodes=(), version=state.version)
     runtime = _runtime_result(valid=False)
-    live_preflight = AsyncMock(return_value=runtime)
+    live_preflight = AsyncMock(spec=owner._preflight.cached_runtime_preflight, return_value=runtime)
     monkeypatch.setattr(owner._preflight, "cached_runtime_preflight", live_preflight)
     loop_thread = threading.get_ident()
     validations: list[tuple[CompositionState, int]] = []
@@ -252,7 +255,7 @@ async def test_terminal_site_enumeration_runs_in_worker_with_the_same_analysis(t
         return original_validate(current)
 
     monkeypatch.setattr(CompositionState, "validate", tracked_validate)
-    missing_sites = AsyncMock(return_value=())
+    missing_sites = AsyncMock(spec=owner._interpretation_surfacing._missing_pending_interpretation_review_sites, return_value=())
     monkeypatch.setattr(owner._interpretation_surfacing, "_missing_pending_interpretation_review_sites", missing_sites)
     registry = ComposerSessionCacheRegistry()
     with registry.borrow(SessionCacheKey("principal", "session")) as lease:
@@ -265,7 +268,7 @@ async def test_terminal_site_enumeration_runs_in_worker_with_the_same_analysis(t
             return ()
 
         monkeypatch.setattr(composition_completion, "interpretation_sites", enumerate_sites)
-        owned_worker = AsyncMock(wraps=analysis.run_in_worker)
+        owned_worker = AsyncMock(spec=analysis.run_in_worker, wraps=analysis.run_in_worker)
         monkeypatch.setattr(analysis, "run_in_worker", owned_worker)
         result = await owner._completion._surface_and_finalize_no_tools(
             assistant_message=_AdmittedAssistantMessage(content="Here is the draft."),

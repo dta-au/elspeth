@@ -746,7 +746,9 @@ class TestDiffPipelineTool:
         current = baseline.with_metadata({"description": "Only the current composition changes"})
         context = _context(baseline=baseline)
         current_validation = context.catalog.validate_composition_state(current).validation
-        context = replace(context, current_validation=current_validation)
+        stale_validation = context.catalog.validate_composition_state(_empty_state()).validation
+        assert stale_validation != current_validation
+        context = replace(context, current_validation=stale_validation)
         expected = diff_states(
             baseline,
             current,
@@ -757,7 +759,8 @@ class TestDiffPipelineTool:
 
         def compare(previous, saved, **kwargs):
             assert previous is baseline and saved is current
-            assert kwargs["current_validation"] is current_validation
+            assert kwargs["current_validation"] == current_validation
+            assert kwargs["current_validation"] != stale_validation
             assert kwargs["baseline_validation"] == context.catalog.validate_composition_state(baseline).validation
             observed.append((previous, saved))
             return original(previous, saved, **kwargs)

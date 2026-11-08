@@ -7,7 +7,9 @@ The repository supplies locked immutable state and remains the sole DML owner.
 from __future__ import annotations
 
 import uuid
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Protocol, TypedDict, cast, final
@@ -76,9 +78,45 @@ from elspeth.web.validation import INTERPRETATION_PLACEHOLDER_RE
 
 if TYPE_CHECKING:
     from elspeth.contracts.blobs import BlobRecord
-    from elspeth.web.composer.state import CompositionState
+    from elspeth.web.composer.state import CompositionState, NodeSpec
     from elspeth.web.execution.schemas import ValidationResult
     from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+
+
+class _PendingInterpretationGraphs:
+    """Bounded derived views of owned immutable records in one transaction.
+
+    Object identity (with the record retained) prevents a replacement carrying
+    the same database id from reusing an old graph. No validation or authority
+    verdict is retained. Only the repository installs this scope.
+    """
+
+    def __init__(self) -> None:
+        self.nodes: dict[int, tuple[CompositionStateRecord, tuple[NodeSpec, ...]]] = {}
+        self.states: dict[int, tuple[CompositionStateRecord, CompositionState]] = {}
+
+    @contextmanager
+    def scope(self) -> Iterator[None]:
+        token = _PENDING_INTERPRETATION_GRAPHS.set(self)
+        try:
+            yield
+        finally:
+            _PENDING_INTERPRETATION_GRAPHS.reset(token)
+
+
+_PENDING_INTERPRETATION_GRAPHS: ContextVar[_PendingInterpretationGraphs | None] = ContextVar("pending_interpretation_graphs", default=None)
+
+
+def _review_state_from_record(record: CompositionStateRecord) -> CompositionState:
+    cache = _PENDING_INTERPRETATION_GRAPHS.get()
+    if cache is None:
+        return state_from_record(record)
+    key = id(record)
+    if key not in cache.states:
+        if len(cache.states) >= 64:
+            cache.states.clear()
+        cache.states[key] = (record, state_from_record(record))
+    return cache.states[key][1]
 
 
 class _InterpretationHashDomainV2Payload(TypedDict):
@@ -215,7 +253,15 @@ def _find_interpretation_review_node(
 def _node_specs_from_state_record(state_record: CompositionStateRecord) -> tuple[Any, ...]:
     from elspeth.web.composer.state import NodeSpec
 
-    return tuple(NodeSpec.from_dict(dict(n)) for n in state_record.nodes or ())
+    cache = _PENDING_INTERPRETATION_GRAPHS.get()
+    if cache is None:
+        return tuple(NodeSpec.from_dict(dict(n)) for n in state_record.nodes or ())
+    key = id(state_record)
+    if key not in cache.nodes:
+        if len(cache.nodes) >= 64:
+            cache.nodes.clear()
+        cache.nodes[key] = (state_record, tuple(NodeSpec.from_dict(dict(n)) for n in state_record.nodes or ()))
+    return cache.nodes[key][1]
 
 
 def _find_node_spec_from_state_record(
@@ -596,7 +642,7 @@ def _source_data_contract_demand_from_state_record(
         raise InterpretationNodeMissingError(
             f"{context}: source_data_contract must target a source component ({SOURCE_COMPONENT_ID!r} or {SOURCE_COMPONENT_ID!r}:<name>)"
         )
-    state = state_from_record(state_record)
+    state = _review_state_from_record(state_record)
     if source_name not in state.sources:
         raise InterpretationNodeMissingError(f"{context}: source_data_contract requires persisted source {source_name!r}")
     if SOURCE_AUTHORING_KEY in state.sources[source_name].options:
@@ -1854,7 +1900,7 @@ class _SessionPendingInterpretationPlanner:
                 affected_node_id=affected_node_id,
                 context="create_pending_interpretation_event",
             )
-            boundary_state = state_from_record(state_record)
+            boundary_state = _review_state_from_record(state_record)
             expected_draft = build_source_data_contract_draft(
                 boundary_demand,
                 sample_header_for_source(boundary_state.sources[_boundary_source_name]),

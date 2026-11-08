@@ -44,6 +44,7 @@ from elspeth.web.catalog.schemas import (
     PluginSecretRequirement,
     PluginSummary,
 )
+from elspeth.web.composer._response_json import parse_response_json
 
 # A plugin class the catalog can introspect. Narrower than bare ``type`` so
 # the attribute access on ``plugin_cls.name`` / ``plugin_cls.get_config_schema()``
@@ -325,6 +326,10 @@ class CatalogServiceImpl:
         # Plugins own schema emission — single-model plugins use the default
         # on the plugin base, discriminated-union plugins override.
         json_schema = self._catalog_schema(plugin_cls, plugin_type)
+        # Plugin schema emission is an owned JSON contract. Validate leaves
+        # before serialization can coerce malformed defaults; retain the
+        # original data, including valid integers outside the JCS range.
+        parse_response_json(json_schema)
         knob_schema = self._knob_schema(plugin_cls, plugin_type=plugin_type, name=name)
         validate_knob_schema(knob_schema, plugin_kind=plugin_type, plugin_name=name)
 

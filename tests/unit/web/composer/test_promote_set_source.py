@@ -22,9 +22,10 @@ import pytest
 from pydantic import ValidationError as PydanticValidationError
 
 from elspeth.web.catalog.policy_view import PolicyCatalogView
-from elspeth.web.catalog.protocol import CatalogService
+from elspeth.web.catalog.protocol import CatalogService, PluginKind
 from elspeth.web.catalog.schemas import (
     ConfigFieldSummary,
+    PluginSchemaInfo,
     PluginSummary,
 )
 from elspeth.web.composer.protocol import ToolArgumentError
@@ -46,9 +47,7 @@ def _empty_state() -> CompositionState:
 
 
 def _mock_catalog() -> MagicMock:
-    """Minimal CatalogService mock — only ``list_sources`` is reached by
-    the path under test, and only the ``csv`` plugin name is referenced.
-    """
+    """Typed catalog responses for CSV source selection and schema probes."""
     catalog = MagicMock(spec=CatalogService)
     catalog.list_sources.return_value = [
         PluginSummary(
@@ -66,6 +65,17 @@ def _mock_catalog() -> MagicMock:
             ],
         ),
     ]
+
+    def schema(plugin_type: PluginKind, name: str) -> PluginSchemaInfo:
+        return PluginSchemaInfo(
+            name=name,
+            plugin_type=plugin_type,
+            description=f"{name} {plugin_type}",
+            json_schema={"properties": {}},
+            knob_schema={"fields": []},
+        )
+
+    catalog.get_schema.side_effect = schema
     return catalog
 
 

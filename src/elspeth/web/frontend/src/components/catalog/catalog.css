@@ -399,7 +399,8 @@
    --------------------------------------------------------------------------- */
 .catalog-backdrop {
   position: absolute;
-  inset: 0;
+  /* Keep the reserved notice/classification strip reachable above the drawer. */
+  inset: var(--size-control) 0 0;
   /* The shared scrim token, not a literal (elspeth-9ae8ee9ac2): this backdrop
      shipped at rgba(0,0,0,0.3) — the drawer is aria-modal and traps focus,
      yet dimmed the page a third less than every other blocking overlay, so
@@ -411,7 +412,7 @@
 
 .catalog-drawer {
   position: absolute;
-  top: 0;
+  top: var(--size-control);
   right: 0;
   bottom: 0;
   width: min(440px, calc(100% - 24px));

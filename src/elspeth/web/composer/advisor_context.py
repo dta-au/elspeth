@@ -31,6 +31,7 @@ from elspeth.web.validation import _redact_sensitive_content
 
 if TYPE_CHECKING:
     from elspeth.web.composer.advisor_transcript import AdvisorVisibleTranscript
+    from elspeth.web.composer.turn_effects import AdvisorPublicationReview
 
 _ADVISOR_SYSTEM_INSTRUCTIONS: Final[str] = (
     "Advisor mode:\n"
@@ -220,7 +221,29 @@ def _advisor_transcript(arguments: Mapping[str, Any]) -> AdvisorVisibleTranscrip
     return transcript
 
 
-def _advisor_user_sections(arguments: Mapping[str, Any]) -> tuple[str, ...]:
+@dataclass(frozen=True, slots=True)
+class PreparedAdvisorUserSections:
+    """Exact request-local rendering and detached facts for deferred partitioning.
+
+    All content remains untrusted. This value grants no admission, retention or
+    authority to reuse evidence across physical attempts.
+    """
+
+    sections: tuple[str, ...]
+    recent_errors: tuple[str, ...]
+    attempted_actions: tuple[str, ...]
+    has_current_request: bool
+    transcript: AdvisorVisibleTranscript | None
+    has_schema_excerpt: bool
+    summary_parts: AdvisorSummaryParts | None
+    publication_review: AdvisorPublicationReview | None
+
+    @property
+    def text(self) -> str:
+        return "\n".join(self.sections)
+
+
+def _advisor_user_sections(arguments: Mapping[str, Any]) -> PreparedAdvisorUserSections:
     """Build the exact variable user message sent to the advisor LLM.
 
     The validation path uses this same helper for prompt-size accounting, so
@@ -232,7 +255,7 @@ def _advisor_user_sections(arguments: Mapping[str, Any]) -> tuple[str, ...]:
         f"Advisor trigger: {arguments['trigger']}",
         f"Problem: {problem_summary}",
     ]
-    recent = cast(list[str], arguments["recent_errors"])
+    recent = tuple(cast(list[str], arguments["recent_errors"]))
     if recent:
         joined = "\n".join(f"- {_redact_sensitive_content(e)}" for e in recent)
         joined = joined.replace(
@@ -250,7 +273,7 @@ def _advisor_user_sections(arguments: Mapping[str, Any]) -> tuple[str, ...]:
             + "\n"
             + _ADVISOR_UNTRUSTED_PRIOR_FINDINGS_END
         )
-    attempted = cast(list[str], arguments["attempted_actions"])
+    attempted = tuple(cast(list[str], arguments["attempted_actions"]))
     if attempted:
         joined = "\n".join(f"- {_redact_sensitive_content(a)}" for a in attempted)
         user_msg_parts.append(f"\nAlready attempted:\n{joined}")
@@ -285,7 +308,9 @@ def _advisor_user_sections(arguments: Mapping[str, Any]) -> tuple[str, ...]:
             + "\n"
             + _ADVISOR_UNTRUSTED_SUMMARY_END
         )
-    if "schema_excerpt" in arguments and arguments["schema_excerpt"]:
+    has_schema_excerpt = bool("schema_excerpt" in arguments and arguments["schema_excerpt"])
+    summary_parts: AdvisorSummaryParts | None = None
+    if has_schema_excerpt:
         # Sentinel-neutralized for the same reason as ``user_message`` above:
         # the excerpt carries user-authored ``prompt_template``/``template``
         # option text, which can equally embed the fence sentinel.
@@ -294,6 +319,7 @@ def _advisor_user_sections(arguments: Mapping[str, Any]) -> tuple[str, ...]:
             summary = arguments["_elspeth_advisor_summary_parts"]
             if type(summary) is not AdvisorSummaryParts:
                 raise InvariantError("Advisor summary parts lack producer ownership")
+            summary_parts = summary
             if "".join(part.text for part in summary.values) == schema_excerpt:
                 schema_excerpt = _redact_advisor_summary(summary)
             else:
@@ -311,6 +337,7 @@ def _advisor_user_sections(arguments: Mapping[str, Any]) -> tuple[str, ...]:
             + "\n"
             + _ADVISOR_UNTRUSTED_SUMMARY_END
         )
+    publication_review: AdvisorPublicationReview | None = None
     if "publication_review" in arguments:
         from elspeth.web.composer.turn_effects import AdvisorPublicationReview
 
@@ -328,12 +355,21 @@ def _advisor_user_sections(arguments: Mapping[str, Any]) -> tuple[str, ...]:
             + "\n"
             + _ADVISOR_UNTRUSTED_SUMMARY_END
         )
-    return tuple(user_msg_parts)
+    return PreparedAdvisorUserSections(
+        sections=tuple(user_msg_parts),
+        recent_errors=recent,
+        attempted_actions=attempted,
+        has_current_request=current_request is not None,
+        transcript=transcript,
+        has_schema_excerpt=has_schema_excerpt,
+        summary_parts=summary_parts,
+        publication_review=publication_review,
+    )
 
 
 def build_advisor_user_message(arguments: Mapping[str, Any]) -> str:
     """Render the same complete variable message used for budget admission."""
-    return "\n".join(_advisor_user_sections(arguments))
+    return _advisor_user_sections(arguments).text
 
 
 @dataclass(frozen=True, slots=True)
@@ -525,10 +561,18 @@ def advisor_summary_parts(state: CompositionState, published: str) -> AdvisorSum
 
 def advisor_user_content_parts(arguments: Mapping[str, Any]) -> tuple[PromptGuardContentPart, ...]:
     """Partition at owned field/component boundaries; every value is untrusted."""
-    sections = _advisor_user_sections(arguments)
+    return _advisor_user_content_parts_from_sections(_advisor_user_sections(arguments))
+
+
+def _advisor_user_content_parts_from_sections(
+    prepared: PreparedAdvisorUserSections,
+) -> tuple[PromptGuardContentPart, ...]:
+    if type(prepared) is not PreparedAdvisorUserSections:
+        raise InvariantError("Advisor partition requires owned prepared sections")
+    sections = prepared.sections
     replacements: dict[int, tuple[PromptGuardContentPart, ...]] = {}
     index = 2
-    recent = cast(list[str], arguments["recent_errors"])
+    recent = prepared.recent_errors
     if recent:
         # Each prior finding remains atomic, including embedded newlines.
         prefix = sections[index].index(_ADVISOR_UNTRUSTED_PRIOR_FINDINGS_BEGIN) + len(_ADVISOR_UNTRUSTED_PRIOR_FINDINGS_BEGIN) + 1
@@ -546,7 +590,7 @@ def advisor_user_content_parts(arguments: Mapping[str, Any]) -> tuple[PromptGuar
         parts.append(PromptGuardContentPart("\n" + _ADVISOR_UNTRUSTED_PRIOR_FINDINGS_END))
         replacements[index] = tuple(parts)
         index += 1
-    attempted = cast(list[str], arguments["attempted_actions"])
+    attempted = prepared.attempted_actions
     if attempted:
         replacements[index] = (
             PromptGuardContentPart("\nAlready attempted:\n"),
@@ -556,11 +600,11 @@ def advisor_user_content_parts(arguments: Mapping[str, Any]) -> tuple[PromptGuar
             ),
         )
         index += 1
-    if _advisor_current_request(arguments) is not None:
+    if prepared.has_current_request:
         section = sections[index]
         replacements[index] = tuple(PromptGuardContentPart(section[start : start + 8_000]) for start in range(0, len(section), 8_000))
         index += 1
-    transcript = _advisor_transcript(arguments)
+    transcript = prepared.transcript
     if transcript is not None:
         section = sections[index]
         prefix = section.index(_ADVISOR_UNTRUSTED_SUMMARY_BEGIN) + len(_ADVISOR_UNTRUSTED_SUMMARY_BEGIN) + 1
@@ -578,11 +622,9 @@ def advisor_user_content_parts(arguments: Mapping[str, Any]) -> tuple[PromptGuar
             PromptGuardContentPart("\n" + _ADVISOR_UNTRUSTED_SUMMARY_END),
         )
         index += 1
-    if "schema_excerpt" in arguments and arguments["schema_excerpt"]:
-        if "_elspeth_advisor_summary_parts" in arguments:
-            summary = arguments["_elspeth_advisor_summary_parts"]
-            if type(summary) is not AdvisorSummaryParts:
-                raise InvariantError("Advisor summary parts lack producer ownership")
+    if prepared.has_schema_excerpt:
+        summary = prepared.summary_parts
+        if summary is not None:
             replacements[index] = (
                 PromptGuardContentPart("\n" + _ADVISOR_UNTRUSTED_SUMMARY_HEADER + "\n" + _ADVISOR_UNTRUSTED_SUMMARY_BEGIN + "\n"),
                 *(
@@ -597,12 +639,8 @@ def advisor_user_content_parts(arguments: Mapping[str, Any]) -> tuple[PromptGuar
                 PromptGuardContentPart("\n" + _ADVISOR_UNTRUSTED_SUMMARY_END),
             )
         index += 1
-    if "publication_review" in arguments:
-        from elspeth.web.composer.turn_effects import AdvisorPublicationReview
-
-        review = arguments["publication_review"]
-        if type(review) is not AdvisorPublicationReview:
-            raise InvariantError("Advisor publication review lacks producer ownership")
+    review = prepared.publication_review
+    if review is not None:
         prefix = sections[index].index(_ADVISOR_UNTRUSTED_SUMMARY_BEGIN) + len(_ADVISOR_UNTRUSTED_SUMMARY_BEGIN) + 1
         replacements[index] = (
             PromptGuardContentPart(sections[index][:prefix]),

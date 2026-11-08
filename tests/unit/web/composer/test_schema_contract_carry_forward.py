@@ -14,9 +14,12 @@ from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService, PluginKind
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
+from elspeth.web.catalog.service import CatalogServiceImpl
+from elspeth.web.composer.analysis import ComposerAnalysis
 from elspeth.web.composer.planner_authoring_aids import build_schema_contract_evidence
 from elspeth.web.composer.prompts import build_catalog_context_string, build_context_string, build_messages
 from elspeth.web.composer.protocol import ComposerHistoryMessage
+from elspeth.web.composer.session_cache import ComposerSessionCacheRegistry, SessionCacheKey
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.config import WebSettings
 from elspeth.web.dependencies import create_catalog_service
@@ -909,3 +912,80 @@ def test_followup_evidence_does_not_duplicate_discovery_or_rewrite_history() -> 
     assert catalog.get_schema_calls == [("source", "csv")]
     payload = _payload(cast(str, messages[-2]["content"]))
     assert [entry["plugin_id"] for entry in _schema_entries(payload)] == ["source/csv"]
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_unknown_schema_producer_preserves_noncanonical_values_and_isolates_copies(enabled: bool) -> None:
+    schema = _SchemaCatalog().get_schema("source", "csv")
+    schema.json_schema["default"] = frozenset({"not-json"})
+
+    class SharedCatalog(_SchemaCatalog):
+        def get_schema(self, plugin_type: PluginKind, name: str) -> PluginSchemaInfo:
+            self.get_schema_calls.append((plugin_type, name))
+            return schema
+
+    catalog = SharedCatalog()
+    view, _snapshot = _policy_view(catalog)
+    registry = ComposerSessionCacheRegistry(enabled=enabled)
+    with registry.borrow(SessionCacheKey("principal", "session")) as lease:
+        view = view.with_analysis(ComposerAnalysis(lease.cache))
+        assert view.projection_revision is None
+        first = view.get_schema("source", "csv")
+        assert first is not schema
+        assert first.json_schema["default"] == frozenset({"not-json"})
+        assert type(first.json_schema["default"]) is frozenset
+        first.json_schema["properties"]["mode"]["enum"].append("caller-only")
+        second = view.get_schema("source", "csv")
+        assert second.json_schema["properties"]["mode"]["enum"] == ["strict", "lenient"]
+        assert schema.json_schema["properties"]["mode"]["enum"] == ["strict", "lenient"]
+
+        evidence, evidenced = build_schema_contract_evidence(
+            view,
+            schemas_loaded=frozenset({("source", "csv")}),
+            referenced={("source", "csv")},
+        )
+        assert evidence["schemas"] == []
+        assert evidenced == frozenset()
+        assert evidence["omitted"] == [{"plugin_id": "source/csv", "reason": "schema_projection_unsupported"}]
+
+        # No revision means no retention, even with a borrowed session owner.
+        schema.json_schema["default"] = ["now-json"]
+        assert view.get_schema("source", "csv").json_schema["default"] == ["now-json"]
+        assert catalog.get_schema_calls == [("source", "csv")] * 4
+        if lease.cache is not None:
+            assert lease.cache.projections.entry_count == 0
+
+
+def test_catalog_subclass_cannot_inherit_projection_revision_for_ambient_schema() -> None:
+    manager = get_shared_plugin_manager()
+
+    class AmbientCatalog(CatalogServiceImpl):
+        ambient_schema: PluginSchemaInfo
+        schema_calls: int
+
+        def get_schema(self, plugin_type: PluginKind, name: str) -> PluginSchemaInfo:
+            assert (plugin_type, name) == ("source", "csv")
+            self.schema_calls += 1
+            return self.ambient_schema
+
+    catalog = AmbientCatalog(manager)
+    catalog.ambient_schema = CatalogServiceImpl.get_schema(catalog, "source", "csv")
+    catalog.ambient_schema.json_schema["default"] = ["before"]
+    catalog.schema_calls = 0
+    inherited_revision = catalog.cache_revision
+    assert catalog.uses_manager(manager)
+    snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
+    registry = ComposerSessionCacheRegistry()
+    with registry.borrow(SessionCacheKey("principal", "derived-catalog")) as lease:
+        view = PolicyCatalogView.for_trained_operator(catalog, snapshot, analysis=ComposerAnalysis(lease.cache, manager=manager))
+        assert view.projection_revision is None
+        assert not view.uses_manager(manager)
+        first = view.get_schema("source", "csv")
+        first.json_schema["default"].append("caller-only")
+        assert catalog.ambient_schema.json_schema["default"] == ["before"]
+        catalog.ambient_schema.json_schema["default"] = ["after"]
+        assert catalog.cache_revision == inherited_revision
+        assert view.get_schema("source", "csv").json_schema["default"] == ["after"]
+        assert catalog.schema_calls == 2
+        assert lease.cache is not None
+        assert lease.cache.projections.entry_count == 0

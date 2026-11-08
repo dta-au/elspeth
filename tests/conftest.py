@@ -11,6 +11,7 @@ Responsibilities:
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import os
 import stat
 import sys
@@ -217,6 +218,32 @@ def _isolate_planner_authoring_aids_memo() -> Iterator[None]:
     _AIDS_MEMO.clear()
     yield
     _AIDS_MEMO.clear()
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _chroma_model_cache() -> Iterator[None]:
+    """Optionally relocate Chroma's real ONNX model cache for restricted hosts.
+
+    Chroma 1.5.5 hardcodes its cache beneath Path.home(), with no cache-path
+    constructor argument. This test-only adaptation changes that path alone:
+    model download/checksum verification, tokenization, embeddings and search
+    still run unchanged. The default embedding function creates fresh ONNX
+    instances, so the override must cover the class for the pytest session.
+    """
+    configured = os.environ.get("ELSPETH_TEST_CHROMA_CACHE_DIR")
+    if configured is None or importlib.util.find_spec("chromadb") is None:
+        yield
+        return
+
+    cache_root = Path(configured).resolve()
+    if not cache_root.is_relative_to(Path(__file__).resolve().parent.parent):
+        raise ValueError("ELSPETH_TEST_CHROMA_CACHE_DIR must be inside this checkout")
+
+    from chromadb.utils.embedding_functions.onnx_mini_lm_l6_v2 import ONNXMiniLM_L6_V2
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(ONNXMiniLM_L6_V2, "DOWNLOAD_PATH", cache_root / ONNXMiniLM_L6_V2.MODEL_NAME)
+        yield
 
 
 @pytest.fixture(autouse=True, scope="session")

@@ -24,6 +24,7 @@ from elspeth.contracts.plugin_protocols import TransformProtocol
 from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.service import CatalogServiceImpl
+from elspeth.web.composer.analysis import ComposerAnalysis
 from elspeth.web.composer.state import CompositionState, ValidationSummary
 from elspeth.web.composer.yaml_importer import composition_state_from_runtime_yaml
 from elspeth.web.config import WebSettings
@@ -202,6 +203,21 @@ def run_validation(
 ) -> ValidationSummary:
     """Run one fixed input through the supplied analysis mode or its reference."""
     return scenario.validate() if validator is None else validator(scenario.state)
+
+
+def validation_for_analysis(
+    scenario: ComposerValidationScenario,
+    analysis: ComposerAnalysis,
+) -> Callable[[CompositionState], ValidationSummary]:
+    """Keep profile lowering live while selecting the scenario's analysis owner."""
+    if scenario.policy_catalog is None:
+        return analysis.validate_raw
+    catalog = scenario.policy_catalog.with_analysis(analysis)
+
+    def validate(state: CompositionState) -> ValidationSummary:
+        return catalog.validate_composition_state(state).validation
+
+    return validate
 
 
 @contextmanager

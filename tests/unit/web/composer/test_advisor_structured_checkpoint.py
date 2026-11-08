@@ -57,7 +57,10 @@ async def test_unavailable_public_detail_does_not_invent_a_retry(make_service, s
     expected_attempts = 2 if retryable else 1
     assert physical_calls == expected_attempts
     assert verdict.failure_class == "unavailable"
-    assert verdict.findings_text == "advisor model was unavailable"
+    assert verdict.timed_out is (not retryable)
+    assert verdict.findings_text == (
+        "advisor model was unavailable" if retryable else "the advisor review timed out before returning a verdict"
+    )
     record = service._sessions_service.add_message.calls[0].kwargs["tool_calls"][0]["pass"]
     assert record["provider_attempts"] == expected_attempts
     assert "private-provider-marker" not in repr(verdict)
@@ -470,6 +473,7 @@ async def test_rejected_attempt_does_not_contribute_final_counts(make_service, s
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(30)
 @pytest.mark.parametrize("scenario", ["clean", "blocked-first", "blocked-retry", "admission-timeout-then-clean"])
 async def test_conformance_counts_only_physical_dispatch_after_quota_admission(
     make_service, simple_state, physical_advisor, monkeypatch, scenario
@@ -480,16 +484,23 @@ async def test_conformance_counts_only_physical_dispatch_after_quota_admission(
     fenced = physical_advisor.bind(service)
     admissions = 0
     physical_calls = 0
+    blocked_admissions = 0
+    cancelled_admissions = 0
     original_admit = ProviderCallCustody.admit
 
     async def admission(custody: ProviderCallCustody, *, model: str) -> None:
-        nonlocal admissions
+        nonlocal admissions, blocked_admissions, cancelled_admissions
         assert model == service._settings.composer_advisor_model
         admissions += 1
         if scenario == "admission-timeout-then-clean" and admissions == 1:
             raise TimeoutError("quota admission timed out before dispatch")
         if scenario == "blocked-first" or (scenario == "blocked-retry" and admissions == 2):
-            await asyncio.Event().wait()
+            blocked_admissions += 1
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled_admissions += 1
+                raise
         await original_admit(custody, model=model)
 
     async def complete(**kwargs):
@@ -510,11 +521,19 @@ async def test_conformance_counts_only_physical_dispatch_after_quota_admission(
             phase="early",
             state=simple_state,
             recorder=None,
-            deadline=asyncio.get_running_loop().time() + 0.2,
+            # This physical path performs real guard/SQL admission and required
+            # settlement. A 200ms turn can expire before the intended retry,
+            # testing the separate deadline-before-format-retry contract instead.
+            # Leave setup headroom; blocked admission still ends by the real
+            # shared deadline, and the assertions below prove that seam ran.
+            deadline=asyncio.get_running_loop().time() + 5.0,
             **fenced,
         )
     expected_calls = 0 if scenario == "blocked-first" else 1
     assert physical_calls == expected_calls
+    assert admissions == (1 if scenario in {"clean", "blocked-first"} else 2)
+    expected_blocked = int(scenario in {"blocked-first", "blocked-retry"})
+    assert blocked_admissions == cancelled_admissions == expected_blocked
     record = service._sessions_service.add_message.await_args_list[0].kwargs["tool_calls"][0]["pass"]
     event = next(item for item in events if item["event"] == "composer.advisor_checkpoint_pass")
     for facts in (record, event):

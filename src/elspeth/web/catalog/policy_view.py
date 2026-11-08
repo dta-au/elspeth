@@ -85,14 +85,14 @@ class PolicyCatalogView:
     @property
     def projection_revision(self) -> str | None:
         """Only explicitly prepared catalogs declare a reusable dependency."""
-        if not isinstance(self._full, CatalogServiceImpl):
+        if type(self._full) is not CatalogServiceImpl:
             return None
         revision = self._full.cache_revision
         generation = self._profiles.generation if self._profiles is not None else 0
         return f"catalog:{revision}:profiles:{generation}"
 
     def uses_manager(self, manager: PluginManager) -> bool:
-        return isinstance(self._full, CatalogServiceImpl) and self._full.uses_manager(manager)
+        return type(self._full) is CatalogServiceImpl and self._full.uses_manager(manager)
 
     def project_json(self, name: str, compute: Callable[[], str]) -> str:
         """Memoize public serialized data, never profile bindings or live checks."""
@@ -181,7 +181,7 @@ class PolicyCatalogView:
         for item in visible:
             plugin_id = PluginId(kind, item.name)
             aliases = self._usable_profile_aliases(plugin_id)
-            if not aliases:
+            if not aliases and self._profiles.default_endpoint_for(plugin_id) is None:
                 projected.append(item)
                 continue
             projected.append(
@@ -281,6 +281,11 @@ class PolicyCatalogView:
     def get_schema(self, plugin_type: PluginKind, name: str) -> PluginSchemaInfo:
         plugin_id = PluginId(plugin_type, name)
         self._require_available(plugin_id)
+        if self.projection_revision is None:
+            # Unknown producers have no reusable serialized contract. Preserve
+            # noncanonical values for the caller's admission boundary instead
+            # of coercing them through Pydantic's JSON serializer.
+            return self._public_schema(plugin_type, name).model_copy(deep=True)
         return PluginSchemaInfo.model_validate_json(
             self.project_json(f"schema:{plugin_type}:{name}", lambda: self._public_schema(plugin_type, name).model_dump_json())
         )
@@ -341,6 +346,12 @@ class PolicyCatalogView:
             profile_registry=self._profiles,
             catalog=self._full,
         )
+
+    def project_component_policy(self, state: CompositionState) -> PluginPolicyValidationResult:
+        """Fresh policy/lowering for option probes; no whole-graph validation."""
+        from elspeth.web.plugin_policy.validation import project_component_policy
+
+        return project_component_policy(state, snapshot=self.snapshot, profile_registry=self._profiles, catalog=self._full)
 
     async def validate_composition_state_async(self, state: CompositionState) -> ProfileAwareValidationResult:
         """Keep fresh policy, lowering and graph CPU off the event loop."""

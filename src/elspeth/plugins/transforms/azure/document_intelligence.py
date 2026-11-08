@@ -44,6 +44,7 @@ from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.plugin_capabilities import ContentTrust
 from elspeth.contracts.schema import FieldDefinition
 from elspeth.contracts.schema_contract import PipelineRow
+from elspeth.core.document_intelligence_config import validate_document_intelligence_endpoint
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.batching import BatchTransformMixin, OutputPort
 from elspeth.plugins.infrastructure.clients.http import AuditedHTTPClient, HTTPResponseBodyTooLargeError
@@ -86,35 +87,6 @@ _KNOWN_FEATURES: frozenset[str] = frozenset(
 
 _MODEL_ID_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._~-]{1,63}$")
 _PAGES_PATTERN = re.compile(r"^(\d+(-\d+)?)(,\s*(\d+(-\d+)?))*$")
-_AZURE_DOCUMENT_INTELLIGENCE_HOST_SUFFIXES: tuple[str, ...] = (
-    ".cognitiveservices.azure.com",
-    ".api.cognitive.microsoft.com",
-    ".cognitiveservices.azure.us",
-    ".api.cognitive.microsoft.us",
-    ".cognitiveservices.azure.cn",
-    ".api.cognitive.azure.cn",
-)
-
-
-def _validate_azure_document_intelligence_endpoint(value: str) -> str:
-    """Validate that a credential-bearing endpoint targets Azure Document Intelligence."""
-    from elspeth.core.url_validation import validate_credential_safe_https_url
-
-    endpoint = validate_credential_safe_https_url(value, field_name="endpoint")
-    parsed = urlparse(endpoint)
-    hostname = (parsed.hostname or "").casefold().rstrip(".")
-    if not any(hostname.endswith(suffix) and bool(hostname.removesuffix(suffix)) for suffix in _AZURE_DOCUMENT_INTELLIGENCE_HOST_SUFFIXES):
-        allowed = ", ".join(f"*{suffix}" for suffix in _AZURE_DOCUMENT_INTELLIGENCE_HOST_SUFFIXES)
-        raise ValueError(f"endpoint must be an Azure Document Intelligence resource endpoint ({allowed})")
-    try:
-        port = parsed.port
-    except ValueError as exc:
-        raise ValueError("endpoint must use a valid HTTPS port") from exc
-    if port not in (None, 443):
-        raise ValueError("endpoint must use the standard HTTPS port 443")
-    if parsed.path not in ("", "/") or parsed.params or parsed.query or parsed.fragment:
-        raise ValueError("endpoint must be an origin URL without a path, parameters, query, or fragment")
-    return endpoint
 
 
 class ExtractFields(BaseModel):
@@ -186,7 +158,7 @@ class AzureDocumentIntelligenceConfig(TransformDataConfig):
     @field_validator("endpoint")
     @classmethod
     def _validate_endpoint(cls, v: str) -> str:
-        return _validate_azure_document_intelligence_endpoint(v)
+        return validate_document_intelligence_endpoint(v)
 
     @field_validator("api_key")
     @classmethod
@@ -295,7 +267,7 @@ class AzureDocumentIntelligence(BaseTransform, BatchTransformMixin):
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
     # Placeholder must be a sha256: literal so the hash normalizer matches it; recomputed by scripts/cicd/plugin_hash.
-    source_file_hash: str | None = "sha256:6cf19c282afd8da5"
+    source_file_hash: str | None = "sha256:46c7896c0e679d78"
     config_model = AzureDocumentIntelligenceConfig
     passes_through_input = True
     content_trust = ContentTrust.UNTRUSTED

@@ -266,6 +266,58 @@ def test_manifest_uses_exact_ordered_advertised_tool_definitions() -> None:
     assert manifest.canonical_schema_hash == stable_hash(canonical_set_pipeline_schema())
 
 
+def test_manifest_reuses_validated_request_serializations_without_sharing_mutable_inputs(monkeypatch: pytest.MonkeyPatch) -> None:
+    from elspeth.core import canonical
+
+    messages = _messages(build_system_prompt(None), sensitive_user_text="Inspect café 🌱")
+    tools = planner_tool_definitions(dialect=ToolContractDialect.NONE)
+    schema = canonical_set_pipeline_schema()
+    expected_messages, expected_tools = stable_hash(messages), stable_hash(tools)
+    original = canonical._normalize_for_canonical
+    visits = {"messages": 0, "tools": 0}
+
+    def counted(value: Any) -> Any:
+        if value is messages:
+            visits["messages"] += 1
+        elif value is tools:
+            visits["tools"] += 1
+        return original(value)
+
+    # Both canonical_json and stable_hash normalize the root; stable_hash
+    # delegates its serialization to the primitive implementation instead of
+    # calling this module's canonical_json. Count the shared real traversal.
+    monkeypatch.setattr(canonical, "_normalize_for_canonical", counted)
+    manifest = build_planner_capability_manifest(messages=messages, tools=tools, canonical_schema=schema)
+    assert visits == {"messages": 1, "tools": 1}
+    assert manifest.rendered_prompt_hash == expected_messages
+    assert manifest.effective_tool_hash == expected_tools
+    # Controlled old-path negative: validating then stable_hash traverses the
+    # same roots twice, so the one-traversal assertion must reject that path.
+    visits.update(messages=0, tools=0)
+    canonical.canonical_json(messages)
+    canonical.canonical_json(tools)
+    canonical.stable_hash(messages)
+    canonical.stable_hash(tools)
+    assert visits == {"messages": 2, "tools": 2}
+    with pytest.raises(AssertionError):
+        assert visits == {"messages": 1, "tools": 1}
+    messages[-1]["content"] = "Later caller mutation"
+    tools.clear()
+    assert manifest.rendered_prompt_hash == expected_messages
+    assert manifest.effective_tool_hash == expected_tools
+
+
+def test_manifest_reused_serialization_still_rejects_nonfinite_owned_request() -> None:
+    messages = _messages(build_system_prompt(None))
+    messages[-1]["content"] = float("nan")
+    with pytest.raises(ValueError):
+        build_planner_capability_manifest(
+            messages=messages,
+            tools=planner_tool_definitions(dialect=ToolContractDialect.NONE),
+            canonical_schema=canonical_set_pipeline_schema(),
+        )
+
+
 def test_manifest_accepts_an_order_preserving_dynamic_discovery_subset() -> None:
     tools = planner_tool_definitions(dialect=ToolContractDialect.NONE)
     retained = {"get_plugin_assistance", "get_plugin_schema", "list_models", "handoff_to_user", "restore_parked_graph"}

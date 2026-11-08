@@ -21,7 +21,7 @@ from typing import Any, Final, Literal, NotRequired, TypedDict
 from elspeth.contracts.blobs_inline import is_widened_blob_ref
 from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.enums import CreationModality
-from elspeth.contracts.freeze import deep_thaw, freeze_fields
+from elspeth.contracts.freeze import deep_freeze, deep_thaw, freeze_fields
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.plugin_capabilities import ControlRole, PluginCapability
 from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
@@ -3310,7 +3310,10 @@ def _reconcile_node_options(
         options["prompt_template"] = rendered
     if carried_prompt_review:
         options["approved_prompt_artifact_hash"] = approved_prompt_artifact_hash_from_options(options)
-    return options
+    # Complete every coherence check before reusing this owned immutable node.
+    # Compare the frozen representation: reconciled review rows are lists,
+    # while NodeSpec has already detached and frozen its options to tuples.
+    return proposed.options if deep_freeze(options) == proposed.options else options
 
 
 def _reconcile_source_options(
@@ -3456,7 +3459,7 @@ def _reconcile_source_options(
         options[INTERPRETATION_REQUIREMENTS_KEY] = reconciled
     elif INTERPRETATION_REQUIREMENTS_KEY in options:
         del options[INTERPRETATION_REQUIREMENTS_KEY]
-    return options
+    return proposed.options if deep_freeze(options) == proposed.options else options
 
 
 def reconcile_authoritative_reviews(
@@ -3465,36 +3468,41 @@ def reconcile_authoritative_reviews(
 ) -> CompositionState:
     """Rehydrate only coherent, still-applicable server-owned review evidence."""
     previous_sources = previous.sources
-    reconciled_sources = {
-        source_name: replace(
+    reconciled_sources = {}
+    changed = False
+    for source_name, source in proposed.sources.items():
+        options = _reconcile_source_options(
+            previous_sources[source_name] if source_name in previous_sources else None,
             source,
-            options=_reconcile_source_options(
-                previous_sources[source_name] if source_name in previous_sources else None,
-                source,
-                component_id=source_component_id(source_name),
-            ),
+            component_id=source_component_id(source_name),
         )
-        for source_name, source in proposed.sources.items()
-    }
+        if options is source.options:
+            reconciled_sources[source_name] = source
+        else:
+            reconciled_sources[source_name] = replace(source, options=options)
+            changed = True
     previous_nodes = {node.id: node for node in previous.nodes}
     proposed_graph = _output_stream_graph(proposed.nodes)
-    reconciled_nodes = tuple(
-        replace(
+    reconciled_nodes = []
+    for node in proposed.nodes:
+        options = _reconcile_node_options(
+            previous_nodes[node.id] if node.id in previous_nodes else None,
             node,
-            options=_reconcile_node_options(
-                previous_nodes[node.id] if node.id in previous_nodes else None,
-                node,
-                previous_nodes=previous.nodes,
-                proposed_nodes=proposed.nodes,
-                proposed_graph=proposed_graph,
-            ),
+            previous_nodes=previous.nodes,
+            proposed_nodes=proposed.nodes,
+            proposed_graph=proposed_graph,
         )
-        for node in proposed.nodes
-    )
+        if options is node.options:
+            reconciled_nodes.append(node)
+        else:
+            reconciled_nodes.append(replace(node, options=options))
+            changed = True
+    if not changed:
+        return proposed
     return replace(
         proposed,
         sources=reconciled_sources,
-        nodes=reconciled_nodes,
+        nodes=tuple(reconciled_nodes),
     )
 
 

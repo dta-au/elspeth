@@ -198,8 +198,8 @@ def build_planner_capability_manifest(
     """
     if tool_surface not in {"full", "terminal_only"}:
         raise ValueError("tool_surface must be 'full' or 'terminal_only'")
-    canonical_json(messages)
-    canonical_json(tools)
+    canonical_messages = canonical_json(messages)
+    canonical_tools = canonical_json(tools)
     core = load_pipeline_capability_core()
     system_contents = [message["content"] for message in messages if message["role"] == "system"]
     if not system_contents or type(system_contents[0]) is not str or not system_contents[0].startswith(core):
@@ -245,8 +245,8 @@ def build_planner_capability_manifest(
         planner_implementation_id=PLANNER_IMPLEMENTATION_ID,
         capability_core_hash=hashlib.sha256(core.encode("utf-8")).hexdigest(),
         canonical_schema_hash=stable_hash(advertised_schema),
-        effective_tool_hash=stable_hash(tools),
-        rendered_prompt_hash=stable_hash(messages),
+        effective_tool_hash=hashlib.sha256(canonical_tools.encode("utf-8")).hexdigest(),
+        rendered_prompt_hash=hashlib.sha256(canonical_messages.encode("utf-8")).hexdigest(),
     )
 
 

@@ -1,6 +1,7 @@
 import { create, type StoreApi, type UseBoundStore } from "zustand";
 
 import * as api from "@/api/client";
+import { composerCustodyScope } from "./composerOperationCustody";
 import type {
   ApiError,
   PluginPolicyResponse,
@@ -76,7 +77,14 @@ export function createPluginCatalogStore(): PluginCatalogStore {
     ...emptyCatalogState(),
 
     async load(request) {
-      const { principal, fingerprint, force = false } = request;
+      const { fingerprint, force = false } = request;
+      // UI callers supply user_id; server responses use auth-provider:user_id.
+      // Normalize only against the authenticated owner, never by guessing a
+      // provider or stripping a prefix from an arbitrary principal string.
+      const scope = composerCustodyScope();
+      const principal = scope !== null && request.principal === scope.principalId
+        ? `${scope.authProvider}:${scope.principalId}`
+        : request.principal;
       const current = get();
       const expectedKey = fingerprint === undefined
         ? null

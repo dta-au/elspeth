@@ -163,14 +163,64 @@ def test_two_processes_materialize_one_exact_permit(postgres_url: str) -> None:
             assert len(conn.execute(select(run_workers_table).where(run_workers_table.c.run_id == binding.run_id)).all()) == 1
 
 
-def _hold_projection_fence(url: str, token: CoordinationToken, control: Connection) -> None:
-    from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
+def _projection_marker_rows(db: LandscapeDB, token: CoordinationToken, marker: str) -> list[str]:
+    from elspeth.core.canonical import canonical_json
+
+    with db.engine.connect() as conn:
+        return list(
+            conn.scalars(
+                select(run_coordination_events_table.c.event_id).where(
+                    run_coordination_events_table.c.run_id == token.run_id,
+                    run_coordination_events_table.c.event_type == "finalize",
+                    run_coordination_events_table.c.worker_id == token.worker_id,
+                    run_coordination_events_table.c.leader_epoch == token.leader_epoch,
+                    run_coordination_events_table.c.context_json == canonical_json({"projection_test_marker": marker}),
+                )
+            )
+        )
+
+
+def _assert_projection_marker_outcome(db: LandscapeDB, token: CoordinationToken, marker: str, outcome: str) -> None:
+    assert outcome in {"released", "rolled-back-expired"}
+    assert len(_projection_marker_rows(db, token, marker)) == (1 if outcome == "released" else 0)
+
+
+def _hold_projection_fence(url: str, token: CoordinationToken, control: Connection, marker: str) -> None:
+    from elspeth.core.canonical import canonical_json
+    from elspeth.core.landscape.database_clock import read_landscape_decision_time
+    from elspeth.core.landscape.lease_deadlines import LeaseDeadlineExpiredError
+    from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction, record_coordination_event
 
     with LandscapeDB.from_url(url, create_tables=False) as db:
-        with fenced_leader_transaction(db.engine, token=token, window_seconds=0.01, verb="test-terminal-projection"):
-            control.send("locked")
-            assert control.recv() == "release"
-        control.send("released")
+        try:
+            with fenced_leader_transaction(db.engine, token=token, window_seconds=0.01, verb="test-terminal-projection") as conn:
+                record_coordination_event(
+                    conn,
+                    run_id=token.run_id,
+                    event_type="finalize",
+                    worker_id=token.worker_id,
+                    leader_epoch=token.leader_epoch,
+                    recorded_at=read_landscape_decision_time(conn),
+                    context={"projection_test_marker": marker},
+                )
+                assert (
+                    len(
+                        conn.execute(
+                            select(run_coordination_events_table.c.event_id).where(
+                                run_coordination_events_table.c.run_id == token.run_id,
+                                run_coordination_events_table.c.context_json == canonical_json({"projection_test_marker": marker}),
+                            )
+                        ).all()
+                    )
+                    == 1
+                )
+                control.send("locked")
+                assert control.recv() == "release"
+        except LeaseDeadlineExpiredError:
+            assert conn.closed
+            control.send("rolled-back-expired")
+        else:
+            control.send("released")
 
 
 def _resume_during_projection(url: str, run_id: str, control: Connection) -> None:
@@ -212,7 +262,8 @@ def test_terminal_projection_lock_blocks_cli_resume_after_lease_expiry(postgres_
         context = multiprocessing.get_context("spawn")
         parent_hold, child_hold = context.Pipe()
         parent_resume, child_resume = context.Pipe()
-        holder = context.Process(target=_hold_projection_fence, args=(postgres_url, token, child_hold))
+        marker = str(uuid4())
+        holder = context.Process(target=_hold_projection_fence, args=(postgres_url, token, child_hold, marker))
         contender = context.Process(target=_resume_during_projection, args=(postgres_url, run_id, child_resume))
         try:
             holder.start()
@@ -228,7 +279,8 @@ def test_terminal_projection_lock_blocks_cli_resume_after_lease_expiry(postgres_
                 assert conn.execute(select(runs_table.c.status).where(runs_table.c.run_id == run_id)).scalar_one() == "failed"
             parent_hold.send("release")
             assert parent_hold.poll(30)
-            assert parent_hold.recv() == "released"
+            outcome = parent_hold.recv()
+            _assert_projection_marker_outcome(db, token, marker, outcome)
             assert parent_resume.poll(30)
             assert parent_resume.recv() in {"refused", "acquired"}
             for process in (holder, contender):
@@ -241,3 +293,73 @@ def test_terminal_projection_lock_blocks_cli_resume_after_lease_expiry(postgres_
                     process.join(timeout=10)
             parent_hold.close()
             parent_resume.close()
+
+
+@pytest.mark.parametrize("failure", ["committed", "deadline", "unrelated"])
+def test_projection_ack_distinguishes_real_guard_expiry_from_unrelated_error(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    from datetime import datetime, timedelta
+
+    from sqlalchemy import Connection as SqlConnection
+    from tests.fixtures.landscape import leader_token_for
+
+    from elspeth.contracts.coordination import mint_worker_id
+    from elspeth.core.landscape import lease_deadlines
+
+    run_id = str(uuid4())
+    with LandscapeDB.from_url(postgres_url) as db:
+        factory = RecorderFactory(db)
+        factory.run_lifecycle.begin_run({}, "v1", run_id=run_id, openrouter_catalog_sha256="a" * 64, openrouter_catalog_source="bundled")
+        original = leader_token_for(db, run_id)
+        factory.run_lifecycle.complete_run(RunStatus.FAILED, coordination_token=original)
+        factory.run_coordination.release_seat(token=original)
+        token = factory.run_coordination.acquire_reconciliation_leadership(
+            run_id=run_id,
+            worker_id=mint_worker_id(run_id),
+            window_seconds=30,
+            expected_status=RunStatus.FAILED,
+        )
+        marker = str(uuid4())
+        parent, child = multiprocessing.Pipe()
+        original_clock = lease_deadlines.read_landscape_decision_time
+        unrelated = RuntimeError("controlled unrelated clock failure")
+
+        def guard_clock(conn: SqlConnection) -> datetime:
+            if failure == "unrelated":
+                raise unrelated
+            return original_clock(conn) + timedelta(days=1 if failure == "deadline" else -1)
+
+        try:
+            parent.send("release")
+            with monkeypatch.context() as scoped:
+                # Only the real precommit guard's clock is moved. Fence renewal
+                # still uses the actual database clock and real production DML.
+                scoped.setattr(lease_deadlines, "read_landscape_decision_time", guard_clock)
+                if failure != "unrelated":
+                    _hold_projection_fence(postgres_url, token, child, marker)
+                else:
+                    with pytest.raises(RuntimeError) as caught:
+                        _hold_projection_fence(postgres_url, token, child, marker)
+                    assert caught.value is unrelated
+            assert parent.recv() == "locked"
+            if failure == "committed":
+                assert parent.recv() == "released"
+                _assert_projection_marker_outcome(db, token, marker, "released")
+                # A swallowed rollback that committed cannot claim expired rollback.
+                with pytest.raises(AssertionError):
+                    _assert_projection_marker_outcome(db, token, marker, "rolled-back-expired")
+            elif failure == "deadline":
+                assert parent.recv() == "rolled-back-expired"
+                _assert_projection_marker_outcome(db, token, marker, "rolled-back-expired")
+                # A swallowed expiry reported as committed must fail the marker oracle.
+                with pytest.raises(AssertionError):
+                    _assert_projection_marker_outcome(db, token, marker, "released")
+            else:
+                assert not parent.poll()
+                assert _projection_marker_rows(db, token, marker) == []
+        finally:
+            parent.close()
+            child.close()

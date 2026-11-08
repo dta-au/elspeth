@@ -2055,6 +2055,48 @@ _LOCK_DISCIPLINE_NEGATIVE_TESTS: tuple[LockDisciplineNegativeTest, ...] = (
 
 _TEST_FIXTURE_REVIEWED_WRITERS: tuple[ReviewedWriter, ...] = (
     ReviewedWriter(
+        path="tests/unit/web/sessions/test_dispatch_evidence_projection.py",
+        enclosing_symbol="test_duplicate_json_keys_cannot_hide_malformed_matching_evidence",
+        table="chat_messages",
+        operation="raw_string_in_text",
+        purpose="Isolated minimal chat_messages fixture preserves raw duplicate JSON keys to prove malformed matching evidence is rejected.",
+    ),
+    ReviewedWriter(
+        path="tests/unit/web/sessions/test_dispatch_evidence_projection.py",
+        enclosing_symbol="test_last_duplicate_json_key_remains_unrelated",
+        table="chat_messages",
+        operation="raw_string_in_text",
+        purpose="Isolated minimal chat_messages fixture proves last-key JSON identity semantics without serializer normalization.",
+    ),
+    ReviewedWriter(
+        path="tests/unit/web/sessions/test_dispatch_evidence_projection.py",
+        enclosing_symbol="test_postgres_legacy_json_storage_domain",
+        table="chat_messages",
+        operation="raw_string_in_text",
+        purpose="Isolated PostgreSQL JSON fixture seeds escaped NUL and numeric domain controls for original-reader compatibility.",
+    ),
+    ReviewedWriter(
+        path="tests/unit/web/sessions/test_dispatch_evidence_projection.py",
+        enclosing_symbol="test_pg_domain_fallback_retains_outer_writes_duplicates_and_exact_types",
+        table="chat_messages",
+        operation="raw_string_in_text",
+        purpose="Isolated PostgreSQL JSON fixture triggers the savepoint fallback while proving prior transaction writes and duplicate evidence survive.",
+    ),
+    ReviewedWriter(
+        path="tests/unit/web/sessions/test_dispatch_evidence_projection.py",
+        enclosing_symbol="test_pg_fallback_does_not_hide_malformed_matching_evidence",
+        table="chat_messages",
+        operation="raw_string_in_text",
+        purpose="Isolated PostgreSQL JSON fixture triggers domain fallback and requires malformed matching authority to remain rejected.",
+    ),
+    ReviewedWriter(
+        path="tests/unit/web/sessions/test_dispatch_evidence_projection.py",
+        enclosing_symbol="test_selected_envelope_retains_original_numeric_decoding",
+        table="chat_messages",
+        operation="raw_string_in_text",
+        purpose="Isolated PostgreSQL JSON fixture preserves numeric lexemes to compare original-driver types with projected matching envelopes.",
+    ),
+    ReviewedWriter(
         path="tests/testcontainer/web/test_quota_authority_postgres.py",
         enclosing_symbol="test_container_storage_serializes_cross_identity_output_reservations",
         table="composition_states",

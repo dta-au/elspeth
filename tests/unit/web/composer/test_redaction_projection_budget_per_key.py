@@ -85,11 +85,18 @@ def test_declarative_unknown_wide_data_keeps_envelope_framing() -> None:
 
 
 def test_real_unfiltered_list_models_call_keeps_envelope_framing() -> None:
+    from elspeth.web.catalog.policy_view import PolicyCatalogView
     from elspeth.web.composer.state import CompositionState, PipelineMetadata
+    from elspeth.web.composer.tools import ToolContext
     from elspeth.web.composer.tools.generation import _execute_list_models
+    from elspeth.web.dependencies import create_catalog_service
+    from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 
     state = CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1)
-    response = _execute_list_models({}, state, None).to_dict()
+    catalog = create_catalog_service()
+    snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
+    context = ToolContext(catalog=PolicyCatalogView.for_trained_operator(catalog, snapshot), plugin_snapshot=snapshot)
+    response = _execute_list_models({}, state, context).to_dict()
     # Precondition: the default discovery call really is wider than the
     # container-width budget, otherwise this test proves nothing.
     assert len(response["data"]["providers"]) > 64

@@ -31,7 +31,6 @@ from elspeth.contracts.errors import OrchestrationInvariantError
 from elspeth.contracts.node_state_context import GateEvaluationContext
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.types import NodeID, StepResolver
-from elspeth.core.canonical import stable_hash
 from elspeth.core.config import GateSettings
 from elspeth.core.expression_parser import (
     ExpressionEvaluationError,
@@ -285,7 +284,6 @@ class GateExecutor:
         # Extract dict from PipelineRow for hashing and Landscape recording
         # Landscape stores raw dicts, not PipelineRow objects
         input_dict = token.row_data.to_dict()
-        input_hash = stable_hash(input_dict)
 
         # Set ctx.contract for plugins that use fallback access (dual-name resolution)
         ctx.contract = token.row_data.contract
@@ -312,6 +310,7 @@ class GateExecutor:
                 auto_fail_phase="gate_evaluation_routing",
             ) as guard,
         ):
+            input_hash = guard.state.input_hash
             start = time.perf_counter()
             try:
                 parser = self._get_condition_parser(gate_config=gate_config, node_id=node_id)

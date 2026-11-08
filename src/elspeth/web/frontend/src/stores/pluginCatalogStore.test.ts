@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import * as api from "@/api/client";
 import type { PluginPolicyResponse, PluginSummary } from "@/types/index";
 import pluginPolicyMatrixFixture from "./__fixtures__/pluginPolicyMatrix.json";
+import { composerCustodyScope } from "./composerOperationCustody";
 import {
   createPluginCatalogStore,
   PLUGIN_CATALOG_INVALIDATED_EVENT,
@@ -15,6 +16,8 @@ vi.mock("@/api/client", () => ({
   listSinks: vi.fn(),
   getPluginSchema: vi.fn(),
 }));
+
+vi.mock("./composerOperationCustody", () => ({ composerCustodyScope: vi.fn(() => null) }));
 
 const SOURCE = {
   name: "csv",
@@ -126,6 +129,7 @@ function deferred<T>() {
 describe("pluginCatalogStore", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.mocked(composerCustodyScope).mockReturnValue(null);
     vi.mocked(api.listSources).mockResolvedValue(snapshot([SOURCE], "a"));
     vi.mocked(api.listTransforms).mockResolvedValue(snapshot([], "a"));
     vi.mocked(api.listSinks).mockResolvedValue(snapshot([], "a"));
@@ -136,6 +140,78 @@ describe("pluginCatalogStore", () => {
       json_schema: { type: "object" },
       knob_schema: { fields: [] },
     }, "a"));
+  });
+
+  it("normalizes an authenticated raw user id and reuses warm lists after fresh policy confirmation", async () => {
+    vi.mocked(composerCustodyScope).mockReturnValue({ principalId: "alice", authProvider: "local" });
+    vi.mocked(api.fetchPluginPolicy).mockResolvedValue(snapshot(policy("a"), "a"));
+    const store = createPluginCatalogStore();
+    await store.getState().load({ principal: "alice" });
+    const priorSources = store.getState().sources;
+    const policyRefresh = deferred<{ data: ReturnType<typeof policy>; snapshotFingerprint: string }>();
+    vi.mocked(api.fetchPluginPolicy).mockReturnValueOnce(policyRefresh.promise);
+    const refresh = store.getState().load({ principal: "alice" });
+    expect(store.getState().sources).toBe(priorSources);
+    policyRefresh.resolve(snapshot(policy("a"), "a"));
+    await refresh;
+    expect(api.fetchPluginPolicy).toHaveBeenCalledTimes(2);
+    expect(api.listSources).toHaveBeenCalledTimes(1);
+    expect(api.listTransforms).toHaveBeenCalledTimes(1);
+    expect(api.listSinks).toHaveBeenCalledTimes(1);
+    expect(store.getState().principal).toBe("local:alice");
+    store.getState().dispose();
+  });
+
+  it("does not normalize a different user or retain the same user across auth providers", async () => {
+    vi.mocked(composerCustodyScope).mockReturnValue({ principalId: "alice", authProvider: "local" });
+    vi.mocked(api.fetchPluginPolicy).mockResolvedValueOnce(snapshot(policy("a"), "a"));
+    const store = createPluginCatalogStore();
+    await store.getState().load({ principal: "alice" });
+    vi.mocked(composerCustodyScope).mockReturnValue({ principalId: "alice", authProvider: "oidc" });
+    const rotated = deferred<{ data: ReturnType<typeof policy>; snapshotFingerprint: string }>();
+    vi.mocked(api.fetchPluginPolicy).mockReturnValueOnce(rotated.promise);
+    const refresh = store.getState().load({ principal: "alice" });
+    expect(store.getState().sources).toBeNull();
+    rotated.resolve(snapshot(policy("a", "oidc:alice"), "a"));
+    await refresh;
+    expect(store.getState().principal).toBe("oidc:alice");
+    expect(api.listSources).toHaveBeenCalledTimes(2);
+    vi.mocked(api.fetchPluginPolicy).mockResolvedValueOnce(snapshot(policy("a", "local:bob"), "a"));
+    await store.getState().load({ principal: "local:bob" });
+    expect(store.getState().principal).toBe("local:bob");
+    expect(api.listSources).toHaveBeenCalledTimes(3);
+    store.getState().dispose();
+  });
+
+  it("refetches raw-owner lists when the confirmed policy fingerprint changes", async () => {
+    vi.mocked(composerCustodyScope).mockReturnValue({ principalId: "alice", authProvider: "local" });
+    vi.mocked(api.fetchPluginPolicy).mockResolvedValueOnce(snapshot(policy("a"), "a"));
+    const store = createPluginCatalogStore();
+    await store.getState().load({ principal: "alice" });
+    vi.mocked(api.fetchPluginPolicy).mockResolvedValueOnce(snapshot(policy("b"), "b"));
+    vi.mocked(api.listSources).mockResolvedValueOnce(snapshot([SOURCE], "b"));
+    vi.mocked(api.listTransforms).mockResolvedValueOnce(snapshot([], "b"));
+    vi.mocked(api.listSinks).mockResolvedValueOnce(snapshot([], "b"));
+    await store.getState().load({ principal: "alice" });
+    expect(store.getState().fingerprint).toBe("b");
+    expect(api.listSources).toHaveBeenCalledTimes(2);
+    store.getState().dispose();
+  });
+
+  it("ignores a delayed raw-owner response after an authenticated principal change", async () => {
+    const old = deferred<{ data: ReturnType<typeof policy>; snapshotFingerprint: string }>();
+    vi.mocked(composerCustodyScope).mockReturnValue({ principalId: "alice", authProvider: "local" });
+    vi.mocked(api.fetchPluginPolicy).mockReturnValueOnce(old.promise);
+    const store = createPluginCatalogStore();
+    const alice = store.getState().load({ principal: "alice" });
+    vi.mocked(composerCustodyScope).mockReturnValue({ principalId: "bob", authProvider: "local" });
+    vi.mocked(api.fetchPluginPolicy).mockResolvedValueOnce(snapshot(policy("a", "local:bob"), "a"));
+    await store.getState().load({ principal: "bob" });
+    old.resolve(snapshot(policy("a"), "a"));
+    await alice;
+    expect(store.getState().principal).toBe("local:bob");
+    expect(api.listSources).toHaveBeenCalledTimes(1);
+    store.getState().dispose();
   });
 
   it("defines the complete five-case UI policy contract", () => {

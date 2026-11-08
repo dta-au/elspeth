@@ -1951,28 +1951,65 @@ transforms:
     model: anthropic/claude-haiku-4.5
     prompt_template: 'Score this: {{ row.value }}'
 """
-        original_prepare = service._prepare_or_create_pending_interpretation_event
-        prepared_count = 0
+        from sqlalchemy import event, func, select
+        from sqlalchemy.sql.dml import Insert
 
-        async def _inject_second_writer_failure(*args, **kwargs):
-            nonlocal prepared_count
-            writer = await original_prepare(*args, **kwargs)
-            prepared_count += 1
-            if prepared_count != 2:
-                return writer
+        from elspeth.web.sessions.models import composition_states_table, interpretation_events_table
 
-            def _fail(_connection):
-                raise failure
+        insert_attempts = 0
+        completed_inserts = 0
+        first_prefix_proven = False
+        engine = app.state.session_engine
 
-            return _fail
+        def _is_interpretation_insert(context):
+            compiled = context.compiled
+            return (
+                compiled is not None and isinstance(compiled.statement, Insert) and compiled.statement.table.name == "interpretation_events"
+            )
 
-        with patch.object(
-            service,
-            "_prepare_or_create_pending_interpretation_event",
-            side_effect=_inject_second_writer_failure,
-        ):
+        def _fail_second_actual_insert(connection, cursor, statement, parameters, context, executemany):
+            nonlocal insert_attempts, first_prefix_proven
+            if not _is_interpretation_insert(context):
+                return
+            insert_attempts += 1
+            if insert_attempts != 2:
+                return
+            assert completed_inserts == 1
+            # Prove an actual first event and its state exist on this exact
+            # transaction before forcing the second cohort write to fail.
+            assert (
+                connection.scalar(
+                    select(func.count())
+                    .select_from(interpretation_events_table)
+                    .where(interpretation_events_table.c.session_id == str(session.id))
+                )
+                == 1
+            )
+            assert (
+                connection.scalar(
+                    select(func.count())
+                    .select_from(composition_states_table)
+                    .where(composition_states_table.c.session_id == str(session.id))
+                )
+                == 1
+            )
+            first_prefix_proven = True
+            raise failure
+
+        def _record_completed_insert(connection, cursor, statement, parameters, context, executemany):
+            nonlocal completed_inserts
+            if _is_interpretation_insert(context):
+                completed_inserts += 1
+
+        event.listen(engine, "before_cursor_execute", _fail_second_actual_insert)
+        event.listen(engine, "after_cursor_execute", _record_completed_insert)
+        try:
             response = client.post(f"/api/sessions/{session.id}/state/yaml", json={"yaml": yaml_text})
+        finally:
+            event.remove(engine, "before_cursor_execute", _fail_second_actual_insert)
+            event.remove(engine, "after_cursor_execute", _record_completed_insert)
 
+        assert insert_attempts == 2 and completed_inserts == 1 and first_prefix_proven
         assert response.status_code == 500
         assert await service.get_current_state(session.id) is None
         assert await service.list_interpretation_events(session.id, status="all") == []

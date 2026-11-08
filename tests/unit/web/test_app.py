@@ -59,7 +59,7 @@ from elspeth.web.auth.audit import AuthAuditRecorder
 from elspeth.web.auth.providers import get_profile
 from elspeth.web.auth.sso import SsoAuthProvider, SsoRuntime
 from elspeth.web.aws_ecs_startup import AwsEcsSchemaNotReadyError, AwsEcsStartupContractError
-from elspeth.web.composer.boot_probe import ComposerBootConfigError, ComposerProbeRequest
+from elspeth.web.composer.boot_probe import ComposerBootConfigError, ComposerProbeRequest, build_composer_probe_requests
 from elspeth.web.composer.session_cache import SessionCacheKey
 from elspeth.web.composer.state import CompositionState, PipelineMetadata, SourceSpec
 from elspeth.web.config import _JSON_COLLECTION_FIELDS, WebSettings, settings_from_env
@@ -2653,7 +2653,12 @@ class TestLifespanShutdown:
         Worst-case probe time is the shared deadline, not a sum of per-request
         timeouts.
         """
-        app = create_app(_settings(tmp_path, composer_boot_probe_enabled=True))
+        settings = _settings(tmp_path, composer_boot_probe_enabled=True)
+        app = create_app(settings)
+        # Build real requests before the deliberately tiny cancellation budget.
+        # Schema construction has separate coverage and can consume that entire
+        # budget on a busy host before any provider coroutine starts.
+        requests = build_composer_probe_requests(settings)
         counter = _RecordingCounter()
         latency = _RecordingHistogram()
         cancelled: list[str] = []
@@ -2677,17 +2682,20 @@ class TestLifespanShutdown:
 
         with (
             capture_logs() as logs,
+            patch("elspeth.web.composer.boot_probe.build_composer_probe_requests", autospec=True, return_value=requests),
             patch("httpx.AsyncClient", return_value=_StaticAsyncClient([])),
             patch("elspeth.web.app.asyncio.wait_for", wraps=asyncio.wait_for) as wait_for,
         ):
             await asyncio.wait_for(_enter_and_exit_lifespan(), timeout=5.0)
 
         timeouts = [call.kwargs["timeout"] for call in wait_for.call_args_list if call.kwargs["timeout"] != 5.0]
-        assert timeouts[:2] == [0.1, 0.1]
         assert len(timeouts) == 3
+        assert all(0 < timeout <= 0.1 for timeout in timeouts[:2])
         # Every probe request fits inside the one deadline.
         assert sum(timeouts) <= 0.3 + 0.01
-        assert 0.05 < timeouts[2] <= 0.1 + 0.01
+        # Local work also spends the shared budget; there is no guaranteed
+        # minimum remaining duration for the Advisor.
+        assert 0 < timeouts[2] < 0.1
         assert cancelled == ["loop_tools", "planner_tools", "advisor"]
         assert [attributes["probe_status"] for _amount, attributes in counter.calls] == ["transient_failure"] * 3
         assert len(latency.calls) == 3

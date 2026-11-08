@@ -12,7 +12,7 @@ CompositionStateData is the input DTO for saving new state versions.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import InitVar, dataclass
+from dataclasses import InitVar, dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 from types import MappingProxyType
@@ -826,6 +826,9 @@ class AuthoritativePipelineProposal:
     composer_operation: ComposerOperationBinding | None = None
     creation_schema: Literal["pipeline_proposal_created.v2", "pipeline_proposal_created.v3"] = "pipeline_proposal_created.v2"
     creation_actor: str | None = None
+    # Derived only from this authority's immutable row. Not caller-admissible,
+    # not persisted, and dataclasses.replace resets it when the row changes.
+    _audit_payload_hash_memo: str | None = field(default=None, init=False, repr=False, compare=False)
 
 
 @dataclass(frozen=True, slots=True)

@@ -930,7 +930,6 @@ async def _service_lifespan(app: FastAPI) -> AsyncIterator[None]:
             scoped_secret_resolver=app.state.scoped_secret_resolver,
             settings=settings,
             web_plugin_policy=app.state.web_plugin_policy,
-            plugin_snapshot_factory=app.state.plugin_snapshot_factory.for_user_id,
             operator_profile_registry=app.state.operator_profile_registry,
             catalog=app.state.catalog_service,
             tutorial_profile=settings.default_llm_profile,

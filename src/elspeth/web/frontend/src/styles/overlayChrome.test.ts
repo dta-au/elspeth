@@ -259,6 +259,11 @@ describe("the notice bar overlays the app instead of displacing it (elspeth-1c46
     ).toBe("var(--size-control)");
   });
 
+  it("keeps the catalog and backdrop below the reserved strip", () => {
+    expect(winningValue(".catalog-drawer", "top")).toBe("var(--size-control)");
+    expect(winningValue(".catalog-backdrop", "inset")).toBe("var(--size-control) 0 0");
+  });
+
   it("stacks it on a tokenised band above page chrome and below dialogs", () => {
     const zIndex = winningValue(".app-notice-center", "z-index");
     expect(zIndex).toMatch(/^var\(--z-[\w-]+\)$/);

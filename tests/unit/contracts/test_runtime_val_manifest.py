@@ -1353,10 +1353,12 @@ def test_manifest_rejects_source_unavailable_classes(
     tr._FROZEN = False
     prepare_for_run()
 
-    def source_unavailable(cls: type[object]) -> str:
-        raise OSError(f"source unavailable for {cls.__module__}.{cls.__qualname__}")
+    def source_unavailable(obj: object) -> tuple[list[str], int]:
+        raise OSError("source unavailable")
 
-    monkeypatch.setattr("elspeth.contracts.runtime_val_manifest.inspect.getsource", source_unavailable)
+    # Both ordinary inspect.getsource and the per-build locator need the
+    # current source lines; fail that common source-availability boundary.
+    monkeypatch.setattr("elspeth.contracts.runtime_val_manifest.inspect.findsource", source_unavailable)
 
     with pytest.raises(FrameworkBugError, match="source unavailable"):
         build_runtime_val_manifest()

@@ -5509,8 +5509,13 @@ class TestComposeTimeout:
 
         assert physical_calls == expected_attempts
         assert verdict.failure_class == expected_failure_class
+        assert verdict.timed_out is (error_class == "Timeout")
         assert verdict.findings_text == (
-            "advisor model was unavailable" if expected_failure_class == "unavailable" else "advisor response was malformed"
+            "the advisor review timed out before returning a verdict"
+            if error_class == "Timeout"
+            else "advisor model was unavailable"
+            if expected_failure_class == "unavailable"
+            else "advisor response was malformed"
         )
         assert "provider secret" not in repr(verdict)
         assert checkpoint_persist.await_count == 1

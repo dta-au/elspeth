@@ -6,6 +6,7 @@ import hashlib
 import json
 from copy import deepcopy
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 
@@ -156,7 +157,12 @@ def test_owned_state_authority_round_trips_exact_content_without_lifecycle_versi
 
 def test_owned_state_review_projection_withholds_blob_custody_but_keeps_control_evidence() -> None:
     authority = owned_composition_state_authority(_state(blob_ids=(_BLOB_A, _BLOB_B)))
-    review = owned_composition_state_review_arguments(authority)
+    with patch(
+        "elspeth.web.composer.pipeline_proposal.restore_owned_composition_state_authority",
+        wraps=restore_owned_composition_state_authority,
+    ) as restore:
+        review = owned_composition_state_review_arguments(authority)
+    restore.assert_called_once_with(authority, version=1)
     review_text = canonical_json(review)
 
     assert _BLOB_A not in review_text

@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
+from elspeth.contracts.errors import FrameworkBugError
 from elspeth.contracts.plugin_capabilities import (
     CapabilityDeclaration,
     ControlRole,
@@ -14,6 +17,7 @@ from elspeth.plugins.infrastructure.discovery import create_dynamic_hookimpl
 from elspeth.plugins.infrastructure.manager import PluginManager, get_shared_plugin_manager
 from elspeth.plugins.sources.llm import LLMSource
 from elspeth.plugins.transforms.aws.textract_document_analysis import AWSTextractDocumentAnalysis
+from elspeth.plugins.transforms.passthrough import PassThrough
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSecretRequirement, PluginSummary
 from elspeth.web.catalog.service import CatalogServiceImpl
@@ -801,3 +805,40 @@ class TestOneOfRoutingPredicate:
         fields = svc._extract_config_fields(schema)
         assert [f.name for f in fields] == ["top_field"]
         assert fields[0].required is True
+
+
+def _manager_with_schema_default(default: object) -> PluginManager:
+    class SchemaDefaultTransform(PassThrough):
+        name = "catalog_schema_default_control"
+        determinism = PassThrough.determinism
+        source_file_hash = "sha256:0123456789abcdef"
+
+        @classmethod
+        def get_config_schema(cls) -> dict[str, Any]:
+            schema = super().get_config_schema()
+            schema["default"] = default
+            return schema
+
+    manager = PluginManager()
+    manager.register_builtin_plugins()
+    manager.register(create_dynamic_hookimpl([SchemaDefaultTransform], "elspeth_get_transforms"))
+    return manager
+
+
+@pytest.mark.parametrize(
+    "default",
+    [frozenset({"not-json"}), b"not-json", float("nan"), float("inf"), {1: "invalid-key"}],
+    ids=["frozenset", "bytes", "nan", "infinity", "non-string-key"],
+)
+def test_registered_plugin_schema_rejects_non_json_default_before_serialization(default: object) -> None:
+    manager = _manager_with_schema_default(default)
+    with pytest.raises(FrameworkBugError, match="Discovery response"):
+        CatalogServiceImpl(manager)
+
+
+def test_registered_plugin_schema_preserves_large_json_integer_default() -> None:
+    value = 2**100
+    catalog = CatalogServiceImpl(_manager_with_schema_default(value))
+    schema = catalog.get_schema("transform", "catalog_schema_default_control")
+    assert type(schema.json_schema["default"]) is int
+    assert schema.json_schema["default"] == value

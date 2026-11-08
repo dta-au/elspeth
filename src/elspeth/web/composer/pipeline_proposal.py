@@ -505,6 +505,11 @@ def owned_composition_state_execution_arguments(
 ) -> OwnedCompositionStateSetPipelineArguments:
     """Build private set-pipeline execution arguments without losing state."""
     state = restore_owned_composition_state_authority(authority, version=version)
+    return _execution_arguments_from_restored_state(state)
+
+
+def _execution_arguments_from_restored_state(state: CompositionState) -> OwnedCompositionStateSetPipelineArguments:
+    """Project an already restored owned state without repeating admission."""
     payload = state.to_dict()
     return OwnedCompositionStateSetPipelineArguments(
         sources=payload["sources"],
@@ -526,7 +531,7 @@ def owned_composition_state_review_arguments(authority: Mapping[str, Any]) -> Ow
     from elspeth.web.interpretation_state import SOURCE_AUTHORING_KEY
 
     state = restore_owned_composition_state_authority(authority, version=1)
-    payload = owned_composition_state_execution_arguments(authority, version=1)
+    payload = _execution_arguments_from_restored_state(state)
     safe_sources: dict[str, Any] = {}
     for source_name, source in state.sources.items():
         options = deep_thaw(source.options)

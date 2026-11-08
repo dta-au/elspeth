@@ -49,6 +49,7 @@ import json
 import re
 import sys
 import textwrap
+from collections import OrderedDict
 from collections.abc import Sequence
 from contextvars import ContextVar
 from types import (
@@ -120,6 +121,7 @@ class _ManifestBuildCache:
         dict[str, object],
     ] = dataclasses.field(default_factory=dict)
     payload_schema_hashes: dict[type[object], str] = dataclasses.field(default_factory=dict)
+    source_indexes: OrderedDict[str, tuple[tuple[str, ...], dict[str, int]]] = dataclasses.field(default_factory=OrderedDict)
 
 
 _MANIFEST_BUILD_CACHE: ContextVar[_ManifestBuildCache | None] = ContextVar(
@@ -732,12 +734,62 @@ def _strip_docstrings(node: ast.AST) -> None:
             child.body.pop(0)
 
 
+class _ClassSourceIndex(ast.NodeVisitor):
+    """Index class starts with the same qualified-name rules as inspect."""
+
+    def __init__(self) -> None:
+        self.stack: list[str] = []
+        self.starts: dict[str, int] = {}
+
+    def visit_FunctionDef(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+        self.stack.extend((node.name, "<locals>"))
+        self.generic_visit(node)
+        del self.stack[-2:]
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        self.stack.append(node.name)
+        start = node.decorator_list[0].lineno if node.decorator_list else node.lineno
+        # inspect selects the first matching qualified name, including when
+        # source contains multiple definitions under conditional branches.
+        self.starts.setdefault(".".join(self.stack), start - 1)
+        self.generic_visit(node)
+        self.stack.pop()
+
+
+def _class_source(cls: type[object], cache: _ManifestBuildCache | None) -> str:
+    target = inspect.unwrap(cls)
+    module = inspect.getmodule(target)
+    if cache is None or not inspect.isclass(target) or module is None:
+        return inspect.getsource(cls)
+    filename = inspect.getsourcefile(module)
+    if filename is None:
+        return inspect.getsource(cls)
+    # inspect performs its normal linecache invalidation and loader lookup.
+    # Asking for the module avoids its repeated whole-module AST class search.
+    lines, _ = inspect.findsource(module)
+    source_lines = tuple(lines)
+    cached = cache.source_indexes.get(filename)
+    if cached is None or cached[0] != source_lines:
+        index = _ClassSourceIndex()
+        index.visit(ast.parse("".join(source_lines)))
+        cached = (source_lines, index.starts)
+        cache.source_indexes[filename] = cached
+        if len(cache.source_indexes) > 32:
+            cache.source_indexes.popitem(last=False)
+    cache.source_indexes.move_to_end(filename)
+    if target.__qualname__ not in cached[1]:
+        raise OSError("could not find class definition")
+    return "".join(inspect.getblock(lines[cached[1][target.__qualname__] :]))
+
+
 def _class_source_hash(cls: type[object]) -> str:
     cache = _MANIFEST_BUILD_CACHE.get()
     if cache is not None and cls in cache.class_source_hashes:
         return cache.class_source_hashes[cls]
     try:
-        source = textwrap.dedent(inspect.getsource(cls))
+        source = textwrap.dedent(_class_source(cls, cache))
     except (OSError, TypeError) as exc:
         raise FrameworkBugError(
             "Runtime-VAL manifest cannot hash source for "

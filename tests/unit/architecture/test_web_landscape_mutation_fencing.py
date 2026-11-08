@@ -5810,6 +5810,7 @@ _reserve_FULL_SOURCE_PATHS = (
     "src/elspeth/web/sessions/service.py",
     "src/elspeth/web/sessions/protocol.py",
     "src/elspeth/web/sessions/proposal_authority.py",
+    "src/elspeth/web/sessions/dispatch_evidence.py",
     "src/elspeth/web/coordination/composer_operation_authority.py",
     "src/elspeth/web/sessions/proposal_decoder.py",
     "src/elspeth/web/sessions/composer_operation_errors.py",
@@ -6608,6 +6609,7 @@ def _reserve_selected_origin_effect_failures(
     protected_constructed_classes=frozenset(),
     validated_worker_error_carrier_calls=frozenset(),
     validated_retained_failure_calls=frozenset(),
+    validated_dispatch_read_calls=frozenset(),
 ):
     """Find source-visible effects on the finite coordinator/dispatch roots.
 
@@ -7624,6 +7626,8 @@ def _reserve_selected_origin_effect_failures(
         def normal_owned_carrier_call(call, *, parents=parents, unit=unit, module=module):
             """Qualify the two current exception carriers and local list append."""
             if (unit.path, id(call)) in validated_worker_error_carrier_calls:
+                return True
+            if (unit.path, id(call)) in validated_dispatch_read_calls:
                 return True
             if isinstance(call.func, ast.Attribute) and call.func.attr == "append" and isinstance(call.func.value, ast.Name):
                 scope = call
@@ -10778,6 +10782,69 @@ def _reserve_retained_failure_transfer_receipts(units):
     return [], frozenset({*((turn_path, id(node)) for node in history), (service_path, id(private[0]))})
 
 
+def _reserve_dispatch_read_transfer_receipt(units):
+    """One source-bound local evidence batch, never general instance admission."""
+    paths = (
+        "src/elspeth/web/sessions/proposal_authority.py",
+        "src/elspeth/web/sessions/dispatch_evidence.py",
+    )
+    guards = _reserve_full_source_guards()
+    selected = {}
+    for path in paths:
+        matches = [unit for unit in units if unit.path == path]
+        if len(matches) != 1:
+            return ["dispatch read transfer source missing or duplicated " + path], None
+        unit = matches[0]
+        if hashlib.sha256(unit.source.encode("utf-8")).hexdigest() != guards[path]["sha256"]:
+            return ["dispatch read transfer source changed " + path], None
+        if ast.dump(unit.tree, include_attributes=False) != ast.dump(ast.parse(unit.source), include_attributes=False):
+            return ["dispatch read transfer AST differs from bound source " + path], None
+        selected[path] = unit
+    path = paths[0]
+    unit = selected[path]
+    function = _reserve_node_at(unit, "_verify_pipeline_lifecycle_authorities")
+    expected = ast.parse("""
+if not authorities:
+    return
+session_id = str(authorities[0].row.session_id)
+if any(str(authority.row.session_id) != session_id for authority in authorities):
+    raise AuditIntegrityError("Pipeline lifecycle batch mixes session authorities")
+evidence_read = _PipelineDispatchEvidenceRead(
+    conn, session_id=session_id, tool_call_ids=tuple(authority.row.tool_call_id for authority in authorities)
+)
+for authority in authorities:
+    _verify_pipeline_lifecycle_authority(conn, service=service, authority=authority, evidence_read=evidence_read)
+""").body
+    if (
+        not isinstance(function, ast.FunctionDef)
+        or len(function.body) != len(expected) + 1
+        or not isinstance(function.body[0], ast.Expr)
+        or not isinstance(function.body[0].value, ast.Constant)
+        or type(function.body[0].value.value) is not str
+        or [ast.dump(node, include_attributes=False) for node in function.body[1:]]
+        != [ast.dump(node, include_attributes=False) for node in expected]
+    ):
+        return ["dispatch read transfer exact constructor/consumer scope changed"], None
+    # The complete two source pins bind the constructor import, consumer bodies,
+    # transaction/session/tool identity checks and nonescaping synchronous chain.
+    # Origins below additionally protect their LIVE bindings against effects in
+    # other modules; a source digest alone cannot establish those bindings.
+    names = (
+        "_verify_pipeline_lifecycle_authorities",
+        "_verify_pipeline_lifecycle_authority",
+        "_verify_committed_pipeline_authority",
+        "_verify_rejected_pipeline_authority",
+        "_persisted_pipeline_dispatch_content_hashes",
+    )
+    if any(not isinstance(_reserve_node_at(unit, name), ast.FunctionDef) for name in names):
+        return ["dispatch read transfer consumer declaration changed"], None
+    call = function.body[-1].body[0].value
+    return [], {
+        "calls": frozenset({(path, id(call))}),
+        "origins": frozenset("elspeth.web.sessions.proposal_authority." + name for name in names),
+    }
+
+
 def _reserve_supported_boundary(units):
     """Join finite source receipts on these AST nodes; refuse unclosed effects."""
     family = _reserve_family_contracts.__dict__
@@ -10799,6 +10866,7 @@ def _reserve_supported_boundary(units):
     six_failures, six_receipt = _reserve_worker_six.worker_six_local_contracts(units)
     child_failures, child_receipt = _reserve_proposal_child_transfers.proposal_child_local_contracts(units)
     terminal_failures, terminal_receipt = _reserve_terminal_sql_transfers.terminal_sql_local_contracts(units)
+    dispatch_read_failures, dispatch_read = _reserve_dispatch_read_transfer_receipt(units)
     failures = [
         *family_failures,
         *supplier_failures,
@@ -10817,6 +10885,7 @@ def _reserve_supported_boundary(units):
         *six_failures,
         *child_failures,
         *terminal_failures,
+        *dispatch_read_failures,
     ]
     if failures:
         return _reserve_ProtectedBoundary(failures, (), (), (), ())
@@ -11315,6 +11384,7 @@ def _reserve_supported_boundary(units):
     # New transfer receipts require the same cross-module rebinding/reflection
     # protection as every other selected supplier, not only local body pins.
     origins.update(_reserve_RETAINED_FAILURE_ORIGINS)
+    origins.update(dispatch_read["origins"])
     origins.update(sink_receipt["read_dependency_origins"])
     guarded_classes = set()
     guarded_functions = set(sink_receipt["read_dependency_origins"])
@@ -11394,6 +11464,7 @@ def _reserve_supported_boundary(units):
         protected_constructed_classes=frozenset(guarded_classes),
         validated_worker_error_carrier_calls=frozenset(error_carrier_calls | normal_carrier_calls),
         validated_retained_failure_calls=retained_calls,
+        validated_dispatch_read_calls=dispatch_read["calls"],
     )
     if origin_failures:
         return _reserve_ProtectedBoundary(origin_failures, (), (), (), (), qualified_owner_stores)
@@ -27939,3 +28010,111 @@ def test_required_work_reserve_proposal_namespace_ignores_unrelated_parent_metad
         assert not _reserve_safe_canonical_plugin_bind(changed_binder, changed_call)
     finally:
         shared_context._landscape_parent = original_parent
+
+
+def _dispatch_read_transfer_units():
+    paths = (
+        "src/elspeth/web/sessions/proposal_authority.py",
+        "src/elspeth/web/sessions/dispatch_evidence.py",
+        "src/elspeth/web/async_workers.py",
+        "src/elspeth/web/app.py",
+        "src/elspeth/web/application_finalizers.py",
+        "src/elspeth/web/process_recovery.py",
+    )
+    return tuple(_read_source(_repo_root() / path, anchor=_repo_root()) for path in paths)
+
+
+def _dispatch_read_origin_failures(units, receipt, *, admit=True):
+    reader = "elspeth.web.sessions.dispatch_evidence._PipelineDispatchEvidenceRead"
+    return _reserve_selected_origin_effect_failures(
+        units,
+        extra_roots=receipt["origins"] | {reader, "elspeth.web.sessions.dispatch_evidence.read_dispatch_envelopes"},
+        protected_constructed_classes=frozenset({reader}),
+        validated_dispatch_read_calls=receipt["calls"] if admit else frozenset(),
+    )
+
+
+def test_dispatch_read_transfer_admits_only_exact_current_call():
+    units = _dispatch_read_transfer_units()
+    failures, receipt = _reserve_dispatch_read_transfer_receipt(units)
+    assert not failures, failures
+    assert receipt is not None and len(receipt["calls"]) == 1
+    path, identity = next(iter(receipt["calls"]))
+    call = next(node for node in ast.walk(units[0].tree) if id(node) == identity)
+    assert path == units[0].path
+    assert ast.unparse(call) == (
+        "_verify_pipeline_lifecycle_authority(conn, service=service, authority=authority, evidence_read=evidence_read)"
+    )
+    # This is the actual effect checker, not an independent positive classifier.
+    # Other unrelated partial-source diagnostics are retained identically.
+    rejected = _dispatch_read_origin_failures(units, receipt, admit=False)
+    accepted = _dispatch_read_origin_failures(units, receipt)
+    target = "guarded constructed instance transferred to unreviewed caller " + path + ":" + str(call.lineno)
+    assert rejected.count(target) == 1
+    assert target not in accepted
+    assert tuple(item for item in rejected if item != target) == tuple(accepted)
+
+
+@pytest.mark.parametrize(
+    "before,after",
+    (
+        ("evidence_read=evidence_read)", "evidence_read=None)"),
+        ("evidence_read = _PipelineDispatchEvidenceRead(", "evidence_read = foreign_constructor("),
+        (
+            "for authority in authorities:\n        _verify_pipeline_lifecycle_authority",
+            "for authority in authorities:\n        foreign_consumer",
+        ),
+        ("for authority in authorities:\n", "leak(evidence_read)\n    for authority in authorities:\n"),
+        ("for authority in authorities:\n", "return evidence_read\n    for authority in authorities:\n"),
+        (
+            "for authority in authorities:\n",
+            "global escaped_reader\n    escaped_reader = evidence_read\n    for authority in authorities:\n",
+        ),
+        ("for authority in authorities:\n", "closure = lambda: evidence_read\n    leak(closure)\n    for authority in authorities:\n"),
+    ),
+)
+def test_dispatch_read_transfer_refuses_changed_constructor_consumer_or_escape(before, after):
+    units = list(_dispatch_read_transfer_units())
+    source = units[0].source
+    function = _reserve_node_at(units[0], "_verify_pipeline_lifecycle_authorities")
+    segment = ast.get_source_segment(source, function)
+    assert segment is not None and segment.count(before) == 1
+    altered = source.replace(segment, segment.replace(before, after))
+    units[0] = _parse_source(units[0].path, altered)
+    failures, receipt = _reserve_dispatch_read_transfer_receipt(units)
+    assert failures and receipt is None
+
+
+def test_dispatch_read_transfer_refuses_detached_ast_mutation():
+    units = list(_dispatch_read_transfer_units())
+    function = _reserve_node_at(units[0], "_verify_pipeline_lifecycle_authorities")
+    function.body[-1].body[0].value.keywords[-1].value = ast.Constant(value=None)
+    failures, receipt = _reserve_dispatch_read_transfer_receipt(units)
+    assert failures == ["dispatch read transfer AST differs from bound source " + units[0].path]
+    assert receipt is None
+
+
+@pytest.mark.parametrize(
+    "source",
+    (
+        "import elspeth.web.sessions.proposal_authority as target\ntarget._verify_pipeline_lifecycle_authority = foreign\n",
+        "import elspeth.web.sessions.proposal_authority as target\nsetattr(target, '_verify_committed_pipeline_authority', foreign)\n",
+        "import elspeth.web.sessions.proposal_authority as target\n"
+        "alias = target\nalias._persisted_pipeline_dispatch_content_hashes = foreign\n",
+        "from elspeth.web.sessions.dispatch_evidence import _PipelineDispatchEvidenceRead\n"
+        "_PipelineDispatchEvidenceRead.envelopes_for = foreign\n",
+        "from elspeth.web.sessions.dispatch_evidence import _PipelineDispatchEvidenceRead\n"
+        "def damage(instance):\n    type(instance).envelopes_for = foreign\n"
+        "def apply(conn):\n    owned = _PipelineDispatchEvidenceRead(conn, session_id='s', tool_call_ids=('c',))\n    damage(owned)\n",
+    ),
+)
+def test_dispatch_read_transfer_keeps_external_rebinding_and_instance_recovery_closed(source):
+    units = _dispatch_read_transfer_units()
+    failures, receipt = _reserve_dispatch_read_transfer_receipt(units)
+    assert not failures and receipt is not None
+    baseline = _dispatch_read_origin_failures(units, receipt)
+    path = "src/elspeth/dispatch_read_attack.py"
+    attack = _parse_source(path, source)
+    actual = _dispatch_read_origin_failures((*units, attack), receipt)
+    new = tuple(item for item in actual if item not in baseline)
+    assert new and any(path in item for item in new), actual

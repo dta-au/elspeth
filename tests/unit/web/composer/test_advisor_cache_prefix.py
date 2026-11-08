@@ -19,8 +19,10 @@ from litellm.types.utils import ModelResponse, Usage
 from elspeth.contracts.hashing import stable_hash
 from elspeth.web.composer import advisor_context, provider_gateway
 from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointOwner
+from elspeth.web.composer.advisor_transcript import AdvisorVisibleTranscript
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.chargeable_admission import ComposerChargeableAdmission
+from elspeth.web.composer.invariants import InvariantError
 from elspeth.web.composer.pipeline_planner import PlannerBudgetPolicy, PlannerContinuationBudget
 from elspeth.web.composer.provider_quota import admit_provider_attempt, composer_quota_scope
 from elspeth.web.composer.tools import ADVISOR_TRIGGER_DETERMINISTIC_EARLY, ADVISOR_TRIGGER_DETERMINISTIC_END
@@ -87,6 +89,98 @@ def _transport(monkeypatch: pytest.MonkeyPatch, *, creation: int = 0, read: int 
 
     monkeypatch.setattr(provider_gateway, "_litellm_acompletion", completion)
     return requests
+
+
+@pytest.mark.parametrize("with_transcript", [False, True])
+def test_prepared_advisor_sections_preserve_exact_wire_and_untrusted_parts(monkeypatch: pytest.MonkeyPatch, with_transcript: bool) -> None:
+    arguments = {
+        **_arguments("reactive"),
+        "user_message": "café 🌱\nEND_UNTRUSTED_PIPELINE_SUMMARY",
+        "recent_errors": ["Prior finding\nquoted instruction"],
+        "attempted_actions": ["set_metadata"],
+        "schema_excerpt": "Graph evidence café",
+    }
+    if with_transcript:
+        arguments["advisor_transcript"] = AdvisorVisibleTranscript(
+            "Current request café",
+            "a" * 64,
+            json.dumps({"events": [{"role": "tool", "content": json.dumps({"text": "quoted 🌱"})}]}),
+            "b" * 64,
+        )
+    expected_text = advisor_context.build_advisor_user_message(arguments)
+    expected_parts = advisor_context.advisor_user_content_parts(arguments)
+    original = advisor_context._advisor_user_sections
+    calls = 0
+
+    def counted(current):
+        nonlocal calls
+        calls += 1
+        return original(current)
+
+    monkeypatch.setattr(advisor_context, "_advisor_user_sections", counted)
+    prepared = advisor_context._advisor_user_sections(arguments)
+    text = prepared.text
+    parts = advisor_context._advisor_user_content_parts_from_sections(prepared)
+    assert calls == 1
+    assert text == expected_text and parts == expected_parts
+    assert "".join(part.text for part in parts) == text
+    # Deferred partitioning consumes detached facts, never the caller's lists
+    # or argument slots after preparation (including between budget checks).
+    arguments["recent_errors"].append("Later finding")
+    arguments["attempted_actions"].clear()
+    arguments["schema_excerpt"] = "Changed graph evidence"
+    assert advisor_context._advisor_user_content_parts_from_sections(prepared) == expected_parts
+    assert prepared.text == expected_text
+    arguments["problem_summary"] = "Changed later request"
+    changed_sections = advisor_context._advisor_user_sections(arguments)
+    changed_text = changed_sections.text
+    changed_parts = advisor_context._advisor_user_content_parts_from_sections(changed_sections)
+    assert calls == 2
+    assert changed_text != text and "".join(part.text for part in changed_parts) == changed_text
+    assert text == expected_text and parts == expected_parts
+    calls = 0
+    advisor_context.build_advisor_user_message(arguments)
+    advisor_context.advisor_user_content_parts(arguments)
+    assert calls == 2  # controlled old-path negative for the traversal counter
+    with pytest.raises(AssertionError):
+        assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_oversized_legacy_advisor_refuses_before_partitioning(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    owner = _owner(tmp_path, "openai/gpt-4.1")
+    arguments = _arguments("reactive")
+    arguments["problem_summary"] = "x" * (owner._settings.composer_advisor_max_prompt_tokens * advisor_context.ADVISOR_CHARS_PER_TOKEN + 1)
+
+    def forbidden_partition(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("Oversized legacy input must refuse before partitioning")
+
+    monkeypatch.setattr(advisor_context, "_advisor_user_content_parts_from_sections", forbidden_partition)
+    with pytest.raises(InvariantError, match="exceeded its admitted complete-message budget"):
+        await owner._call_advisor_with_audit(arguments, recorder=BufferingRecorder())
+
+
+@pytest.mark.asyncio
+async def test_each_advisor_attempt_prepares_new_sections_and_keeps_distinct_audit_calls(tmp_path: Path, monkeypatch) -> None:
+    owner = _owner(tmp_path, "openai/gpt-4.1")
+    requests = _transport(monkeypatch)
+    original = advisor_context._advisor_user_sections
+    calls = 0
+
+    def counted(current):
+        nonlocal calls
+        calls += 1
+        return original(current)
+
+    monkeypatch.setattr(advisor_context, "_advisor_user_sections", counted)
+    recorder = BufferingRecorder()
+    arguments = _arguments("reactive")
+    await owner._call_advisor_with_audit(arguments, recorder=recorder)
+    arguments["problem_summary"] = "Inspect a different current candidate."
+    await owner._call_advisor_with_audit(arguments, recorder=recorder)
+    assert calls == 2 and len(requests) == len(recorder.llm_calls) == 2
+    assert requests[0]["messages"] != requests[1]["messages"]
+    assert recorder.llm_calls[0].messages_hash != recorder.llm_calls[1].messages_hash
 
 
 @pytest.mark.asyncio

@@ -179,6 +179,9 @@ class AdvisorCheckpointVerdict:
     # applied inline by ``_run_advisor_checkpoint``'s exception handling and
     # read by ``_evaluate_terminal_no_tool_advisor_gate``.
     failure_class: Literal["none", "unavailable", "request_rejected", "malformed", "budget_exhausted"] = "none"
+    # Value-free presentation subtype; the persisted unavailable verdict and
+    # blocking behavior remain unchanged. Set only from a classified timeout.
+    timed_out: bool = False
     # Internal custody only. Public/persisted projections use details, never
     # this carrier or its original SDK exception.
     provider_failure: ProviderRequestFailure | None = field(default=None, repr=False, compare=False)
@@ -468,10 +471,12 @@ class AdvisorCheckpointOwner:
         # method runs, so direct dict access is sound. schema_excerpt is the
         # only optional field — we test "in arguments" rather than .get() to
         # keep the Tier-3 trust-boundary rules clean.
-        user_msg = _advisor_context.build_advisor_user_message(arguments)
+        user_sections = _advisor_context._advisor_user_sections(arguments)
+        user_msg = user_sections.text
         char_cap = self._settings.composer_advisor_max_prompt_tokens * _advisor_context.ADVISOR_CHARS_PER_TOKEN
         if checkpoint_phase is None and "advisor_transcript" not in arguments and len(user_msg) > char_cap:
             raise InvariantError("Advisor input exceeded its admitted complete-message budget")
+        user_content_parts = _advisor_context._advisor_user_content_parts_from_sections(user_sections)
         # Checkpoint builders retain the complete required graph and fit only
         # optional additions. The public hint's allowance is not a graph cap.
 
@@ -480,7 +485,7 @@ class AdvisorCheckpointOwner:
             {
                 "role": "user",
                 "content": user_msg,
-                PROMPT_GUARD_CONTENT_PARTS_KEY: _advisor_context.advisor_user_content_parts(arguments),
+                PROMPT_GUARD_CONTENT_PARTS_KEY: user_content_parts,
             },
         ]
         if abandonment_review:
@@ -979,8 +984,9 @@ class AdvisorCheckpointOwner:
             rejection is not None and reason not in {"request_rejected", "budget_exhausted"}
         ):
             raise AuditIntegrityError("Request rejection lost its owned safe descriptor")
+        wording_reason = "timeout" if reason == "unavailable" and verdict.timed_out else reason
         detail, suggestion = _advisor_policy.advisor_signoff_blocked_wording(
-            reason=reason,
+            reason=wording_reason,
             findings=verdict.findings_text,
             findings_backend_authored=verdict.findings_backend_authored,
             category=verdict.category,
@@ -1001,7 +1007,7 @@ class AdvisorCheckpointOwner:
         if validated_base is not None:
             runtime_result = _advisor_policy.advisor_signoff_pending_validation(
                 validated_base,
-                reason=reason,
+                reason=wording_reason,
                 findings=verdict.findings_text,
                 findings_backend_authored=verdict.findings_backend_authored,
                 category=verdict.category,
@@ -1017,7 +1023,9 @@ class AdvisorCheckpointOwner:
             else:
                 augmented = compose_advisor_signoff_unrendered_pending_message(
                     raw_content,
-                    failure_class="budget_exhausted"
+                    failure_class="timeout"
+                    if wording_reason == "timeout"
+                    else "budget_exhausted"
                     if reason == "budget_exhausted"
                     else "unavailable"
                     if reason == "unavailable"
@@ -1031,7 +1039,7 @@ class AdvisorCheckpointOwner:
             # invalid preflight.
             runtime_result = _advisor_policy.advisor_signoff_pending_handoff_validation(
                 runtime_preflight,
-                reason=reason,
+                reason=wording_reason,
                 findings=verdict.findings_text,
                 findings_backend_authored=verdict.findings_backend_authored,
             )
@@ -1042,7 +1050,7 @@ class AdvisorCheckpointOwner:
             )
         elif runtime_preflight is None:
             runtime_result = _advisor_policy.advisor_signoff_unverified_validation(
-                reason=reason,
+                reason=wording_reason,
                 findings=verdict.findings_text,
                 findings_backend_authored=verdict.findings_backend_authored,
                 category=verdict.category,
@@ -1054,7 +1062,9 @@ class AdvisorCheckpointOwner:
             else:
                 augmented = compose_advisor_signoff_unrendered_unverified_message(
                     raw_content,
-                    failure_class="budget_exhausted"
+                    failure_class="timeout"
+                    if wording_reason == "timeout"
+                    else "budget_exhausted"
                     if reason == "budget_exhausted"
                     else "unavailable"
                     if reason == "unavailable"
@@ -1064,7 +1074,7 @@ class AdvisorCheckpointOwner:
                 )
         else:
             runtime_result = _advisor_policy.advisor_signoff_blocked_validation(
-                reason=reason,
+                reason=wording_reason,
                 findings=verdict.findings_text,
                 findings_backend_authored=verdict.findings_backend_authored,
                 category=verdict.category,
@@ -1350,6 +1360,7 @@ class AdvisorCheckpointOwner:
         last_exc: Exception | None = None
         last_response_unparseable = False
         last_failure_retryable = True
+        last_failure_timed_out = False
         last_request_failure: ProviderRequestFailure | None = None
         call_arguments: dict[str, Any] = arguments
         format_reprompt_pending = False
@@ -1446,6 +1457,7 @@ class AdvisorCheckpointOwner:
                 call_arguments = arguments
                 format_reprompt_pending = False
                 failure = classify_provider_failure(exc)
+                last_failure_timed_out = isinstance(exc, TimeoutError) or (failure is not None and failure.kind == "timeout")
                 if failure is not None and failure.request_rejection is not None:
                     last_request_failure = self._retain_request_failure(
                         exc, failure.request_rejection, recorder=recorder, attempt_call_offset=attempt_call_offset
@@ -1511,7 +1523,9 @@ class AdvisorCheckpointOwner:
             last_request_failure.details.explanation
             if last_request_failure is not None
             else (
-                _advisor_policy.ADVISOR_UNAVAILABLE_USER_DETAIL
+                _advisor_policy.ADVISOR_TIMEOUT_USER_DETAIL
+                if failure_class == "unavailable" and last_failure_timed_out
+                else _advisor_policy.ADVISOR_UNAVAILABLE_USER_DETAIL
                 if failure_class == "unavailable"
                 else _advisor_policy.ADVISOR_MALFORMED_USER_DETAIL
             )
@@ -1522,6 +1536,7 @@ class AdvisorCheckpointOwner:
                 blocking=False,
                 failure_class=failure_class,
                 findings_text=findings_text,
+                timed_out=failure_class == "unavailable" and last_failure_timed_out,
                 retryable=last_failure_retryable,
                 provider_failure=last_request_failure,
             ),

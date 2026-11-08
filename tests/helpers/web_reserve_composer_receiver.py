@@ -932,12 +932,13 @@ def composer_receiver_local_contracts(units):
                 "secret_service",
                 "blob_service",
                 "runtime_preflight_coordinator",
+                "session_cache_registry",
                 "plugin_snapshot_factory",
                 "operator_profile_registry",
             ],
             "concrete service constructor and complete keyword transfers",
         )
-        if isinstance(c, ast.Call) and len(c.keywords) == 9:
+        if isinstance(c, ast.Call) and len(c.keywords) == 10:
             expected = [
                 ("app", "state", "catalog_service"),
                 ("settings",),
@@ -946,6 +947,7 @@ def composer_receiver_local_contracts(units):
                 ("app", "state", "scoped_secret_resolver"),
                 ("app", "state", "blob_service"),
                 ("runtime_preflight_coordinator",),
+                ("app", "state", "composer_session_cache_registry"),
                 ("app", "state", "plugin_snapshot_factory", "for_user_id"),
                 ("app", "state", "operator_profile_registry"),
             ]

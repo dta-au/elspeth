@@ -3620,11 +3620,14 @@ async def _plan_pipeline_inner(
             if model_override is not None
             else None
         )
+        # Both contract checks describe this same physical attempt. Keep the
+        # schema local: no cross-attempt trust in a mutable caller projection.
+        call_pipeline_schema = canonical_set_pipeline_schema()
         manifest = build_planner_capability_manifest(
             messages=marked_messages,
             tools=marked_tools,
-            canonical_schema=canonical_set_pipeline_schema(),
-            capability_schema=canonical_set_pipeline_schema(),
+            canonical_schema=call_pipeline_schema,
+            capability_schema=call_pipeline_schema,
             tool_surface="full",
         )
         request_size = len(canonical_json({"messages": marked_messages, "tools": marked_tools}).encode("utf-8"))

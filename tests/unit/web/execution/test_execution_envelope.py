@@ -3,6 +3,7 @@
 import json
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -13,12 +14,14 @@ from elspeth.core.secrets import resolve_secret_refs
 from elspeth.web.execution.envelope import (
     EnvelopeRecoveryReason,
     ExecutionEnvelopeRefused,
+    ExecutionRecoveryAuthority,
     RetainedBlobInput,
     build_run_execution_input,
     capture_execution_envelope,
     discover_execution_blob_inputs,
     read_cancelled_execution_envelope,
     restore_execution_envelope,
+    restore_run_execution_input,
     validate_run_execution_input,
 )
 from elspeth.web.execution.protocol import FrozenRunSettings
@@ -198,7 +201,8 @@ def test_round_trip_pins_secret_material_in_memory_only() -> None:
         ("deployment", EnvelopeRecoveryReason.DEPLOYMENT_CHANGED),
     ],
 )
-def test_restore_refuses_changed_admission(change: str, reason: EnvelopeRecoveryReason) -> None:
+@pytest.mark.parametrize("combined", [False, True])
+def test_restore_refuses_changed_admission(change: str, reason: EnvelopeRecoveryReason, combined: bool) -> None:
     store = SecretStore()
     admitted = FrozenRunSettings(snapshot(), {"api_key": {"secret_ref": "ACCESS"}}, {})
     envelope = capture_execution_envelope(
@@ -215,6 +219,20 @@ def test_restore_refuses_changed_admission(change: str, reason: EnvelopeRecovery
     elif change == "missing":
         store.secret = None
     with pytest.raises(ExecutionEnvelopeRefused) as caught:
+        if combined:
+            execution_input = build_run_execution_input(envelope, admitted, "d" * 64, "image-1", ())
+            restore_run_execution_input(
+                execution_input,
+                current_authority=lambda: ExecutionRecoveryAuthority(
+                    replace(snapshot(), policy_hash="f" * 64) if change == "policy" else snapshot(),
+                    "f" * 64 if change == "implementation" else "d" * 64,
+                    "image-2" if change == "deployment" else "image-1",
+                ),
+                user_id="other" if change == "principal" else "user",
+                auth_provider_type="other" if change == "provider" else "oidc",
+                resolver=store,
+            )
+            pytest.fail("changed recovery authority was accepted")
         restore_execution_envelope(
             envelope.to_json(),
             current_snapshot=replace(snapshot(), policy_hash="f" * 64) if change == "policy" else snapshot(),
@@ -477,3 +495,151 @@ def test_blob_manifest_requires_retained_bytes_and_current_custody(tmp_path: Pat
             implementation_fingerprint="d" * 64,
             deployment_generation="image-1",
         )
+
+
+def test_combined_recovery_decodes_once_and_rechecks_later_attempts() -> None:
+    from elspeth.web.execution.envelope import _EnvelopePayload
+
+    store = SecretStore()
+    frozen = FrozenRunSettings(snapshot(), {"api_key": {"secret_ref": "ACCESS"}}, {"labels": ["original"]})
+    envelope = capture_execution_envelope(
+        frozen,
+        user_id="user",
+        auth_provider_type="oidc",
+        resolver=store,
+        env_ref_names=frozenset(),
+        implementation_fingerprint="d" * 64,
+        deployment_generation="image-1",
+    )
+    execution_input = build_run_execution_input(envelope, frozen, "d" * 64, "image-1", ())
+    calls = []
+
+    def current_authority() -> ExecutionRecoveryAuthority:
+        calls.append("fresh")
+        return ExecutionRecoveryAuthority(snapshot(), "d" * 64, "image-1")
+
+    with patch.object(_EnvelopePayload, "model_validate_json", wraps=_EnvelopePayload.model_validate_json) as parse:
+        restored = restore_run_execution_input(
+            execution_input,
+            current_authority=current_authority,
+            user_id="user",
+            auth_provider_type="oidc",
+            resolver=store,
+        )
+    assert parse.call_count == 1
+    assert restored.settings == frozen
+    with pytest.raises(TypeError):
+        restored.settings.audit_safe_config["labels"][0] = "changed"
+    copy = deep_thaw(restored.settings.audit_safe_config)
+    copy["labels"][0] = "changed"
+    assert deep_thaw(restored.settings.audit_safe_config) == {"labels": ["original"]}
+
+    # No decoded carrier or admitted-secret cache crosses recovery attempts.
+    store.secret = ResolvedSecret("ACCESS", "rotated", "server", "f" * 64)
+    with pytest.raises(ExecutionEnvelopeRefused) as caught:
+        restore_run_execution_input(
+            execution_input,
+            current_authority=current_authority,
+            user_id="user",
+            auth_provider_type="oidc",
+            resolver=store,
+        )
+    assert caught.value.reason is EnvelopeRecoveryReason.SECRET_VERSION_CHANGED
+    assert calls == ["fresh", "fresh"]
+
+    # Changed bytes and derived identities are refused before current authority.
+    for corrupted in (
+        replace(execution_input, envelope_json=envelope.to_json() + " "),
+        replace(execution_input, configuration_fingerprint="0" * 64),
+    ):
+        with pytest.raises(ExecutionEnvelopeRefused) as caught:
+            restore_run_execution_input(
+                corrupted,
+                current_authority=current_authority,
+                user_id="user",
+                auth_provider_type="oidc",
+                resolver=store,
+            )
+        assert caught.value.reason is EnvelopeRecoveryReason.INVALID_ENVELOPE
+    assert calls == ["fresh", "fresh"]
+
+
+def test_combined_recovery_rechecks_retained_file_after_current_authority_lookup(tmp_path: Path) -> None:
+    source = tmp_path / "source.csv"
+    source.write_text("value\nadmitted\n")
+    original = FrozenRunSettings(snapshot(), {"source": {"plugin": "csv", "options": {"path": str(source)}}}, {})
+    frozen, retained = retain_execution_inputs(original, root=tmp_path / "retained")
+    envelope = capture_execution_envelope(
+        frozen,
+        user_id="user",
+        auth_provider_type="oidc",
+        resolver=None,
+        env_ref_names=frozenset(),
+        implementation_fingerprint="d" * 64,
+        deployment_generation="image-1",
+        retained_inputs=retained,
+    )
+    execution_input = build_run_execution_input(envelope, frozen, "d" * 64, "image-1", retained)
+
+    def current_authority() -> ExecutionRecoveryAuthority:
+        # A valid admission check is not permission to skip a later custody
+        # check: the file can disappear while resolving current authority.
+        Path(retained[0].retained_path).unlink()
+        return ExecutionRecoveryAuthority(snapshot(), "d" * 64, "image-1")
+
+    with pytest.raises(ExecutionEnvelopeRefused) as caught:
+        restore_run_execution_input(
+            execution_input,
+            current_authority=current_authority,
+            user_id="user",
+            auth_provider_type="oidc",
+            resolver=None,
+        )
+    assert caught.value.reason is EnvelopeRecoveryReason.SOURCE_UNAVAILABLE
+
+
+def test_implementation_fingerprint_rechecks_source_registry_and_dependencies(tmp_path, monkeypatch) -> None:
+    import hashlib
+    import os
+    from types import SimpleNamespace
+
+    from elspeth.web.execution import envelope as module
+
+    package = tmp_path / "elspeth"
+    origin = package / "web" / "execution" / "envelope.py"
+    origin.parent.mkdir(parents=True)
+    origin.write_text("# fixture origin\n")
+    source = package / "plugin.py"
+    source.write_text("VALUE = 1\n")
+    monkeypatch.setattr(module, "__file__", str(origin))
+    dependencies = [SimpleNamespace(metadata={"Name": "example"}, version="1")]
+    monkeypatch.setattr(module, "distributions", lambda: dependencies)
+
+    def reference(current):
+        digest = hashlib.sha256()
+        for path in sorted(path for path in (origin, source) if path.is_file()):
+            digest.update(path.relative_to(package).as_posix().encode())
+            digest.update(b"\0")
+            digest.update(hashlib.sha256(path.read_bytes()).digest())
+        digest.update(json.dumps(sorted((item.metadata["Name"], item.version) for item in dependencies), separators=(",", ":")).encode())
+        digest.update(json.dumps(sorted(map(str, current.available)), separators=(",", ":")).encode())
+        return digest.hexdigest()
+
+    current = snapshot()
+    original = module.runtime_implementation_fingerprint(current)
+    assert original == reference(current)
+    assert module.runtime_implementation_fingerprint(current) == original
+    prior_stat = source.stat()
+    source.write_text("VALUE = 2\n")
+    os.utime(source, ns=(prior_stat.st_atime_ns, prior_stat.st_mtime_ns))
+    changed = module.runtime_implementation_fingerprint(current)
+    assert changed == reference(current) and changed != original
+    dependencies[0].version = "2"
+    changed_dependencies = module.runtime_implementation_fingerprint(current)
+    assert changed_dependencies == reference(current) and changed_dependencies != changed
+    changed_registry = replace(current, available=frozenset())
+    assert module.runtime_implementation_fingerprint(changed_registry) == reference(changed_registry)
+    assert module.runtime_implementation_fingerprint(changed_registry) != changed_dependencies
+    source.unlink()
+    assert module.runtime_implementation_fingerprint(current) == reference(current)
+    assert module.runtime_implementation_fingerprint(current) != changed_dependencies

@@ -46,8 +46,8 @@ from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.web.catalog.policy_view import PolicyCatalogView
-from elspeth.web.catalog.protocol import CatalogService
-from elspeth.web.catalog.schemas import PluginSummary
+from elspeth.web.catalog.protocol import CatalogService, PluginKind
+from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.redaction import (
     MANIFEST,
@@ -107,9 +107,7 @@ def _empty_state() -> CompositionState:
 
 
 def _mock_catalog() -> MagicMock:
-    """Minimal catalog accepting the ``text`` source plugin used by the
-    functional smoke test below.  A bare ``MagicMock`` is sufficient — the
-    paths exercised here do not consult the catalog's schema registry."""
+    """Typed catalog responses for the source and transform selection probes."""
     catalog = MagicMock(spec=CatalogService)
     catalog.list_sources.return_value = [
         PluginSummary(name=name, description=name, plugin_type="source", config_fields=[]) for name in ("csv", "json", "text")
@@ -121,7 +119,17 @@ def _mock_catalog() -> MagicMock:
     catalog.list_sinks.return_value = [
         PluginSummary(name=name, description=name, plugin_type="sink", config_fields=[]) for name in ("csv", "json")
     ]
-    catalog.get_schema.return_value = {"properties": {}}
+
+    def schema(plugin_type: PluginKind, name: str) -> PluginSchemaInfo:
+        return PluginSchemaInfo(
+            name=name,
+            plugin_type=plugin_type,
+            description=f"{name} {plugin_type}",
+            json_schema={"properties": {}},
+            knob_schema={"fields": []},
+        )
+
+    catalog.get_schema.side_effect = schema
     return catalog
 
 

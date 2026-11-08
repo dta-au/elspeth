@@ -417,7 +417,7 @@ def _web_authored_policy_pair(
         selected_profile_aliases=(),
         binding_generation_fingerprint="web-authored-test-generation",
     )
-    return PolicyCatalogView(catalog, snapshot, MagicMock(spec=OperatorProfileRegistry)), snapshot
+    return PolicyCatalogView(catalog, snapshot, _empty_operator_profiles()), snapshot
 
 
 def _profiled_s3_policy_pair() -> tuple[PolicyCatalogView, PluginAvailabilitySnapshot]:
@@ -457,6 +457,43 @@ def _profiled_s3_policy_pair() -> tuple[PolicyCatalogView, PluginAvailabilitySna
     return PolicyCatalogView(catalog, snapshot, profiles), snapshot
 
 
+def _empty_operator_profiles() -> OperatorProfileRegistry:
+    """Use real public schema projection with no configured profile bindings."""
+    settings = WebSettings(
+        data_dir=Path.cwd(),
+        shareable_link_signing_key=b"fixture-empty-profile-key-32!!!!!",
+        composer_max_composition_turns=4,
+        composer_max_discovery_turns=4,
+        composer_timeout_seconds=60,
+        composer_rate_limit_per_minute=20,
+    )
+    policy = WebPluginPolicy.create(
+        required=frozenset(),
+        configured_optional=frozenset(),
+        preferences=(),
+        control_modes=(),
+        plugin_code_identities=(),
+    )
+    return OperatorProfileRegistry(policy=policy, settings=RuntimeWebPluginConfig.from_settings(settings))
+
+
+def _stale_validation_for(state: CompositionState) -> ValidationSummary:
+    """Genuine advice from a different graph, never an inconsistent summary."""
+    other = _empty_state()
+    if not state.sources:
+        other = other.with_source(
+            SourceSpec(
+                plugin="csv",
+                on_success="unconnected",
+                options={"schema": {"mode": "observed"}},
+                on_validation_failure="discard",
+            )
+        )
+    stale = other.validate()
+    assert stale != state.validate()
+    return stale
+
+
 def _restricted_policy_pair(
     catalog: CatalogService,
     plugin_id: PluginId,
@@ -473,7 +510,7 @@ def _restricted_policy_pair(
         selected_profile_aliases=(),
         binding_generation_fingerprint="restricted-test-generation",
     )
-    return PolicyCatalogView(catalog, snapshot, MagicMock(spec=OperatorProfileRegistry)), snapshot
+    return PolicyCatalogView(catalog, snapshot, _empty_operator_profiles()), snapshot
 
 
 def test_direct_upsert_cannot_name_hidden_registered_plugin() -> None:
@@ -1211,12 +1248,13 @@ class TestExecuteToolPriorValidation:
         d = result.to_dict()
         assert "validation_delta" not in d
 
-    def test_threaded_prior_used_for_mutation(self) -> None:
-        """When prior_validation is threaded, execute_tool uses it as-is."""
+    @pytest.mark.parametrize("stale", [False, True])
+    def test_threaded_prior_used_for_mutation(self, stale: bool) -> None:
+        """Current graph advice stays authoritative over an unkeyed prior."""
         state = _empty_state()
         catalog = _mock_catalog()
-        # Pre-compute validation for the empty state
-        threaded = state.validate()
+        expected = state.validate()
+        threaded = _stale_validation_for(state) if stale else expected
         result = execute_tool(
             "set_source",
             {
@@ -1230,8 +1268,9 @@ class TestExecuteToolPriorValidation:
             prior_validation=threaded,
         )
         assert result.success is True
-        # The threaded validation should be used as the prior — identity check
-        assert result.prior_validation is threaded
+        assert result.prior_validation == expected
+        if stale:
+            assert result.prior_validation != threaded
 
     def test_threaded_prior_produces_correct_delta(self) -> None:
         """Threaded validation produces the same delta as fresh computation."""
@@ -1278,7 +1317,8 @@ class TestExecuteToolPriorValidation:
         )
         assert r1.success is True
 
-        # Second mutation — thread r1's validation as prior
+        # A prior from the old empty graph must not replace current advice.
+        stale = _stale_validation_for(r1.updated_state)
         r2 = execute_tool(
             "set_output",
             {
@@ -1289,11 +1329,11 @@ class TestExecuteToolPriorValidation:
             },
             r1.updated_state,
             catalog,
-            prior_validation=r1.validation,
+            prior_validation=stale,
         )
         assert r2.success is True
-        # r1.validation becomes r2's prior — identity check
-        assert r2.prior_validation is r1.validation
+        assert r2.prior_validation == r1.validation
+        assert r2.prior_validation != stale
         # The delta should reflect changes from r1's state to r2's state
         assert "validation_delta" in r2.to_dict()
 
@@ -2033,16 +2073,18 @@ class TestSecretTools:
         assert r.success is True
         return r.updated_state
 
-    def test_wire_secret_ref_threaded_prior_used(self) -> None:
-        """Threaded prior_validation is reused by secret mutation tools (identity check).
+    @pytest.mark.parametrize("stale", [False, True])
+    def test_wire_secret_ref_threaded_prior_used(self, stale: bool) -> None:
+        """Secret mutation advice belongs to the current graph.
 
         execute_tool dispatches secret mutations through a separate branch from
-        standard mutations. Both branches must honour the prior_validation kwarg.
+        standard mutations. Neither branch may trust an unkeyed stale summary.
         """
         catalog = _mock_catalog()
         svc = self._mock_secret_service()
         state = self._build_state_with_source(catalog)
-        threaded = state.validate()
+        expected = state.validate()
+        threaded = _stale_validation_for(state) if stale else expected
         result = execute_tool(
             "wire_secret_ref",
             {
@@ -2058,7 +2100,9 @@ class TestSecretTools:
             secret_wiring_policy=_wiring_policy("OPENROUTER_API_KEY", "source", "csv", "api_key"),
         )
         assert result.success is True
-        assert result.prior_validation is threaded
+        assert result.prior_validation == expected
+        if stale:
+            assert result.prior_validation != threaded
 
     def test_wire_secret_ref_threaded_prior_produces_correct_delta(self) -> None:
         """Threaded and fresh prior_validation produce identical deltas for secret tools."""

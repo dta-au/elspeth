@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import replace
 from threading import Event
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 from uuid import UUID, uuid4
 
 import litellm
@@ -161,7 +161,11 @@ async def test_terminal_fact_projects_current_explicit_and_recovery_without_chec
     store[1].release(running.session_operation_context)
     with store[0].connect() as conn:
         assert conn.execute(select(composition_states_table)).mappings().all() == original
-        assert store[3]._graph_review_on_connection(conn, session_id=store[4], stored=base) == fact
+        restore_name = "state_from_record" if present else "empty_recovery_state"
+        restore = state_from_record if present else empty_recovery_state
+        with patch(f"elspeth.web.sessions.service.{restore_name}", wraps=restore) as restore_spy:
+            assert store[3]._graph_review_on_connection(conn, session_id=store[4], stored=base) == fact
+        assert restore_spy.call_count == 1
     assert len(facts(store)) == 1
     graph = await store[3].read_current_composition_graph(store[4])
     assert graph.effective_completion_gates == fact.gates

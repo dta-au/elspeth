@@ -312,6 +312,7 @@ from elspeth.web.sessions.proposal_authority import (
     _restore_authoritative_pipeline_proposal,
     _validate_tool_call_id_set_equality,
     _validated_pipeline_rejection_reason,
+    _verify_pipeline_lifecycle_authorities,
     _verify_pipeline_lifecycle_authority,
 )
 from elspeth.web.sessions.protocol import (
@@ -733,6 +734,42 @@ def _validate_principal_snapshot(value: tuple[str | None, PluginAvailabilitySnap
 def _validate_inline_snapshot(value: SessionInlineBlobSnapshot | None) -> None:
     if value is not None and type(value) is not SessionInlineBlobSnapshot:
         raise AuditIntegrityError("preparation inline read returned an invalid owned snapshot")
+
+
+def _build_pending_interpretation_command(
+    *,
+    event_id: UUID,
+    opt_out_marker_event_id: UUID,
+    composition_state_id: UUID,
+    affected_node_id: str,
+    tool_call_id: str,
+    user_term: str,
+    kind: InterpretationKind,
+    llm_draft: str,
+    surface_origin: InterpretationSurfaceOrigin,
+    model_identifier: str | None,
+    model_version: str | None,
+    provider: str | None,
+    composer_skill_hash: str | None,
+    created_at: datetime,
+) -> SessionPendingInterpretationCommand:
+    """Construct one command without preparing or granting mutation authority."""
+    return SessionPendingInterpretationCommand(
+        event_id=event_id,
+        opt_out_marker_event_id=opt_out_marker_event_id,
+        composition_state_id=composition_state_id,
+        affected_node_id=affected_node_id,
+        tool_call_id=tool_call_id,
+        user_term=user_term,
+        kind=kind,
+        llm_draft=llm_draft,
+        surface_origin=surface_origin,
+        model_identifier=model_identifier,
+        model_version=model_version,
+        provider=provider,
+        composer_skill_hash=composer_skill_hash,
+        created_at=created_at,
+    )
 
 
 class SessionServiceImpl:
@@ -3594,42 +3631,26 @@ class SessionServiceImpl:
         ) != len(prepared_interpretations):
             _refuse_required_sql(required_work, AuditIntegrityError("pipeline prepared cohort identities are duplicated"))
         candidate_state_id = str(uuid.uuid4())
-        prepared_events: list[_PreparedPendingInterpretation] = []
-        for draft in prepared_interpretations:
-            try:
-                prepared = await self._prepare_or_create_pending_interpretation_event(
-                    session_id=session_id,
-                    composition_state_id=UUID(candidate_state_id),
-                    affected_node_id=draft.affected_node_id,
-                    tool_call_id=draft.tool_call_id,
-                    user_term=draft.user_term,
-                    kind=draft.kind,
-                    llm_draft=draft.llm_draft,
-                    model_identifier=draft.model_identifier,
-                    model_version=draft.model_version,
-                    provider=draft.provider,
-                    composer_skill_hash=draft.composer_skill_hash,
-                    surface_origin=draft.surface_origin,
-                    session_operation_context=session_operation_context,
-                    _event_id=draft.event_id,
-                    _prepare_only=True,
-                    proposed_state=settled_state,
-                    preparation_work=(
-                        RequiredWorkBinding(
-                            finish_once_work.coordinator,
-                            finish_once_work.publication.key.transition_ordinal,
-                            finish_once_work.publication.key.semantic_ordinal,
-                            RequiredWorkRole.TURN,
-                        )
-                        if finish_once_work is not None
-                        else None
-                    ),
-                )
-            except BaseException as error:
-                _refuse_required_sql(required_work, error)
-            if type(prepared) is not _PreparedPendingInterpretation:
-                _refuse_required_sql(required_work, AuditIntegrityError("pipeline review preparation returned an invalid package"))
-            prepared_events.append(prepared)
+        try:
+            prepared_events = await self._prepare_pending_interpretation_cohort(
+                session_id=session_id,
+                composition_state_id=UUID(candidate_state_id),
+                drafts=prepared_interpretations,
+                session_operation_context=session_operation_context,
+                proposed_state=settled_state,
+                preparation_work=(
+                    RequiredWorkBinding(
+                        finish_once_work.coordinator,
+                        finish_once_work.publication.key.transition_ordinal,
+                        finish_once_work.publication.key.semantic_ordinal,
+                        RequiredWorkRole.TURN,
+                    )
+                    if finish_once_work is not None
+                    else None
+                ),
+            )
+        except BaseException as error:
+            _refuse_required_sql(required_work, error)
 
         def _sync() -> tuple[PipelinePublicationSQLResult | TrustModeAutoCommitRevokedError, bool]:
             with (
@@ -4704,6 +4725,7 @@ class SessionServiceImpl:
             if event_row.proposal_id not in by_proposal:
                 raise AuditIntegrityError("proposal creation event escaped the constrained proposal query")
             by_proposal[event_row.proposal_id].append(event_row)
+        pipeline_authorities: list[AuthoritativePipelineProposal] = []
         enriched: list[CompositionProposalRecord] = []
         for record in records:
             events = by_proposal[str(record.id)]
@@ -4714,13 +4736,10 @@ class SessionServiceImpl:
                 creation_event=_proposal_event_record_from_row(events[0]),
             )
             if authority.pipeline is not None:
-                _verify_pipeline_lifecycle_authority(
-                    conn,
-                    service=self,
-                    authority=authority.pipeline,
-                )
+                pipeline_authorities.append(authority.pipeline)
             metadata = _pipeline_public_metadata(authority.pipeline) if authority.pipeline is not None else None
             enriched.append(replace(record, pipeline_metadata=metadata))
+        _verify_pipeline_lifecycle_authorities(conn, service=self, authorities=pipeline_authorities)
         return tuple(enriched)
 
     async def list_composition_proposals(
@@ -5003,41 +5022,15 @@ class SessionServiceImpl:
         ):
             raise SessionOperationFenceLost(FenceLossReason.TOKEN_MISMATCH)
         event_id = _event_id if _event_id is not None else uuid.uuid4()
-        principal_user_id, plugin_snapshot = await self._session_principal_context(sid, preparation_work=preparation_work)
-        expected_anchor: CompositionStateRecord | None = None
-        expected_live: CompositionStateRecord | None = None
-        if proposed_state is None:
-            expected_anchor, expected_live = await self._preflight_state_pair(session_id=session_id, anchor_id=composition_state_id)
-            snapshot_config = self._inline_preflight_config(expected_live) if expected_live is not None else None
-        else:
-            snapshot_config = self._inline_preflight_config(proposed_state)
-        inline_blob_snapshot = (
-            await self._prepare_inline_blob_snapshot(
-                snapshot_config,
-                session_id=session_id,
-                session_operation_context=session_operation_context,
-                preparation_work=preparation_work,
-            )
-            if snapshot_config is not None
-            else None
-        )
-        validation_inputs = build_interpretation_validation_inputs(
-            profile_aware=self._plugin_snapshot_factory is not None,
-            plugin_snapshot=plugin_snapshot,
-            profile_registry=self._operator_profile_registry,
-            catalog=self._catalog,
-        )
-        validator = _SessionPendingInterpretationValidator(
-            validation_inputs=validation_inputs,
-            runtime_preflight=self._runtime_preflight,
-            inline_blob_snapshot=inline_blob_snapshot,
-            expected_anchor=expected_anchor if inline_blob_snapshot is not None else None,
-            expected_live=expected_live if inline_blob_snapshot is not None else None,
-            session_id=sid,
-            user_id=principal_user_id,
+        validator = await self._prepare_pending_interpretation_validator(
+            session_id=session_id,
+            composition_state_id=composition_state_id,
+            session_operation_context=session_operation_context,
+            proposed_state=proposed_state,
+            preparation_work=preparation_work,
         )
 
-        command = SessionPendingInterpretationCommand(
+        command = _build_pending_interpretation_command(
             event_id=event_id,
             opt_out_marker_event_id=uuid.uuid4(),
             composition_state_id=composition_state_id,
@@ -5064,6 +5057,108 @@ class SessionServiceImpl:
                 session_operation_context,
                 lambda transaction: transaction.interpretations.create_or_reconcile_pending(command, validator),
             ),
+        )
+
+    async def _prepare_pending_interpretation_validator(
+        self,
+        *,
+        session_id: UUID,
+        composition_state_id: UUID,
+        session_operation_context: SessionOperationContext,
+        proposed_state: CompositionStateData | None,
+        preparation_work: RequiredWorkBinding | None = None,
+    ) -> _SessionPendingInterpretationValidator:
+        """Prepare immutable inputs once; the repository still checks live authority."""
+        sid = str(session_id)
+        if type(session_operation_context) is not SessionOperationContext:
+            raise TypeError("session_operation_context must be an exact SessionOperationContext")
+        if (
+            session_operation_context.operation_kind not in {SessionOperationKind.COMPOSE, SessionOperationKind.PROPOSAL}
+            or session_operation_context.fence.session_id != sid
+        ):
+            raise SessionOperationFenceLost(FenceLossReason.TOKEN_MISMATCH)
+        principal_user_id, plugin_snapshot = await self._session_principal_context(sid, preparation_work=preparation_work)
+        expected_anchor: CompositionStateRecord | None = None
+        expected_live: CompositionStateRecord | None = None
+        if proposed_state is None:
+            expected_anchor, expected_live = await self._preflight_state_pair(session_id=session_id, anchor_id=composition_state_id)
+            snapshot_config = self._inline_preflight_config(expected_live) if expected_live is not None else None
+        else:
+            snapshot_config = self._inline_preflight_config(proposed_state)
+        inline_blob_snapshot = (
+            await self._prepare_inline_blob_snapshot(
+                snapshot_config,
+                session_id=session_id,
+                session_operation_context=session_operation_context,
+                preparation_work=preparation_work,
+            )
+            if snapshot_config is not None
+            else None
+        )
+        validation_inputs = build_interpretation_validation_inputs(
+            profile_aware=self._plugin_snapshot_factory is not None,
+            plugin_snapshot=plugin_snapshot,
+            profile_registry=self._operator_profile_registry,
+            catalog=self._catalog,
+        )
+        return _SessionPendingInterpretationValidator(
+            validation_inputs=validation_inputs,
+            runtime_preflight=self._runtime_preflight,
+            inline_blob_snapshot=inline_blob_snapshot,
+            expected_anchor=expected_anchor if inline_blob_snapshot is not None else None,
+            expected_live=expected_live if inline_blob_snapshot is not None else None,
+            session_id=sid,
+            user_id=principal_user_id,
+        )
+
+    async def _prepare_pending_interpretation_cohort(
+        self,
+        *,
+        session_id: UUID,
+        composition_state_id: UUID,
+        drafts: tuple[PreparedInterpretationEventDraft, ...],
+        session_operation_context: SessionOperationContext,
+        proposed_state: CompositionStateData,
+        created_at: datetime | None = None,
+        preparation_work: RequiredWorkBinding | None = None,
+    ) -> tuple[_PreparedPendingInterpretation, ...]:
+        """Share preparation only inside this immutable candidate's cohort.
+
+        No await separates command construction after preparation. A different
+        candidate, blob set or operation enters here again and prepares afresh.
+        Each repository mutation still checks the fence, locked state and blob
+        rows; this shared validation capability grants no write authority.
+        """
+        if not drafts:
+            return ()
+        validator = await self._prepare_pending_interpretation_validator(
+            session_id=session_id,
+            composition_state_id=composition_state_id,
+            session_operation_context=session_operation_context,
+            proposed_state=proposed_state,
+            preparation_work=preparation_work,
+        )
+        return tuple(
+            _PreparedPendingInterpretation(
+                command=_build_pending_interpretation_command(
+                    event_id=draft.event_id,
+                    opt_out_marker_event_id=uuid.uuid4(),
+                    composition_state_id=composition_state_id,
+                    affected_node_id=draft.affected_node_id,
+                    tool_call_id=draft.tool_call_id,
+                    user_term=draft.user_term,
+                    kind=draft.kind,
+                    llm_draft=draft.llm_draft,
+                    surface_origin=draft.surface_origin,
+                    model_identifier=draft.model_identifier,
+                    model_version=draft.model_version,
+                    provider=draft.provider,
+                    composer_skill_hash=draft.composer_skill_hash,
+                    created_at=(restore_utc(created_at) + timedelta(microseconds=index) if created_at is not None else self._now()),
+                ),
+                validator=validator,
+            )
+            for index, draft in enumerate(drafts)
         )
 
     async def resolve_interpretation_event(
@@ -6397,33 +6492,17 @@ class SessionServiceImpl:
         sid = str(session_id)
         state_id = uuid.uuid4()
         now = self._now()
-        prepared_events: list[_PreparedPendingInterpretation] = []
-        for index, draft in enumerate(interpretations):
-            prepared = await self._prepare_or_create_pending_interpretation_event(
-                session_id=session_id,
-                composition_state_id=state_id,
-                affected_node_id=draft.affected_node_id,
-                tool_call_id=draft.tool_call_id,
-                user_term=draft.user_term,
-                kind=draft.kind,
-                llm_draft=draft.llm_draft,
-                model_identifier=draft.model_identifier,
-                model_version=draft.model_version,
-                provider=draft.provider,
-                composer_skill_hash=draft.composer_skill_hash,
-                surface_origin=draft.surface_origin,
-                session_operation_context=session_operation_context,
-                # list_interpretation_events orders by created_at then id.
-                # Preserve the generic surfacer's deterministic call order
-                # without depending on random event UUID ordering.
-                created_at=now + timedelta(microseconds=index),
-                _event_id=draft.event_id,
-                _prepare_only=True,
-                proposed_state=state,
-            )
-            if type(prepared) is not _PreparedPendingInterpretation:
-                raise AuditIntegrityError("imported interpretation preparation did not return an exact package")
-            prepared_events.append(prepared)
+        prepared_events = await self._prepare_pending_interpretation_cohort(
+            session_id=session_id,
+            composition_state_id=state_id,
+            drafts=interpretations,
+            session_operation_context=session_operation_context,
+            # list_interpretation_events orders by created_at then id.
+            # Preserve the generic surfacer's deterministic call order
+            # without depending on random event UUID ordering.
+            created_at=now,
+            proposed_state=state,
+        )
 
         def _sync() -> CompositionStateRecord:
             with self._session_process_locked_begin(sid) as conn, self._session_write_lock(conn, sid):
@@ -6956,8 +7035,13 @@ class SessionServiceImpl:
         """Resolve effective facts on a normally hydrated immutable snapshot."""
         from elspeth.web.execution.completion_gates import parse_completion_gates
 
+        restored_state: CompositionState | None = None
+
         def read_state() -> CompositionState:
-            return state_from_record(stored) if stored is not None else empty_recovery_state()
+            nonlocal restored_state
+            if restored_state is None:
+                restored_state = state_from_record(stored) if stored is not None else empty_recovery_state()
+            return restored_state
 
         fact = self._graph_review_for_base_on_connection(
             conn, session_id=session_id, state_id=stored.id if stored is not None else None, read_state=read_state

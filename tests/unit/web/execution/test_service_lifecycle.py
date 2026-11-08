@@ -822,6 +822,49 @@ class TestExecutionFlow:
         }
 
     @pytest.mark.asyncio
+    async def test_assessment_owns_exact_snapshot_and_refreshes_on_next_occurrence(
+        self,
+        service: ExecutionServiceImpl,
+        mock_session_service: MagicMock,
+    ) -> None:
+        state = state_from_record(mock_session_service.get_current_state.return_value)
+        base = PluginAvailabilitySnapshot.for_trained_operator(create_catalog_service())
+        snapshots = tuple(
+            PluginAvailabilitySnapshot.create(
+                policy_hash=base.policy_hash,
+                principal_scope="local:alice",
+                available=base.available,
+                unavailable=(),
+                selected=base.selected,
+                usable_profile_aliases=(),
+                selected_profile_aliases=(),
+                binding_generation_fingerprint=generation,
+            )
+            for generation in ("before-rotation", "after-rotation")
+        )
+        expected = ValidationResult(
+            is_valid=True,
+            checks=[],
+            errors=[],
+            readiness=ValidationReadiness(authoring_valid=True, execution_ready=True, completion_ready=True, blockers=[]),
+        )
+        factory = MagicMock(spec=service._plugin_snapshot_factory, side_effect=snapshots)
+        session_id = uuid4()
+        context = make_blob_read_context(session_id)
+        with (
+            patch.object(service, "_plugin_snapshot_factory", factory),
+            patch.object(service, "_authoritative_state_preflight_sync", return_value=expected) as preflight,
+        ):
+            first = await service.assess_state(state, session_operation_context=context, user_id="alice", session_id=session_id)
+            second = await service.assess_state(state, session_operation_context=context, user_id="alice", session_id=session_id)
+        assert factory.call_count == 2
+        assert first.plugin_snapshot is snapshots[0]
+        assert second.plugin_snapshot is snapshots[1]
+        assert first.validation is expected and second.validation is expected
+        assert [call.kwargs["plugin_snapshot"] for call in preflight.call_args_list] == list(snapshots)
+        assert all(call.kwargs["session_operation_context"] is context for call in preflight.call_args_list)
+
+    @pytest.mark.asyncio
     async def test_validate_state_runs_validation_in_worker_with_secret_context(
         self,
         service: ExecutionServiceImpl,

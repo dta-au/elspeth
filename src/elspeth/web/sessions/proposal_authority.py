@@ -26,6 +26,7 @@ from elspeth.web.coordination.repository import (
 )
 from elspeth.web.sessions._persist_payload import RedactedToolRow
 from elspeth.web.sessions.converters import state_from_record
+from elspeth.web.sessions.dispatch_evidence import _PipelineDispatchEvidenceRead, read_dispatch_envelopes
 from elspeth.web.sessions.models import (
     chat_messages_table,
     composition_states_table,
@@ -329,27 +330,25 @@ def _persisted_pipeline_dispatch_content_hashes(
     *,
     session_id: str,
     dispatch: PipelineDispatchAuditBinding,
+    evidence_read: _PipelineDispatchEvidenceRead | None = None,
 ) -> tuple[str, ...]:
-    """Return content hashes from exact durable redacted dispatch envelopes."""
-    rows = conn.execute(select(chat_messages_table.c.tool_calls).where(chat_messages_table.c.session_id == session_id)).fetchall()
+    """Return content hashes from every exact durable dispatch candidate."""
+    envelopes = (
+        evidence_read.envelopes_for(conn, session_id=session_id, tool_call_id=dispatch.tool_call_id)
+        if evidence_read is not None
+        else tuple(envelope for _, envelope in read_dispatch_envelopes(conn, session_id=session_id, tool_call_ids=(dispatch.tool_call_id,)))
+    )
     matches: list[str] = []
-    for row in rows:
-        tool_calls = row.tool_calls
-        if type(tool_calls) is not list:
+    for envelope in envelopes:
+        try:
+            recovery = _pipeline_dispatch_recovery_from_envelope(envelope, expected_tool_call_id=dispatch.tool_call_id)
+        except AuditIntegrityError as exc:
+            raise AuditIntegrityError("pipeline dispatch audit evidence is malformed") from exc
+        if recovery is None:
             continue
-        for envelope in tool_calls:
-            try:
-                recovery = _pipeline_dispatch_recovery_from_envelope(
-                    envelope,
-                    expected_tool_call_id=dispatch.tool_call_id,
-                )
-            except AuditIntegrityError as exc:
-                raise AuditIntegrityError("pipeline dispatch audit evidence is malformed") from exc
-            if recovery is None:
-                continue
-            if recovery.binding != dispatch:
-                raise AuditIntegrityError("pipeline successful dispatch evidence does not match the terminal binding")
-            matches.append(recovery.executor_content_hash)
+        if recovery.binding != dispatch:
+            raise AuditIntegrityError("pipeline successful dispatch evidence does not match the terminal binding")
+        matches.append(recovery.executor_content_hash)
     return tuple(matches)
 
 
@@ -576,6 +575,7 @@ def _verify_committed_pipeline_authority(
     *,
     service: SessionServiceImpl,
     authority: AuthoritativePipelineProposal,
+    evidence_read: _PipelineDispatchEvidenceRead | None = None,
 ) -> None:
     """Verify the complete already-committed outcome used by HTTP retries."""
     sid = str(authority.row.session_id)
@@ -647,7 +647,7 @@ def _verify_committed_pipeline_authority(
             raise AuditIntegrityError("committed pipeline proposal creation operation mismatch")
     if compared_payload != expected:
         raise AuditIntegrityError("committed pipeline proposal exact retry binding mismatch")
-    if _persisted_pipeline_dispatch_content_hashes(conn, session_id=sid, dispatch=dispatch) != (state_hash,):
+    if _persisted_pipeline_dispatch_content_hashes(conn, session_id=sid, dispatch=dispatch, evidence_read=evidence_read) != (state_hash,):
         raise AuditIntegrityError("committed pipeline proposal dispatch audit is missing or duplicated")
 
 
@@ -655,6 +655,7 @@ def _verify_rejected_pipeline_authority(
     conn: Connection,
     *,
     authority: AuthoritativePipelineProposal,
+    evidence_read: _PipelineDispatchEvidenceRead | None = None,
 ) -> None:
     """Verify the closed terminal authority for a canonical rejection."""
     sid = str(authority.row.session_id)
@@ -702,8 +703,35 @@ def _verify_rejected_pipeline_authority(
     expected = _pipeline_rejected_payload(authority=authority, reason=reason, dispatch=dispatch)
     if payload != expected:
         raise AuditIntegrityError("rejected pipeline proposal exact terminal binding mismatch")
-    if dispatch is not None and len(_persisted_pipeline_dispatch_content_hashes(conn, session_id=sid, dispatch=dispatch)) != 1:
+    if (
+        dispatch is not None
+        and len(_persisted_pipeline_dispatch_content_hashes(conn, session_id=sid, dispatch=dispatch, evidence_read=evidence_read)) != 1
+    ):
         raise AuditIntegrityError("rejected pipeline proposal dispatch audit is missing or duplicated")
+
+
+def _verify_pipeline_lifecycle_authorities(
+    conn: Connection,
+    *,
+    service: SessionServiceImpl,
+    authorities: Sequence[AuthoritativePipelineProposal],
+) -> None:
+    """Verify one synchronous list read with one fresh dispatch snapshot.
+
+    The batch never escapes this stack frame: later reads, even on the same
+    transaction after a write, acquire fresh durable evidence. No mutation or
+    await occurs within this read-only verification pass.
+    """
+    if not authorities:
+        return
+    session_id = str(authorities[0].row.session_id)
+    if any(str(authority.row.session_id) != session_id for authority in authorities):
+        raise AuditIntegrityError("Pipeline lifecycle batch mixes session authorities")
+    evidence_read = _PipelineDispatchEvidenceRead(
+        conn, session_id=session_id, tool_call_ids=tuple(authority.row.tool_call_id for authority in authorities)
+    )
+    for authority in authorities:
+        _verify_pipeline_lifecycle_authority(conn, service=service, authority=authority, evidence_read=evidence_read)
 
 
 def _verify_pipeline_lifecycle_authority(
@@ -711,18 +739,19 @@ def _verify_pipeline_lifecycle_authority(
     *,
     service: SessionServiceImpl,
     authority: AuthoritativePipelineProposal,
+    evidence_read: _PipelineDispatchEvidenceRead | None = None,
 ) -> None:
     """Verify the complete canonical lifecycle before exposing or mutating it."""
     is_fork_transaction = type(conn) is _ForkCreationTransaction
     if authority.row.status == "committed":
         if is_fork_transaction:
             raise AuditIntegrityError("fork source proposal must remain pending")
-        _verify_committed_pipeline_authority(cast(Connection, conn), service=service, authority=authority)
+        _verify_committed_pipeline_authority(cast(Connection, conn), service=service, authority=authority, evidence_read=evidence_read)
         return
     if authority.row.status == "rejected":
         if is_fork_transaction:
             raise AuditIntegrityError("fork source proposal must remain pending")
-        _verify_rejected_pipeline_authority(cast(Connection, conn), authority=authority)
+        _verify_rejected_pipeline_authority(cast(Connection, conn), authority=authority, evidence_read=evidence_read)
         return
     if authority.row.status != "pending":
         raise AuditIntegrityError("pipeline proposal lifecycle status is malformed")

@@ -9266,7 +9266,17 @@ async def test_aid_supplied_reads_in_one_turn_deliver_results_without_hatch(
     assert completion.requests[1]["model"] == "anthropic/claude-planner"
     tool_results = [json.loads(message["content"]) for message in completion.requests[1]["messages"] if message["role"] == "tool"]
     assert [result["success"] for result in tool_results] == [True, True]
-    assert [invocation.tool_name for invocation in recorder.invocations] == ["list_models", "get_expression_grammar"]
+    # Concurrent audit records follow completion order; provider delivery must
+    # retain admitted call order and correlate each result by its call ID.
+    assert len(recorder.invocations) == 2
+    assert {invocation.tool_call_id: invocation.tool_name for invocation in recorder.invocations} == {
+        "call-1": "list_models",
+        "call-2": "get_expression_grammar",
+    }
+    assert [message["tool_call_id"] for message in completion.requests[1]["messages"] if message["role"] == "tool"] == [
+        "call-1",
+        "call-2",
+    ]
 
 
 @pytest.mark.asyncio

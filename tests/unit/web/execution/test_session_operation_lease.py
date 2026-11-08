@@ -75,8 +75,9 @@ from elspeth.web.coordination.repository import (
     SessionOperationConflictError,
 )
 from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
+from elspeth.web.execution import envelope as execution_envelope_module
 from elspeth.web.execution import service as execution_service_module
-from elspeth.web.execution.envelope import restore_execution_envelope
+from elspeth.web.execution.envelope import restore_run_execution_input
 from elspeth.web.execution.progress import ProgressBroadcaster
 from elspeth.web.execution.protocol import ExecutionService
 from elspeth.web.execution.routes import create_execution_router
@@ -2143,6 +2144,33 @@ def _is_exact_envelope_blob_verifier_edge(call: ast.Call, keyword: ast.keyword) 
     )
 
 
+def _is_exact_run_input_callback_edge(
+    call: ast.Call,
+    keyword: ast.keyword,
+    function: _FunctionNode,
+    parent: dict[ast.AST, ast.AST],
+    enclosing: dict[int, _FunctionNode],
+) -> bool:
+    """The joined recovery worker synchronously invokes these two exact callbacks."""
+    expected = {"current_authority", "user_id", "auth_provider_type", "resolver", "blob_verifier"}
+    return (
+        isinstance(function, ast.AsyncFunctionDef)
+        and isinstance(parent.get(call), ast.Await)
+        and isinstance(call.func, ast.Name)
+        and call.func.id == "run_sync_in_worker"
+        and len(call.args) == 2
+        and isinstance(call.args[0], ast.Name)
+        and call.args[0].id == "restore_run_execution_input"
+        and not isinstance(call.args[1], ast.Starred)
+        and len(call.keywords) == len(expected)
+        and {item.arg for item in call.keywords} == expected
+        and keyword.arg in {"blob_verifier", "current_authority"}
+        and any(item is keyword for item in call.keywords)
+        and isinstance(keyword.value, ast.Name)
+        and isinstance(_unique_local_callable(function, keyword.value.id, enclosing), ast.FunctionDef)
+    )
+
+
 def _is_exact_blob_metadata_callback_edge(call: ast.Call, keyword: ast.keyword) -> bool:
     """Follow the validator's exact metadata and content-read callbacks."""
     return (
@@ -2365,6 +2393,7 @@ def _execution_reachability(owner: ast.ClassDef) -> _ExecutionReachability:
         )
         exact_worker_bound = _binding_nodes(function, live_nodes, name="run_sync_in_worker") == ()
         exact_envelope_bound = _binding_nodes(function, live_nodes, name="restore_execution_envelope") == ()
+        exact_run_input_bound = _binding_nodes(function, live_nodes, name="restore_run_execution_input") == ()
         for call in (candidate for candidate in live_nodes if isinstance(candidate, ast.Call)):
             if (
                 isinstance(call.func, ast.Name)
@@ -2450,6 +2479,17 @@ def _execution_reachability(owner: ast.ClassDef) -> _ExecutionReachability:
                 for keyword in call.keywords
                 if exact_worker_bound and exact_envelope_bound and _is_exact_envelope_blob_verifier_edge(call, keyword)
             )
+            if exact_worker_bound and exact_run_input_bound:
+                for keyword in call.keywords:
+                    if _is_exact_run_input_callback_edge(call, keyword, function, parent, enclosing):
+                        assert isinstance(keyword.value, ast.Name)
+                        definition = _unique_local_callable(function, keyword.value.id, enclosing)
+                        assert isinstance(definition, ast.FunctionDef)
+                        # Use the exact lexical definition, not the class-wide
+                        # name map: another closure with the same name cannot
+                        # supply this recovery worker's callback.
+                        pending.append(definition)
+                        admitted.add(id(keyword.value))
             admitted.update(id(edge) for edge in delegated_edges)
             callable_edges.extend(delegated_edges)
             pending.extend(local_functions[edge.id] for edge in callable_edges if isinstance(edge, ast.Name) and edge.id in local_functions)
@@ -3562,9 +3602,19 @@ def test_every_worker_run_blob_progress_output_and_terminal_effect_uses_same_con
     assert execution_service_module.asyncio is asyncio, "execution thread/coroutine scheduler module provenance changed"
     assert execution_service_module.asyncio.to_thread is to_thread
     assert execution_service_module.asyncio.run_coroutine_threadsafe is run_coroutine_threadsafe
-    assert execution_service_module.restore_execution_envelope is restore_execution_envelope, (
-        "execution envelope consumer provenance changed"
+    assert execution_service_module.restore_run_execution_input is restore_run_execution_input, (
+        "execution run-input consumer provenance changed"
     )
+    recovery_consumers = [
+        call.args[0].id
+        for call in live_calls
+        if isinstance(call.func, ast.Name)
+        and call.func.id == "run_sync_in_worker"
+        and call.args
+        and isinstance(call.args[0], ast.Name)
+        and call.args[0].id in {"restore_execution_envelope", "restore_run_execution_input"}
+    ]
+    assert recovery_consumers == ["restore_run_execution_input"], "actual recovery consumer changed"
     assert [function.name for function in exact_event_bus_functions] == ["_run_pipeline"]
     assert findings.escaped_local_helpers == (), (
         f"local execution helper callable escapes direct analysis: {findings.escaped_local_helpers}"
@@ -3763,6 +3813,7 @@ class _EdgeControlCase:
     escaped_class_helpers: tuple[str, ...] = ()
     escaped_decoys: tuple[str, ...] = ("get_blob",)
     """Gate calls left unreachable when the closure escapes; empty when the read lives in a member reached only through it."""
+    escaped_local_occurrences: int = 1
 
 
 def _synthetic_owner(body: str) -> ast.ClassDef:
@@ -3782,7 +3833,7 @@ def _assert_edge_control(case: _EdgeControlCase) -> None:
         assert live_effects == [case.effect_name], live_effects
     else:
         assert case.closure not in reachable_names, f"{case.closure} was admitted through a non-exact shape: {reachable_names}"
-        assert findings.escaped_local_helpers == (case.closure,), findings.escaped_local_helpers
+        assert findings.escaped_local_helpers == (case.closure,) * case.escaped_local_occurrences, findings.escaped_local_helpers
         assert decoy_names == list(case.escaped_decoys), decoy_names
         assert live_effects == [], live_effects
     assert findings.context_offenders == case.context_offenders, findings.context_offenders
@@ -5189,6 +5240,285 @@ def _envelope_blob_verifier_case(
 )
 def test_envelope_blob_verifier_callback_requires_exact_worker_and_restore_consumer(case_id: str, case: _EdgeControlCase) -> None:
     _assert_edge_control(case)
+
+
+_RUN_INPUT_BLOB_EDGE = """
+    async def _entry(self, state, *, session_id, session_operation_context):
+        {rebinding}
+        def verify_blob(blob_id):
+            return self._call_async({receiver}.get_blob(blob_id, session_operation_context={context}))
+        return await {worker}({consumer}, state{extra_argument}, current_authority=self._authority,
+            user_id=None, auth_provider_type=None, resolver=None, {keyword}=verify_blob{extra_keyword})
+"""
+
+
+@pytest.mark.parametrize(
+    ("changes", "admitted", "offenders", "receivers"),
+    [
+        ({}, True, (), 0),
+        ({"worker": "other_worker"}, False, (), 0),
+        ({"consumer": "other_restore"}, False, (), 0),
+        ({"keyword": "verify_blob"}, False, (), 0),
+        ({"extra_argument": ", state"}, False, (), 0),
+        ({"extra_keyword": ", **state"}, False, (), 0),
+        ({"extra_keyword": ", other_callback=verify_blob"}, False, (), 0),
+        ({"rebinding": "run_sync_in_worker = self._runner"}, False, (), 0),
+        ({"rebinding": "restore_run_execution_input = self._restore"}, False, (), 0),
+        ({"rebinding": "from elspeth.web.execution.staging import restore_run_execution_input"}, False, (), 0),
+        ({"context": "other_context"}, True, ("get_blob",), 0),
+        ({"receiver": "self._staging"}, True, (), 1),
+    ],
+)
+def test_run_input_blob_callback_requires_exact_worker_consumer_binding(changes, admitted, offenders, receivers):
+    values = {
+        "rebinding": "",
+        "receiver": "self._blob_service",
+        "context": "session_operation_context",
+        "worker": "run_sync_in_worker",
+        "consumer": "restore_run_execution_input",
+        "extra_argument": "",
+        "keyword": "blob_verifier",
+        "extra_keyword": "",
+    }
+    values.update(changes)
+    _assert_edge_control(
+        _EdgeControlCase(
+            body=_RUN_INPUT_BLOB_EDGE.format(**values),
+            closure="verify_blob",
+            admitted=admitted,
+            context_offenders=offenders,
+            unresolved_receiver_count=receivers,
+            escaped_local_occurrences=2 if changes.get("extra_keyword") == ", other_callback=verify_blob" else 1,
+        )
+    )
+
+
+@pytest.mark.parametrize("mutation", ["unawaited", "sync_unawaited", "detached_task", "dead_return", "false_branch"])
+def test_run_input_blob_callback_rejects_unjoined_or_unreachable_worker(mutation):
+    body = _RUN_INPUT_BLOB_EDGE.format(
+        rebinding="",
+        receiver="self._blob_service",
+        context="session_operation_context",
+        worker="run_sync_in_worker",
+        consumer="restore_run_execution_input",
+        extra_argument="",
+        keyword="blob_verifier",
+        extra_keyword="",
+    )
+    if mutation in {"unawaited", "sync_unawaited"}:
+        body = body.replace("return await run_sync_in_worker", "return run_sync_in_worker")
+        if mutation == "sync_unawaited":
+            body = body.replace("async def _entry", "def _entry")
+    elif mutation == "detached_task":
+        body = body.replace("return await run_sync_in_worker(", "return asyncio.create_task(run_sync_in_worker(")
+        body = body.replace("blob_verifier=verify_blob)", "blob_verifier=verify_blob))")
+    elif mutation == "dead_return":
+        body = body.replace("return await run_sync_in_worker", "return None\n        return await run_sync_in_worker")
+    elif mutation == "false_branch":
+        body = body.replace("return await run_sync_in_worker", "if False:\n            return await run_sync_in_worker")
+    findings = _execution_effect_findings(_synthetic_owner(body))
+    assert "verify_blob" not in [function.name for function in findings.reachable]
+    assert "get_blob" not in [_call_name(call) for call in findings.effect_calls]
+
+
+_RUN_INPUT_AUTHORITY_EDGE = """
+    async def _entry(self, state, *, session_id, session_operation_context):
+        def current_authority():
+            return self._call_async(self._blob_service.get_blob(state, session_operation_context=session_operation_context))
+        return await run_sync_in_worker(restore_run_execution_input, state,
+            current_authority=current_authority, user_id=None, auth_provider_type=None,
+            resolver=None, blob_verifier=None)
+"""
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "none",
+        "unawaited",
+        "wrong_worker",
+        "wrong_consumer",
+        "wrong_keyword",
+        "extra_keyword",
+        "rebound",
+        "alias",
+        "decorated",
+        "async_callback",
+        "duplicate_definition",
+        "dead_definition",
+    ],
+)
+def test_run_input_authority_callback_requires_joined_exact_unique_local_edge(mutation):
+    # An observable effect proves that this callback is traversed, rather
+    # than merely deleting its name from escaped-helper diagnostics. The real
+    # producer's separate contract below requires a fresh policy snapshot.
+    body = _RUN_INPUT_AUTHORITY_EDGE
+    if mutation == "unawaited":
+        body = body.replace("return await run_sync_in_worker", "return run_sync_in_worker")
+    elif mutation == "wrong_worker":
+        body = body.replace("run_sync_in_worker(", "other_worker(")
+    elif mutation == "wrong_consumer":
+        body = body.replace("restore_run_execution_input,", "other_consumer,")
+    elif mutation == "wrong_keyword":
+        body = body.replace("current_authority=current_authority", "authority=current_authority")
+    elif mutation == "extra_keyword":
+        body = body.replace("blob_verifier=None)", "blob_verifier=None, other=current_authority)")
+    elif mutation == "rebound":
+        body = body.replace("return await", "current_authority = foreign\n        return await")
+    elif mutation == "alias":
+        body = body.replace("return await", "alias = current_authority\n        return await")
+        body = body.replace("current_authority=current_authority", "current_authority=alias")
+    elif mutation == "decorated":
+        body = body.replace("def current_authority", "@foreign\n        def current_authority")
+    elif mutation == "async_callback":
+        body = body.replace("def current_authority", "async def current_authority")
+    elif mutation == "duplicate_definition":
+        body = body.replace("return await", "def current_authority():\n            return foreign\n        return await")
+    elif mutation == "dead_definition":
+        body = body.replace("def current_authority", "return None\n        def current_authority")
+    findings = _execution_effect_findings(_synthetic_owner(body))
+    if mutation == "none":
+        assert "current_authority" in [function.name for function in findings.reachable]
+        assert findings.escaped_local_helpers == ()
+        assert findings.unreachable_decoys == ()
+        assert [_call_name(call) for call in findings.effect_calls] == ["get_blob"]
+        assert findings.context_offenders == ()
+        assert findings.unresolved_receivers == ()
+    else:
+        assert "current_authority" not in [function.name for function in findings.reachable]
+        assert "get_blob" not in [_call_name(call) for call in findings.effect_calls]
+        assert "get_blob" in [_call_name(call) for call in findings.unreachable_decoys]
+        if mutation != "dead_definition":
+            expected = ("current_authority",) * (2 if mutation == "extra_keyword" else 1)
+            assert findings.escaped_local_helpers == expected
+
+
+_RECOVERY_AUTHORITY_PRODUCER = """
+snapshot = self._plugin_snapshot_for_user(user_id, operation="run recovery")
+implementation = runtime_implementation_fingerprint(snapshot)
+return ExecutionRecoveryAuthority(snapshot, implementation, implementation)
+"""
+
+
+def _exact_recovery_authority_producer(function: _FunctionNode) -> bool:
+    return (
+        isinstance(function, ast.FunctionDef)
+        and not function.decorator_list
+        and not function.args.posonlyargs
+        and not function.args.args
+        and not function.args.kwonlyargs
+        and function.args.vararg is None
+        and function.args.kwarg is None
+        and ast.dump(ast.Module(body=function.body, type_ignores=[])) == ast.dump(ast.parse(_RECOVERY_AUTHORITY_PRODUCER))
+    )
+
+
+def test_actual_recovery_authority_producer_reads_fresh_snapshot_and_implementation():
+    owner = _class_node(ExecutionServiceImpl)
+    restorer = next(node for node in owner.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "_restore_admitted_run")
+    callbacks = [node for node in restorer.body if isinstance(node, ast.FunctionDef) and node.name == "current_authority"]
+    assert len(callbacks) == 1
+    assert _exact_recovery_authority_producer(callbacks[0])
+    assert execution_service_module.ExecutionRecoveryAuthority is execution_envelope_module.ExecutionRecoveryAuthority
+    assert execution_service_module.runtime_implementation_fingerprint is execution_envelope_module.runtime_implementation_fingerprint
+
+
+@pytest.mark.parametrize("mutation", ["cached_snapshot", "different_principal", "cached_implementation", "different_result", "async"])
+def test_recovery_authority_producer_refuses_stale_or_different_binding(mutation):
+    source = _RECOVERY_AUTHORITY_PRODUCER
+    if mutation == "cached_snapshot":
+        source = source.replace('self._plugin_snapshot_for_user(user_id, operation="run recovery")', "cached_snapshot")
+    elif mutation == "different_principal":
+        source = source.replace("user_id,", "other_user,")
+    elif mutation == "cached_implementation":
+        source = source.replace("runtime_implementation_fingerprint(snapshot)", "cached_implementation")
+    elif mutation == "different_result":
+        source = source.replace("return ExecutionRecoveryAuthority(snapshot, implementation, implementation)", "return cached_authority")
+    prefix = "async def" if mutation == "async" else "def"
+    callback = ast.parse(prefix + " current_authority():\n" + textwrap.indent(source, "    ")).body[0]
+    assert isinstance(callback, (ast.FunctionDef, ast.AsyncFunctionDef))
+    assert not _exact_recovery_authority_producer(callback)
+
+
+_RUN_INPUT_FORWARDING = """
+payload = _validated_run_execution_payload(execution_input)
+authority = current_authority()
+return _restore_execution_payload(
+    payload, current_snapshot=authority.snapshot, user_id=user_id,
+    auth_provider_type=auth_provider_type, resolver=resolver,
+    implementation_fingerprint=authority.implementation_fingerprint,
+    deployment_generation=authority.deployment_generation, blob_verifier=blob_verifier,
+)
+"""
+
+
+def _exact_run_input_forwarding(function: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    if not isinstance(function, ast.FunctionDef):
+        return False
+    body = function.body
+    if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) and isinstance(body[0].value.value, str):
+        body = body[1:]
+    return ast.dump(ast.Module(body=body, type_ignores=[])) == ast.dump(ast.parse(_RUN_INPUT_FORWARDING))
+
+
+def _exact_live_blob_invocation(function: ast.FunctionDef) -> bool:
+    expected = ast.parse("if blob_verifier is not None:\n    for blob in payload.blob_inputs:\n        blob_verifier(blob)").body[0]
+    live = _reachable_function_nodes(function)
+    # The callback must remain the caller's parameter, never a rebound local.
+    if any(
+        isinstance(node, ast.Name) and node.id == "blob_verifier" and isinstance(node.ctx, (ast.Store, ast.Del))
+        for node in ast.walk(function)
+    ):
+        return False
+    calls = [node for node in live if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "blob_verifier"]
+    return len(calls) == 1 and any(isinstance(node, ast.If) and ast.dump(node) == ast.dump(expected) for node in live)
+
+
+def test_run_input_consumer_forwards_and_invokes_blob_callback_synchronously():
+    wrapper = ast.parse(inspect.getsource(restore_run_execution_input)).body[0]
+    assert isinstance(wrapper, ast.FunctionDef)
+    assert _exact_run_input_forwarding(wrapper)
+    consumer = ast.parse(inspect.getsource(execution_envelope_module._restore_execution_payload)).body[0]
+    assert isinstance(consumer, ast.FunctionDef)
+    assert _exact_live_blob_invocation(consumer)
+    assert restore_run_execution_input.__globals__["_restore_execution_payload"] is execution_envelope_module._restore_execution_payload
+
+
+@pytest.mark.parametrize(
+    "mutation", ["drop_callback", "replace_callback", "skip_authority", "authority_after_restore", "early_return", "async_wrapper"]
+)
+def test_run_input_forwarding_guard_rejects_changed_callback_or_authority_order(mutation):
+    source = _RUN_INPUT_FORWARDING
+    if mutation == "drop_callback":
+        source = source.replace("blob_verifier=blob_verifier,", "")
+    elif mutation == "replace_callback":
+        source = source.replace("blob_verifier=blob_verifier", "blob_verifier=None")
+    elif mutation == "skip_authority":
+        source = source.replace("authority = current_authority()", "authority = cached_authority")
+    elif mutation == "authority_after_restore":
+        source = source.replace("authority = current_authority()\n", "") + "\nauthority = current_authority()\n"
+    elif mutation == "early_return":
+        source = "return None\n" + source
+    prefix = "async def" if mutation == "async_wrapper" else "def"
+    function = ast.parse(prefix + " wrapper():\n" + textwrap.indent(source, "    ")).body[0]
+    assert not _exact_run_input_forwarding(function)
+
+
+@pytest.mark.parametrize("mutation", ["drop_call", "wrong_callback", "wrong_input", "unreachable", "rebound"])
+def test_run_input_blob_invocation_guard_rejects_missing_or_dead_callback(mutation):
+    source = "if blob_verifier is not None:\n    for blob in payload.blob_inputs:\n        blob_verifier(blob)\n"
+    if mutation == "drop_call":
+        source = source.replace("blob_verifier(blob)", "pass")
+    elif mutation == "wrong_callback":
+        source = source.replace("blob_verifier(blob)", "other_callback(blob)")
+    elif mutation == "wrong_input":
+        source = source.replace("payload.blob_inputs", "other_inputs")
+    elif mutation == "unreachable":
+        source = "return None\n" + source
+    elif mutation == "rebound":
+        source = "blob_verifier = other_callback\n" + source
+    function = ast.parse("def consumer():\n" + textwrap.indent(source, "    ")).body[0]
+    assert not _exact_live_blob_invocation(function)
 
 
 @pytest.mark.asyncio

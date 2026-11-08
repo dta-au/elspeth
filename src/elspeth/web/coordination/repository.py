@@ -956,10 +956,14 @@ class _RepositoryCompositionStateMutations:
 class _RepositoryInterpretationMutations:
     """Interpretation-event capability bound to one private operation transaction."""
 
-    __slots__ = ("__state",)
+    __slots__ = ("__graphs", "__records", "__state")
 
     def __init__(self, state: _RepositoryMutationState) -> None:
+        from elspeth.web.sessions.pending_interpretation import _PendingInterpretationGraphs
+
         self.__state = state
+        self.__records: dict[str, CompositionStateRecord] = {}
+        self.__graphs = _PendingInterpretationGraphs()
 
     def _require_compose(self) -> None:
         state = self.__state
@@ -1005,6 +1009,20 @@ class _RepositoryInterpretationMutations:
             derived_from_state_id=(UUID(row.derived_from_state_id) if row.derived_from_state_id is not None else None),
             composer_meta=cls._state_column(row.composer_meta),
         )
+
+    def _cached_state_record(self, row: Row[Any]) -> CompositionStateRecord:
+        """Decode append-only state rows once within this private transaction.
+
+        The caller still reads/locks the current head each time. New versions
+        have new ids, including opt-out resolutions appended by earlier cards.
+        Retain the frozen DTO, never a SQL row or its mutable JSON containers.
+        """
+        key = str(row.id)
+        if key not in self.__records:
+            if len(self.__records) >= 64:
+                self.__records.clear()
+            self.__records[key] = self._state_record(row)
+        return self.__records[key]
 
     @staticmethod
     def _event_record(row: Row[Any]) -> InterpretationEventRecord:
@@ -1103,6 +1121,14 @@ class _RepositoryInterpretationMutations:
         ).all()
         pending_sites: list[SessionPendingInterpretationSiteSnapshot] = []
         for pending_row in pending_rows:
+            pending_event = self._event_record(pending_row)
+            if type(pending_event.user_term) is not str:
+                raise AuditIntegrityError("create_pending_interpretation_event: pending review has malformed user_term")
+            # The planner ignores other terms at this node/kind. Do not load
+            # their potentially large historical graphs merely to discard them.
+            # Python strip preserves the exact existing Unicode comparison.
+            if pending_event.user_term.strip() != command.user_term.strip():
+                continue
             surfacing_row = None
             if pending_row.composition_state_id is not None:
                 surfacing_row = connection.execute(
@@ -1113,8 +1139,8 @@ class _RepositoryInterpretationMutations:
                 ).one_or_none()
             pending_sites.append(
                 SessionPendingInterpretationSiteSnapshot(
-                    event=self._event_record(pending_row),
-                    surfacing_state=(self._state_record(surfacing_row) if surfacing_row is not None else None),
+                    event=pending_event,
+                    surfacing_state=(self._cached_state_record(surfacing_row) if surfacing_row is not None else None),
                 )
             )
         superseded_rows = connection.execute(
@@ -1146,8 +1172,8 @@ class _RepositoryInterpretationMutations:
             is not None
         )
         snapshot = SessionPendingInterpretationSnapshot(
-            anchor_state=self._state_record(anchor_row),
-            live_state=self._state_record(live_row),
+            anchor_state=self._cached_state_record(anchor_row),
+            live_state=self._cached_state_record(live_row),
             pending_sites=tuple(pending_sites),
             review_disabled=review_disabled,
             opt_out_marker_exists=marker_exists,
@@ -1171,7 +1197,8 @@ class _RepositoryInterpretationMutations:
             )
             if any(term.strip() == command.user_term.strip() for term in candidate_terms):
                 raise AuditIntegrityError("pipeline candidate review site already has immutable evidence")
-        decision = _SessionPendingInterpretationPlanner.plan(command, snapshot, validator, policy=policy)
+        with self.__graphs.scope():
+            decision = _SessionPendingInterpretationPlanner.plan(command, snapshot, validator, policy=policy)
         if type(decision) is not SessionPendingInterpretationDecision:
             raise TypeError("pending interpretation planner must return an exact decision")
         matching_term_ids = {

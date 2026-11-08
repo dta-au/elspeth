@@ -30,6 +30,7 @@ from tests.unit.web.composer.test_tools import (
     _insert_user_message,
     _mock_catalog,
     _session_engine_with_session,
+    _stale_validation_for,
     _verbatim_blob_context,
     execute_tool,
 )
@@ -529,15 +530,17 @@ class TestBlobTools:
         d = result.to_dict()
         assert "validation_delta" in d
 
-    def test_set_source_from_blob_threaded_prior_used(self) -> None:
-        """Threaded prior_validation is reused by blob mutation tools (identity check).
+    @pytest.mark.parametrize("stale", [False, True])
+    def test_set_source_from_blob_threaded_prior_used(self, stale: bool) -> None:
+        """Blob mutation advice belongs to the current graph.
 
         execute_tool dispatches blob mutations through a separate branch from
-        standard mutations. Both branches must honour the prior_validation kwarg.
+        standard mutations. Neither branch may trust an unkeyed stale summary.
         """
         state = _empty_state()
         catalog = _mock_catalog()
-        threaded = state.validate()
+        expected = state.validate()
+        threaded = _stale_validation_for(state) if stale else expected
         result = execute_tool(
             "set_source_from_blob",
             {"blob_id": self.blob_id, "on_success": "out", "on_validation_failure": "discard", "options": {"schema": {"mode": "observed"}}},
@@ -548,7 +551,9 @@ class TestBlobTools:
             prior_validation=threaded,
         )
         assert result.success is True
-        assert result.prior_validation is threaded
+        assert result.prior_validation == expected
+        if stale:
+            assert result.prior_validation != threaded
 
     def test_set_source_from_blob_threaded_prior_produces_correct_delta(self) -> None:
         """Threaded and fresh prior_validation produce identical deltas for blob tools."""

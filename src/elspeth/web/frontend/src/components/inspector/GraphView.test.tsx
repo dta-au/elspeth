@@ -561,6 +561,30 @@ describe("GraphView", () => {
     expect(screen.getByText("pending #1")).toBeInTheDocument();
   });
 
+  it("shows configured ADI choices when its node opens before catalog loading", async () => {
+    const user = userEvent.setup();
+    const state = makeState({ nodes: [makeNode({
+      id: "read_document",
+      node_type: "transform",
+      plugin: "azure_document_intelligence",
+      options: {
+        model_id: "prebuilt-layout",
+        source_mode: "base64",
+        schema: { mode: "observed" },
+      },
+    })] });
+    const before = JSON.stringify(state);
+    useSessionStore.setState({ compositionState: state });
+    render(<GraphView />);
+    await user.click(screen.getByTestId("node-read_document"));
+    const panel = screen.getByRole("complementary", { name: "read_document configuration" });
+    expect(within(panel).getByRole("heading", { name: "read_document" })).toBeInTheDocument();
+    for (const value of ["prebuilt-layout", "base64", "Row schema", "observed"]) {
+      expect(within(panel).getByText(value).closest("details")).toBeNull();
+    }
+    expect(JSON.stringify(useSessionStore.getState().compositionState)).toBe(before);
+  });
+
   it("opens a structured plugin configuration panel when a graph node is clicked", async () => {
     const user = userEvent.setup();
     useSessionStore.setState({
@@ -589,8 +613,9 @@ describe("GraphView", () => {
     });
     expect(panel).toBeInTheDocument();
     expect(
-      within(panel).getByRole("heading", { name: /colour_lookup config/i }),
+      within(panel).getByRole("heading", { name: "colour_lookup" }),
     ).toBeInTheDocument();
+    expect(within(panel).queryByRole("heading", { name: "colour_lookup config" })).not.toBeInTheDocument();
     // elspeth-e1c5ad0b53: the panel's type chip is the ui/TypeBadge primitive
     // composing the shared .type-badge-* token classes.
     const typeChip = within(panel).getByText("transform");
@@ -1832,6 +1857,102 @@ describe("GraphView", () => {
       expect(connectionTexts("route_rows to merge_rows:")).toEqual([
         "route_rows to merge_rows: branch_a (success)",
       ]);
+    });
+
+    describe("direct gate fork branches to sinks", () => {
+      function forkSinkState(overrides: Partial<CompositionState> = {}): CompositionState {
+        return makeState({
+          sources: { source: { plugin: "csv", options: {}, on_success: "gate_in" } },
+          nodes: [gate({ routes: { true: "fork", false: "fork" }, fork_to: ["sink_a", "sink_b"] })],
+          outputs: [
+            { name: "sink_a", plugin: "csv", options: {} },
+            { name: "sink_b", plugin: "csv", options: {} },
+          ],
+          edges: [],
+          ...overrides,
+        });
+      }
+
+      it("draws both sink branches without explicit edges and exposes both accessible connections", () => {
+        useSessionStore.setState({ compositionState: forkSinkState() } as never);
+        const { container } = render(<GraphView />);
+        for (const sink of ["sink_a", "sink_b"]) {
+          expect(screen.getByTestId(`node-${sink}`)).toBeInTheDocument();
+          const edges = edgeElements(container, "route_rows", sink);
+          expect(edges).toHaveLength(1);
+          expect(edges[0]).toHaveTextContent(sink);
+        }
+        expect(connectionTexts("route_rows to ")).toEqual([
+          "route_rows to sink_a: sink_a (success)",
+          "route_rows to sink_b: sink_b (success)",
+        ]);
+        expect(container.querySelector('[data-edge-target="fork"]')).toBeNull();
+      });
+
+      it("keeps both fork success arms when failure routes are hidden", async () => {
+        const user = userEvent.setup();
+        useSessionStore.setState({ compositionState: forkSinkState() } as never);
+        const { container } = render(<GraphView />);
+        await user.click(screen.getByRole("button", { name: "Hide quarantine and discard routes" }));
+        expect(edgeElements(container, "route_rows", "sink_a")).toHaveLength(1);
+        expect(edgeElements(container, "route_rows", "sink_b")).toHaveLength(1);
+      });
+
+      it.each([null, "sink_a", "authored fork label"])("keeps an explicit fork edge with label %s without duplicating it", (label) => {
+        useSessionStore.setState({ compositionState: forkSinkState({
+          edges: [makeEdge({ from_node: "route_rows", to_node: "sink_a", edge_type: "fork", label })],
+        }) } as never);
+        const { container } = render(<GraphView />);
+        const stored = edgeElements(container, "route_rows", "sink_a");
+        expect(stored).toHaveLength(1);
+        expect(stored[0]).toHaveTextContent(label ?? "fork");
+        expect(edgeElements(container, "route_rows", "sink_b")).toHaveLength(1);
+      });
+
+      it("retains a distinct direct route and an error route to the same sink", () => {
+        useSessionStore.setState({ compositionState: forkSinkState({ nodes: [gate({
+          routes: { true: "fork", false: "sink_a" }, fork_to: ["sink_a", "sink_b"], on_error: "sink_a",
+        })] }) } as never);
+        const { container } = render(<GraphView />);
+        const edges = edgeElements(container, "route_rows", "sink_a");
+        expect(edges.map((edge) => edge.textContent).sort()).toEqual(["error", "false", "sink_a"]);
+        expectDistinctVisibleLanes(edges);
+        expect(connectionTexts("route_rows to sink_a:")).toEqual([
+          "route_rows to sink_a: error (error)",
+          "route_rows to sink_a: false (success)",
+          "route_rows to sink_a: sink_a (success)",
+        ]);
+      });
+
+      it("does not invent forks without an active fork route", () => {
+        useSessionStore.setState({ compositionState: forkSinkState({ nodes: [gate({
+          routes: { true: "sink_a", false: "sink_b" }, fork_to: ["sink_a", "sink_b"],
+        })] }) } as never);
+        const { container } = render(<GraphView />);
+        expect(edgeElements(container, "route_rows", "sink_a").map((edge) => edge.textContent)).toEqual(["true"]);
+        expect(edgeElements(container, "route_rows", "sink_b").map((edge) => edge.textContent)).toEqual(["false"]);
+      });
+
+      it("renders mixed transform and direct sink branches without treating missing targets as sinks", () => {
+        useSessionStore.setState({ compositionState: forkSinkState({ nodes: [
+          gate({ routes: { true: "fork", false: "fork" }, fork_to: ["branch_rows", "sink_b", "missing"] }),
+          makeNode({ id: "branch_transform", input: "branch_rows", on_success: "sink_a" }),
+        ] }) } as never);
+        const { container } = render(<GraphView />);
+        expect(edgeElements(container, "route_rows", "branch_transform")).toHaveLength(1);
+        expect(edgeElements(container, "route_rows", "sink_b")).toHaveLength(1);
+        expect(edgeElements(container, "route_rows", "sink_a")).toHaveLength(0);
+        expect(container.querySelector('[data-edge-target="missing"]')).toBeNull();
+      });
+
+      it("collapses a direct route only when its full rendered semantics match the fork branch", () => {
+        useSessionStore.setState({ compositionState: forkSinkState({ nodes: [gate({
+          routes: { split: "fork", sink_a: "sink_a" }, fork_to: ["sink_a", "sink_b"],
+        })] }) } as never);
+        const { container } = render(<GraphView />);
+        expect(edgeElements(container, "route_rows", "sink_a")).toHaveLength(1);
+        expect(edgeElements(container, "route_rows", "sink_b")).toHaveLength(1);
+      });
     });
   });
 

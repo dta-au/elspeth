@@ -783,7 +783,7 @@ function NodeConfigPanel({
               (elspeth-e1c5ad0b53). Canvas-drawn badges keep the raw token
               values because React Flow / MiniMap need resolved colours. */}
           <TypeBadge type={config.typeLabel} />
-          <h3>{config.id} config</h3>
+          <h3>{config.id}</h3>
           {config.plugin && (
             /* Human register on the line, the raw catalog id in `title`
                (elspeth-ca456d9d8d) — the config panel names the plugin's
@@ -1915,6 +1915,37 @@ export function GraphView({ onFullscreen }: GraphViewProps = {}) {
             });
             existingConnections.add(semanticKey);
           }
+        }
+      }
+
+      // A fork branch can terminate directly at a named sink. Sinks have no
+      // node.input, so the producer-consumer pass above cannot draw these.
+      // Preserve explicit fork hints (including their authored labels) and
+      // infer only missing branches from the same active-fork authority used
+      // by buildProducerRegistry.
+      if (
+        node.node_type === "gate"
+        && node.routes
+        && Object.values(node.routes).includes("fork")
+        && node.fork_to
+      ) {
+        for (const targetId of node.fork_to) {
+          if (!outputIds.has(targetId)) continue;
+          const semanticKey = edgeSemanticIdentity(node.id, targetId, targetId, "success");
+          const hasExplicitFork = explicitEdges.some((edge) =>
+            edge.edge_type === "fork" && edge.from_node === node.id && edge.to_node === targetId,
+          );
+          if (hasExplicitFork || existingConnections.has(semanticKey)) continue;
+          rfEdges.push({
+            id: inferredSemanticEdgeId("sink", node.id, targetId, targetId, "success"),
+            source: node.id,
+            target: targetId,
+            label: targetId,
+            data: { flowType: "success" },
+            style: { stroke: EDGE_COLORS.normal, strokeWidth: 1.5 },
+            labelStyle: { fontSize: 10, fill: EDGE_LABEL_COLOR },
+          });
+          existingConnections.add(semanticKey);
         }
       }
     }

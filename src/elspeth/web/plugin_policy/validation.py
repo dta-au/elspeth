@@ -13,6 +13,7 @@ from elspeth.contracts.aws_textract import TextractProfiledAuditIdentities, Text
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.plugin_capabilities import ControlMode, WebConfigAuthority
 from elspeth.contracts.trust_boundary import observation_boundary
+from elspeth.core.document_intelligence_config import materialize_document_intelligence_endpoint, validate_document_intelligence_endpoint
 from elspeth.plugins.infrastructure.power_automate import PowerAutomateProtocolError, normalize_allowed_origin
 from elspeth.web.catalog.schemas import PluginKind, PluginSchemaInfo
 from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, SourceSpec, ValidationEntry, ValidationSummary
@@ -43,6 +44,8 @@ class ProfileValidationRegistry(Protocol):
     def public_schema(
         self, plugin_id: PluginId, full_schema: PluginSchemaInfo, *, available_aliases: tuple[str, ...]
     ) -> PluginSchemaInfo: ...
+
+    def default_endpoint_for(self, plugin_id: PluginId) -> str | None: ...
 
     def lower_options(self, plugin_id: PluginId, *, alias: str, safe_options: dict[str, object]) -> LoweredPluginConfig: ...
 
@@ -149,6 +152,49 @@ def _textract_alias_as_bucket_finding(component: _Component, alias_inventory: fr
     return None
 
 
+def _materialize_endpoint_defaults(state: CompositionState, registry: ProfileValidationRegistry | None) -> CompositionState:
+    if registry is None:
+        return state
+    plugin_id = PluginId("transform", "azure_document_intelligence")
+    if not any(node.plugin == plugin_id.name and "endpoint" not in node.options for node in state.nodes):
+        return state
+    endpoint = registry.default_endpoint_for(plugin_id)
+    if endpoint is None:
+        return state
+    nodes = tuple(
+        replace(node, options=materialize_document_intelligence_endpoint(node.options, endpoint))
+        if node.plugin == plugin_id.name and "endpoint" not in node.options
+        else node
+        for node in state.nodes
+    )
+    return replace(state, nodes=nodes)
+
+
+def _document_intelligence_endpoint_findings(state: CompositionState) -> tuple[PluginPolicyFinding, ...]:
+    """Validate effective ADI origins without resolving or selecting credentials."""
+    findings: list[PluginPolicyFinding] = []
+    for node in state.nodes:
+        if node.node_type != "transform" or node.plugin != "azure_document_intelligence":
+            continue
+        endpoint = node.options["endpoint"] if "endpoint" in node.options else None
+        try:
+            if not isinstance(endpoint, str):
+                raise ValueError("endpoint must be a string")
+            validate_document_intelligence_endpoint(endpoint)
+        except ValueError:
+            findings.append(
+                PluginPolicyFinding(
+                    stage="operator_profile_options",
+                    component_id=node.id,
+                    component_type="transform",
+                    error_code="invalid_document_intelligence_endpoint",
+                    message="Azure Document Intelligence requires a valid HTTPS Azure resource endpoint.",
+                    suggestion="Set a valid node endpoint or omit it to use the configured operator endpoint default.",
+                )
+            )
+    return tuple(findings)
+
+
 def validate_plugin_policy(
     state: CompositionState,
     *,
@@ -204,12 +250,13 @@ def validate_plugin_policy(
             finding for component in components if (finding := _textract_alias_as_bucket_finding(component, alias_inventory)) is not None
         )
 
-    executable_state = state
+    executable_state = _materialize_endpoint_defaults(state, profile_registry)
+    findings.extend(_document_intelligence_endpoint_findings(executable_state))
     profiled_s3_audit_identities: S3ProfiledAuditIdentities = ()
     profiled_textract_audit_identities: TextractProfiledAuditIdentities = ()
     if not findings and not snapshot.is_trained_operator:
         executable_state, profile_findings, profiled_s3_audit_identities, profiled_textract_audit_identities = _lower_profiled_components(
-            state,
+            executable_state,
             snapshot=snapshot,
             profile_registry=profile_registry,
             catalog=catalog,
@@ -725,6 +772,20 @@ class ProfileAwareValidationResult:
 _IMMEDIATE_BLOCKING_STAGES: frozenset[PolicyValidationStage] = frozenset({"plugin_enablement", "operator_profile_options"})
 
 
+def project_component_policy(
+    state: CompositionState,
+    *,
+    snapshot: PluginAvailabilitySnapshot,
+    profile_registry: ProfileValidationRegistry | None,
+    catalog: ProfileValidationCatalog,
+) -> PluginPolicyValidationResult:
+    """Project fresh component policy without validating an incomplete graph."""
+    if snapshot.is_trained_operator:
+        executable = _materialize_endpoint_defaults(state, profile_registry)
+        return PluginPolicyValidationResult(executable, _document_intelligence_endpoint_findings(executable))
+    return validate_plugin_policy(state, snapshot=snapshot, profile_registry=profile_registry, catalog=catalog)
+
+
 def validate_authored_composition_state(
     state: CompositionState,
     *,
@@ -736,11 +797,21 @@ def validate_authored_composition_state(
 ) -> ProfileAwareValidationResult:
     """Recheck current policy/lowering and reuse only immutable base analysis."""
     if snapshot.is_trained_operator:
+        projection = project_component_policy(state, snapshot=snapshot, profile_registry=profile_registry, catalog=catalog)
+        executable = projection.executable_state
+        endpoint_findings = projection.findings
+        summary = (
+            ValidationSummary(is_valid=False, errors=tuple(_validation_entry(item, severity="high") for item in endpoint_findings))
+            if endpoint_findings
+            else analysis.validate_raw(executable)
+            if analysis is not None
+            else executable.validate()
+        )
         return ProfileAwareValidationResult(
             authored_state=state,
-            executable_state=state,
-            policy_findings=(),
-            validation=analysis.validate_raw(state) if analysis is not None else state.validate(),
+            executable_state=executable,
+            policy_findings=endpoint_findings,
+            validation=summary,
         )
 
     policy = validate_plugin_policy(

@@ -7655,7 +7655,7 @@ class TestCsvBindGuaranteeRuntimeAgreement:
 
         from elspeth.web.catalog.policy_view import PolicyCatalogView
         from elspeth.web.catalog.protocol import CatalogService as _CatalogService
-        from elspeth.web.catalog.schemas import PluginSummary
+        from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
         from elspeth.web.composer.tools import _execute_create_blob, _execute_set_source_from_blob
         from elspeth.web.composer.tools._common import ToolContext
         from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
@@ -7713,7 +7713,13 @@ class TestCsvBindGuaranteeRuntimeAgreement:
         catalog.list_sources.return_value = [
             PluginSummary(name=name, description=name, plugin_type="source", config_fields=[]) for name in ("csv", "json", "text")
         ]
-        catalog.get_schema.return_value = {"properties": {}}
+        catalog.get_schema.return_value = PluginSchemaInfo(
+            name="csv",
+            plugin_type="source",
+            description="CSV source fixture",
+            json_schema={"properties": {}},
+            knob_schema={"properties": {}},
+        )
         snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
         ctx = ToolContext(
             catalog=PolicyCatalogView.for_trained_operator(catalog, snapshot),

@@ -1346,16 +1346,16 @@ async def test_candidate_prior_validation_runtime_error_uses_plugin_crash_audit_
     failure = RuntimeError("candidate-prior validation private detail")
     snapshot = PluginAvailabilitySnapshot.for_trained_operator(harness.catalog)
     catalog = PolicyCatalogView.for_trained_operator(harness.catalog, snapshot)
-    original_validate = catalog.validate_composition_state
+    original_validate = PolicyCatalogView.validate_composition_state
     armed = False
     llm_calls = 0
     recorded: list[Any] = []
     original_record = BufferingRecorder.record
 
-    def _validate(candidate_state: CompositionState) -> Any:
+    def _validate(view: PolicyCatalogView, candidate_state: CompositionState) -> Any:
         if armed:
             raise failure
-        return original_validate(candidate_state)
+        return original_validate(view, candidate_state)
 
     async def _llm(
         messages: list[dict[str, Any]],
@@ -1380,7 +1380,7 @@ async def test_candidate_prior_validation_runtime_error_uses_plugin_crash_audit_
     with (
         patch.object(harness.service._policy_context, "build", return_value=(snapshot, catalog)),
         patch.object(harness.service._provider_gateway, "_call_llm", new=_llm),
-        patch.object(catalog, "validate_composition_state", side_effect=_validate) as validation,
+        patch.object(PolicyCatalogView, "validate_composition_state", autospec=True, side_effect=_validate) as validation,
         patch("elspeth.web.composer.tool_batch.build_set_pipeline_candidate") as builder,
         patch("elspeth.web.composer.tool_batch.finalize_tool_result") as finalizer,
         patch.object(BufferingRecorder, "record", new=_record),
@@ -1397,6 +1397,8 @@ async def test_candidate_prior_validation_runtime_error_uses_plugin_crash_audit_
 
     assert llm_calls == 1
     assert validation.call_count >= 1
+    assert armed
+    assert any(call.args[0] is not catalog for call in validation.call_args_list)
     assert builder.call_count == 0
     assert finalizer.call_count == 0
     assert exc_info.value.original_exc is failure
@@ -1424,16 +1426,16 @@ async def test_candidate_prior_validation_base_exception_is_audited_once_and_pro
     signal = _PreproposalBaseSignal("candidate-prior shutdown-style private detail")
     snapshot = PluginAvailabilitySnapshot.for_trained_operator(harness.catalog)
     catalog = PolicyCatalogView.for_trained_operator(harness.catalog, snapshot)
-    original_validate = catalog.validate_composition_state
+    original_validate = PolicyCatalogView.validate_composition_state
     armed = False
     llm_calls = 0
     recorded: list[Any] = []
     original_record = BufferingRecorder.record
 
-    def _validate(candidate_state: CompositionState) -> Any:
+    def _validate(view: PolicyCatalogView, candidate_state: CompositionState) -> Any:
         if armed:
             raise signal
-        return original_validate(candidate_state)
+        return original_validate(view, candidate_state)
 
     async def _llm(
         messages: list[dict[str, Any]],
@@ -1458,7 +1460,7 @@ async def test_candidate_prior_validation_base_exception_is_audited_once_and_pro
     with (
         patch.object(harness.service._policy_context, "build", return_value=(snapshot, catalog)),
         patch.object(harness.service._provider_gateway, "_call_llm", new=_llm),
-        patch.object(catalog, "validate_composition_state", side_effect=_validate) as validation,
+        patch.object(PolicyCatalogView, "validate_composition_state", autospec=True, side_effect=_validate) as validation,
         patch("elspeth.web.composer.tool_batch.build_set_pipeline_candidate") as builder,
         patch("elspeth.web.composer.tool_batch.finalize_tool_result") as finalizer,
         patch.object(BufferingRecorder, "record", new=_record),
@@ -1475,6 +1477,8 @@ async def test_candidate_prior_validation_base_exception_is_audited_once_and_pro
 
     assert llm_calls == 1
     assert validation.call_count >= 1
+    assert armed
+    assert any(call.args[0] is not catalog for call in validation.call_args_list)
     assert builder.call_count == 0
     assert finalizer.call_count == 0
     assert exc_info.value is signal

@@ -22,7 +22,9 @@ GRAMMARS = {
     COMPLETE: "4947b18fec56b611b18c552727355de19b281da98f24f27f207e109f27cddd0a",
     FAIL: "722ac4ab6f9aee7a02e7750b20ca7fe9ef5e2113799beb1891fbeac045dc2644",
 }
-NAMESPACE_GRAMMAR = "58e64107f0a28ec8e1f832994517b743e68dd9f2562ec387287dbf9e57614621"
+# Reviewed cohort preparation adds only ordinary deferred method declarations;
+# terminal SQL method bodies and their authority/default guards are unchanged.
+NAMESPACE_GRAMMAR = "55859a8d05bc893904341eb646746fd5613bd1bf3fa4df13dfbb4df065d3591e"
 MASK = inspect.CO_GENERATOR | inspect.CO_COROUTINE | inspect.CO_ASYNC_GENERATOR | inspect.CO_ITERABLE_COROUTINE
 SUPPLIERS = (
     ("RequiredWorkCoordinator", "elspeth.web.required_work", REQUIRED),

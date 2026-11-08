@@ -142,6 +142,10 @@ def build_plugin_snapshot(
             if not aliases:
                 unavailable.append(PluginAvailability(plugin_id, PluginUnavailableReason.PROFILE_UNAVAILABLE))
                 continue
+        endpoint_default = profiles.default_endpoint_for(plugin_id)
+        if endpoint_default is not None:
+            endpoint_generation = hmac.new(generation_key, endpoint_default.encode(), hashlib.sha256).hexdigest()
+            profile_bindings.append((plugin_id, "endpoint-default", "operator", endpoint_generation))
         schema = catalog.get_schema(plugin_id.kind, plugin_id.name)
         if not _schema_secret_ready(schema, principal=principal_scope, inventory=secret_inventory):
             unavailable.append(PluginAvailability(plugin_id, PluginUnavailableReason.CREDENTIAL_MISSING))

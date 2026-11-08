@@ -23,6 +23,18 @@ from elspeth.web.sessions.protocol import RunRecord
 
 
 @dataclass(frozen=True, slots=True)
+class StateValidationAssessment:
+    """One validation occurrence and the fresh policy snapshot it actually used.
+
+    Internal projection input, never execution authorization or a reusable
+    cross-request validation cache entry.
+    """
+
+    validation: ValidationResult
+    plugin_snapshot: PluginAvailabilitySnapshot
+
+
+@dataclass(frozen=True, slots=True)
 class FrozenRunSettings:
     """One run's immutable policy decision and split configuration forms.
 
@@ -110,6 +122,18 @@ class ExecutionService(Protocol):
         Async because the implementation wraps the sync validate_pipeline()
         call via run_in_executor to avoid blocking the event loop.
         """
+        ...
+
+    async def assess_state(
+        self,
+        state: CompositionState,
+        *,
+        session_operation_context: SessionOperationContext,
+        user_id: str | None = None,
+        session_id: UUID | None = None,
+        completion_gates: CompletionGateFacts | None = None,
+    ) -> StateValidationAssessment:
+        """Validate and retain the exact fresh snapshot for adjacent projections."""
         ...
 
     async def validate_state(

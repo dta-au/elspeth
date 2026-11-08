@@ -32,6 +32,7 @@ from elspeth.contracts.auth import AuthProviderType
 from elspeth.contracts.plugin_capabilities import ControlMode, PluginCapability
 from elspeth.contracts.prompt_guard import PromptGuardMode
 from elspeth.core.config import PayloadStoreSettings, RateLimitSettings
+from elspeth.core.document_intelligence_config import validate_document_intelligence_endpoint
 from elspeth.core.llm_profiles import LLMProfileSettings, validate_profile_alias
 from elspeth.core.url_validation import validate_credential_safe_https_url
 from elspeth.plugins.infrastructure.power_automate import normalize_allowed_origin
@@ -247,6 +248,7 @@ class WebSettings(BaseModel):
     # value pins it for a single-process harness.
     instance_id: str | None = None
     deployment_aws_region: str | None = None
+    azure_document_intelligence_endpoint: str | None = None
     # Operator telemetry is deployment policy, not pipeline-authored routing.
     # The AWS destination and headers are intentionally absent from this model:
     # web/operator_telemetry.py fixes them to the task-local collector and the
@@ -821,6 +823,11 @@ class WebSettings(BaseModel):
         if value is not None and not is_compartment_id(value):
             raise ValueError(f"compartment_id must match {COMPARTMENT_ID_PATTERN}")
         return value
+
+    @field_validator("azure_document_intelligence_endpoint")
+    @classmethod
+    def _validate_adi_endpoint(cls, value: str | None) -> str | None:
+        return None if value is None else validate_document_intelligence_endpoint(value)
 
     @field_validator("deployment_aws_region")
     @classmethod

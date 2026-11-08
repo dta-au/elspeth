@@ -210,10 +210,27 @@ class _CallRecorder:
         return self.return_value
 
 
+def _assessment_snapshot():
+    from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+
+    return PluginAvailabilitySnapshot.create(
+        policy_hash="readiness-policy",
+        principal_scope="local:alice",
+        available=frozenset(),
+        unavailable=(),
+        selected=(),
+        usable_profile_aliases=(),
+        selected_profile_aliases=(),
+        binding_generation_fingerprint="readiness-binding",
+    )
+
+
 class _ExecutionServiceDouble:
     def __init__(self, validation_result: ValidationResult) -> None:
+        from elspeth.web.execution.protocol import StateValidationAssessment
+
         self.validate = _AsyncCallRecorder(side_effect=AssertionError("ReadinessService must validate the already-read state"))
-        self.validate_state = _AsyncCallRecorder(return_value=validation_result)
+        self.assess_state = _AsyncCallRecorder(return_value=StateValidationAssessment(validation_result, _assessment_snapshot()))
 
 
 class _ScopedSecretResolverDouble:
@@ -778,13 +795,59 @@ def test_compute_snapshot_validates_already_read_state():
     )
 
     exec_svc.validate.assert_not_awaited()
-    exec_svc.validate_state.assert_awaited_once_with(
+    exec_svc.assess_state.assert_awaited_once_with(
         state,
         user_id="alice",
         session_id=UUID("11111111-1111-1111-1111-111111111111"),
         session_operation_context=_blob_read_context(),
         completion_gates=None,
     )
+
+
+def test_policy_readiness_projects_exact_validation_assessment_snapshot(monkeypatch):
+    from elspeth.web.audit_readiness import service as readiness_module
+    from elspeth.web.dependencies import create_catalog_service
+    from elspeth.web.plugin_policy.models import WebPluginPolicy
+
+    state = _state(transforms=(("t", "passthrough"),))
+    execution = _ExecutionServiceDouble(_OK)
+    assessed = execution.assess_state.return_value
+    policy = WebPluginPolicy.create(
+        required=frozenset(),
+        configured_optional=frozenset(),
+        preferences=(),
+        control_modes=(),
+        plugin_code_identities=(),
+    )
+    seen = []
+    original = readiness_module.build_plugin_policy_readiness
+
+    def project(**kwargs):
+        seen.append(kwargs["snapshot"])
+        return original(**kwargs)
+
+    monkeypatch.setattr(readiness_module, "build_plugin_policy_readiness", project)
+    service = ReadinessService(
+        execution_service=execution,
+        session_service=_make_session_service(),
+        scoped_secret_resolver=_ScopedSecretResolverDouble(()),
+        settings=_SettingsDouble(),
+        state_from_record=lambda _: state,
+        web_plugin_policy=policy,
+        catalog=create_catalog_service(),
+    )
+    snapshot = asyncio.run(
+        service.compute_snapshot(
+            session_id=_TEST_SESSION_ID,
+            user_id="alice",
+            session_operation_context=_blob_read_context(),
+        )
+    )
+    assert seen == [assessed.plugin_snapshot]
+    assert seen[0] is assessed.plugin_snapshot
+    assert snapshot.validation_result is assessed.validation
+    assert snapshot.plugin_policy_readiness is not None
+    assert len(execution.assess_state.calls) == 1
 
 
 def test_compute_snapshot_passes_persisted_completion_gates():
@@ -824,7 +887,7 @@ def test_compute_snapshot_passes_persisted_completion_gates():
         )
     )
 
-    ((args, kwargs),) = exec_svc.validate_state.calls
+    ((args, kwargs),) = exec_svc.assess_state.calls
     assert args == (state,)
     assert kwargs["completion_gates"] == CompletionGateFacts(
         advisor_signoff=AdvisorSignoffGateFact(

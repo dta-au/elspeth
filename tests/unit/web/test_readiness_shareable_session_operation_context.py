@@ -40,7 +40,7 @@ def test_readiness_forwards_its_context_to_validation() -> None:
     calls = [
         call
         for call in ast.walk(node)
-        if isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute) and call.func.attr == "validate_state"
+        if isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute) and call.func.attr == "assess_state"
     ]
     assert len(calls) == 1
     forwarded = next(keyword.value for keyword in calls[0].keywords if keyword.arg == "session_operation_context")

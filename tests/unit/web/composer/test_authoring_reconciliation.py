@@ -6,6 +6,7 @@ import json
 from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
+from types import MappingProxyType
 from unittest.mock import MagicMock
 
 import pytest
@@ -339,9 +340,13 @@ def test_model_choice_review_is_preserved_for_unrelated_drift_and_reopened_for_m
     )
 
     reconciled = reconcile_authoritative_reviews(previous, unrelated)
+    assert reconciled is not unrelated
+    assert reconciled.nodes[0] is not unrelated.nodes[0]
+    assert reconciled.sources["source"] is unrelated.sources["source"]
     carried = reconciled.nodes[0].options[INTERPRETATION_REQUIREMENTS_KEY][0]
     assert carried["status"] == "resolved"
     assert carried["event_id"] == "event-1"
+    assert reconcile_authoritative_reviews(reconciled, reconciled) is reconciled
 
     changed = _state(
         nodes=(
@@ -1427,3 +1432,28 @@ def test_set_pipeline_accepts_wired_pending_vague_term() -> None:
     result = _execute_set_pipeline(deep_thaw(_exact_arguments(wired).data), wired, _trained_context())
 
     assert result.success, result.data
+
+
+def test_unchanged_reconciliation_reuses_owned_state_without_retaining_input_aliases() -> None:
+    node_input = {"schema": {"mode": "observed"}, "fields": ["original"]}
+    source_input = {"path": "rows.csv", "schema": {"mode": "observed"}}
+    node = replace(_node(plugin="passthrough"), options=MappingProxyType(node_input))
+    state = _state(nodes=(node,))
+    source = replace(state.sources["source"], options=MappingProxyType(source_input))
+    state = replace(state, sources={"source": source})
+    expected = state.to_dict()
+
+    # A proxy is a read-only view, not ownership. The nominal constructors
+    # must already have detached both the outer mapping and nested inputs.
+    node_input["fields"].append("external edit")
+    source_input["schema"]["mode"] = "fixed"
+    reconciled = reconcile_authoritative_reviews(state, state)
+    assert reconciled is state
+    assert reconciled.nodes[0] is node
+    assert reconciled.sources["source"] is source
+    assert reconciled.to_dict() == expected
+
+    with pytest.raises(TypeError):
+        reconciled.nodes[0].options["schema"]["mode"] = "fixed"
+    with pytest.raises(TypeError):
+        reconciled.sources["source"].options["path"] = "other.csv"

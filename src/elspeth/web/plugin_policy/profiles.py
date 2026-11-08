@@ -209,6 +209,7 @@ class RuntimeWebPluginConfig:
     aws_textract_profiles: tuple[AWSTextractProfileSettings, ...] = field(repr=False)
     azure_search_profiles: tuple[AzureSearchProfileSettings, ...] = field(repr=False)
     deployment_aws_region: str | None
+    azure_document_intelligence_endpoint: str | None = None
 
     @property
     def operator_profiles(self) -> tuple[BedrockGuardrailProfileSettings, ...]:
@@ -235,6 +236,7 @@ class RuntimeWebPluginConfig:
             aws_textract_profiles=tuple(sorted(settings.aws_textract_profiles, key=lambda profile: profile.alias)),
             azure_search_profiles=tuple(sorted(settings.azure_search_profiles, key=lambda profile: profile.alias)),
             deployment_aws_region=settings.deployment_aws_region,
+            azure_document_intelligence_endpoint=settings.azure_document_intelligence_endpoint,
         )
 
 
@@ -1542,6 +1544,7 @@ class OperatorProfileRegistry:
         # Process-local identity for this immutable policy/config binding.
         # It contains no profile values and cannot be reused like id(self).
         self._generation = next(_PROFILE_REGISTRY_GENERATIONS)
+        self._adi_endpoint = settings.azure_document_intelligence_endpoint
         llm_transform_resolver = _LLMProfileResolver(
             settings.llm_profiles,
             preferred_alias=settings.default_llm_profile,
@@ -1585,6 +1588,11 @@ class OperatorProfileRegistry:
         if settings.azure_search_profiles:
             self._resolvers[PluginId("transform", "azure_ai_search")] = _AzureSearchProfileResolver(settings.azure_search_profiles)
 
+    def default_endpoint_for(self, plugin_id: PluginId) -> str | None:
+        if plugin_id.kind == "transform" and plugin_id.name == "azure_document_intelligence":
+            return self._adi_endpoint
+        return None
+
     @property
     def generation(self) -> int:
         """Non-secret revision for one frozen registry construction."""
@@ -1597,6 +1605,18 @@ class OperatorProfileRegistry:
         *,
         available_aliases: tuple[str, ...],
     ) -> PluginSchemaInfo:
+        endpoint = self.default_endpoint_for(plugin_id)
+        if endpoint is not None:
+            schema = deepcopy(full_schema.json_schema)
+            # Exact built-in ADI schema, never an arbitrary profile alias.
+            schema["properties"]["endpoint"]["default"] = endpoint
+            schema["required"] = [name for name in schema["required"] if name != "endpoint"]
+            knobs = deepcopy(full_schema.knob_schema)
+            for knob in knobs["fields"]:
+                if knob["name"] == "endpoint":
+                    knob["required"] = False
+                    knob["default"] = endpoint
+            return full_schema.model_copy(update={"json_schema": schema, "knob_schema": knobs})
         if plugin_id not in self._resolvers:
             return full_schema
         return self._resolvers[plugin_id].public_schema(full_schema, available_aliases)
@@ -1613,6 +1633,16 @@ class OperatorProfileRegistry:
         from elspeth.web.catalog.schema_parse import SchemaObject
         from elspeth.web.catalog.schemas import ConfigFieldSummary
 
+        endpoint = self.default_endpoint_for(plugin_id)
+        if endpoint is not None:
+            return full_summary.model_copy(
+                update={
+                    "config_fields": [
+                        item.model_copy(update={"required": False, "default": endpoint}) if item.name == "endpoint" else item
+                        for item in full_summary.config_fields
+                    ]
+                }
+            )
         if plugin_id not in self._resolvers:
             return full_summary
         resolver = self._resolvers[plugin_id]

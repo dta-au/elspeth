@@ -1,6 +1,7 @@
 """Fast prerequisites and adversarial controls for the expensive reserve proof."""
 
 import ast
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -106,6 +107,53 @@ def test_retained_failure_supplier_roots_allow_unchanged_sibling_imports() -> No
         (*_retained_transfer_units(), sibling), fencing._reserve_RETAINED_FAILURE_ORIGINS
     )
     assert not any(sibling.path in failure for failure in failures), failures
+
+
+def test_dispatch_projection_source_guard_refuses_changed_domain_admission() -> None:
+    path = "src/elspeth/web/sessions/dispatch_evidence.py"
+    sources = {item: (ROOT / item).read_text() for item in fencing._reserve_FULL_SOURCE_PATHS}
+    assert fencing._reserve_full_source_failures(sources) == []
+    guard = fencing._reserve_full_source_guards()[path]
+    assert set(guard["protected_exports"]) == {"read_dispatch_envelopes", "_PipelineDispatchEvidenceRead"}
+    tree = ast.parse(sources[path])
+    domain = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_is_jsonb_domain_error")
+    domain.body = [ast.Return(value=ast.Constant(value=True))]
+    sources[path] = ast.unparse(tree)
+    assert fencing._reserve_full_source_failures(sources) == ["full source changed " + path]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "reader.read_dispatch_envelopes = foreign\n",
+        "reader.read_dispatch_envelopes.__code__ = foreign.__code__\n",
+        "reader._PipelineDispatchEvidenceRead.envelopes_for = foreign\n",
+    ),
+)
+def test_dispatch_projection_supplier_refuses_sibling_rebinding(mutation: str) -> None:
+    source = "src/elspeth/web/sessions/dispatch_evidence.py"
+    prefix = "from elspeth.web.sessions import dispatch_evidence as reader\n"
+    origins = frozenset(
+        "elspeth.web.sessions.dispatch_evidence." + name for name in fencing._reserve_full_source_guards()[source]["protected_exports"]
+    )
+    # This shared scanner also verifies the retained recovery-cell producers;
+    # supply their real defining units rather than weakening the empty-error
+    # positive control to ignore missing prerequisites.
+    units = _source_units(
+        (
+            source,
+            "src/elspeth/web/async_workers.py",
+            "src/elspeth/web/app.py",
+            "src/elspeth/web/application_finalizers.py",
+            "src/elspeth/web/process_recovery.py",
+            "src/elspeth/web/coordination/repository.py",
+        )
+    )
+    normal = fencing._parse_source("src/elspeth/dispatch_projection_control.py", prefix + "def harmless():\n return 1\n")
+    assert fencing._reserve_selected_origin_effect_failures((*units, normal), origins) == []
+    changed = fencing._parse_source(normal.path, prefix + "def corrupt():\n" + textwrap.indent(mutation, " "))
+    failures = fencing._reserve_selected_origin_effect_failures((*units, changed), origins)
+    assert any(changed.path in failure for failure in failures), failures
 
 
 @pytest.mark.parametrize(
@@ -299,6 +347,17 @@ def test_reviewed_source_guard_matches_live_source_and_refuses_changed_bytes(pat
     function.body.insert(0, ast.parse("unreviewed_effect()\n").body[0])
     sources[path] = ast.unparse(tree)
     assert check(sources) == [expected]
+
+
+def test_manifest_source_reader_recipe_refuses_skipped_live_lookup() -> None:
+    path = "src/elspeth/contracts/runtime_val_manifest.py"
+    units = fencing._production_units()
+    assert fencing._reserve_recipe_failures(units) == []
+    changed = tuple(fencing._parse_source(item.path, item.source) if item.path == path else item for item in units)
+    unit = next(item for item in changed if item.path == path)
+    reader = fencing._reserve_node_at(unit, "_class_source")
+    reader.body = [ast.Return(value=ast.Constant(value="stale cached source"))]
+    assert fencing._reserve_recipe_failures(changed) == ["writer target/field recipe changed " + path + ":__closed_namespace_readers__"]
 
 
 @pytest.mark.parametrize(
@@ -948,3 +1007,72 @@ def test_provider_mint_callable_escape_remains_an_unclosed_common_premise() -> N
         if isinstance(node, ast.Name) and node.id == "ProviderInvocationOwner" and isinstance(node.ctx, ast.Load)
     )
     assert (carrier.path, id(escaped)) in receipt["unclosed_callable_carriers"]
+
+
+@pytest.mark.parametrize(
+    "path,original,replacement",
+    (
+        (
+            terminal.WORKERS,
+            "concurrent_future.add_done_callback(lambda _future: on_complete())",
+            "on_complete()",
+        ),
+        (
+            terminal.WORKERS,
+            "return await run_joined_sync_in_worker(func, *args, **kwargs)",
+            "return await run_sync_in_worker(func, *args, **kwargs)",
+        ),
+        (
+            terminal.SERVICE,
+            "with self._retire_composer_session(str(session_id)):",
+            "with contextlib.nullcontext():",
+        ),
+        (
+            terminal.SERVICE,
+            "await self._archive_session_attempt(session_id)",
+            "await self._archive_session_attempt(UUID(int=0))",
+        ),
+    ),
+)
+def test_cache_lifecycle_full_source_guards_refuse_unreviewed_changes(path: str, original: str, replacement: str) -> None:
+    sources = {item: (ROOT / item).read_text() for item in fencing._reserve_FULL_SOURCE_PATHS}
+    assert fencing._reserve_full_source_failures(sources) == []
+    assert sources[path].count(original) == 1
+    sources[path] = sources[path].replace(original, replacement)
+    assert fencing._reserve_full_source_failures(sources) == ["full source changed " + path]
+
+
+@pytest.mark.parametrize("fault", ("foreign_registry", "omit_registry", "extra_keyword"))
+def test_cache_registry_constructor_transfer_keeps_exact_producer(fault: str) -> None:
+    units = _source_units((receiver.APP, receiver.DTO, receiver.TURN, receiver.SERVICE))
+    assert receiver.composer_receiver_local_contracts(units)[0] == []
+    app = receiver.find(units[0].tree, "_create_app")
+    calls = [node for node in ast.walk(app) if isinstance(node, ast.Call) and receiver.name(node.func, "ComposerServiceImpl")]
+    assert len(calls) == 1
+    call = calls[0]
+    keyword = next(item for item in call.keywords if item.arg == "session_cache_registry")
+    if fault == "foreign_registry":
+        keyword.value = ast.Name(id="foreign_registry", ctx=ast.Load())
+        expected = "Composer receiver: constructor argument producer identity"
+    elif fault == "omit_registry":
+        call.keywords.remove(keyword)
+        expected = "Composer receiver: concrete service constructor and complete keyword transfers"
+    else:
+        call.keywords.append(ast.keyword(arg="foreign_override", value=ast.Constant(value=True)))
+        expected = "Composer receiver: concrete service constructor and complete keyword transfers"
+    assert expected in receiver.composer_receiver_local_contracts(units)[0]
+
+
+@pytest.mark.parametrize(
+    "original,replacement", (("cache_lease.close()", "None"), ("ComposerAnalysis(cache_lease.cache)", "ComposerAnalysis(None)"))
+)
+def test_cache_owned_compose_grammar_refuses_lifetime_or_owner_drift(original: str, replacement: str) -> None:
+    units = _source_units(tuple(compose._METHOD_PATHS))
+    assert compose.compose_proposal_local_transfers(units)[0] == []
+    source = next(unit for unit in units if unit.path == compose.SERVICE)
+    assert source.source.count(original) == 1
+    changed = fencing._parse_source(source.path, source.source.replace(original, replacement))
+    changed_units = tuple(changed if unit.path == source.path else unit for unit in units)
+    assert compose.compose_proposal_local_transfers(changed_units)[0] == [
+        "composer complete executed method grammar changed " + compose.SERVICE
+    ]

@@ -361,6 +361,30 @@ def restore_execution_envelope(
         payload = _EnvelopePayload.model_validate_json(serialized)
     except ValidationError:
         raise ExecutionEnvelopeRefused(EnvelopeRecoveryReason.INVALID_ENVELOPE) from None
+    return _restore_execution_payload(
+        payload,
+        current_snapshot=current_snapshot,
+        user_id=user_id,
+        auth_provider_type=auth_provider_type,
+        resolver=resolver,
+        implementation_fingerprint=implementation_fingerprint,
+        deployment_generation=deployment_generation,
+        blob_verifier=blob_verifier,
+    )
+
+
+def _restore_execution_payload(
+    payload: _EnvelopePayload,
+    *,
+    current_snapshot: PluginAvailabilitySnapshot,
+    user_id: str | None,
+    auth_provider_type: str | None,
+    resolver: WebSecretResolver | None,
+    implementation_fingerprint: str,
+    deployment_generation: str,
+    blob_verifier: Callable[[RetainedBlobInput], None] | None,
+) -> RestoredExecutionEnvelope:
+    """Re-admit authority using a private payload owned by this invocation."""
     admitted = payload.plugin_snapshot
     if (payload.user_id, payload.auth_provider_type) != (
         user_id,
@@ -552,11 +576,25 @@ def build_run_execution_input(
     Engine checkpoint topology remains independently verified against the
     instantiated ExecutionGraph by the engine's normal resume admission.
     """
+
+    payload = _EnvelopePayload.model_validate_json(envelope.to_json())
+    return _build_run_execution_input_from_payload(
+        envelope, payload, frozen, implementation_fingerprint, deployment_generation, retained_inputs
+    )
+
+
+def _build_run_execution_input_from_payload(
+    envelope: ExecutionEnvelope,
+    payload: _EnvelopePayload,
+    frozen: FrozenRunSettings,
+    implementation_fingerprint: str,
+    deployment_generation: str,
+    retained_inputs: tuple[RetainedRunInput, ...],
+) -> RunExecutionInput:
     from elspeth.core.landscape.schema import SQLITE_SCHEMA_EPOCH
     from elspeth.web.coordination.contracts import WEB_COORDINATION_PROTOCOL_VERSION
     from elspeth.web.sessions.models import SESSION_SCHEMA_EPOCH
 
-    payload = _EnvelopePayload.model_validate_json(envelope.to_json())
     if (
         payload.executable_config != deep_thaw(frozen.executable_config)
         or payload.audit_safe_config != deep_thaw(frozen.audit_safe_config)
@@ -600,6 +638,11 @@ def build_run_execution_input(
 
 def validate_run_execution_input(execution_input: RunExecutionInput) -> None:
     """Verify the persisted admission identities against this worker before use."""
+    _validated_run_execution_payload(execution_input)
+
+
+def _validated_run_execution_payload(execution_input: RunExecutionInput) -> _EnvelopePayload:
+    """Decode once and retain all persisted-boundary checks for this invocation."""
     from elspeth.core.landscape.schema import SQLITE_SCHEMA_EPOCH
     from elspeth.web.coordination.contracts import WEB_COORDINATION_PROTOCOL_VERSION
     from elspeth.web.sessions.models import SESSION_SCHEMA_EPOCH
@@ -629,8 +672,9 @@ def validate_run_execution_input(execution_input: RunExecutionInput) -> None:
         profiled_s3_audit_identities=payload.profiled_s3_audit_identities,
         profiled_textract_audit_identities=payload.profiled_textract_audit_identities,
     )
-    expected = build_run_execution_input(
+    expected = _build_run_execution_input_from_payload(
         envelope,
+        payload,
         frozen,
         payload.implementation_fingerprint,
         payload.deployment_generation,
@@ -638,3 +682,43 @@ def validate_run_execution_input(execution_input: RunExecutionInput) -> None:
     )
     if execution_input != expected:
         raise ExecutionEnvelopeRefused(EnvelopeRecoveryReason.INVALID_ENVELOPE)
+    return payload
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionRecoveryAuthority:
+    """Fresh deployment and principal policy context for one recovery attempt."""
+
+    snapshot: PluginAvailabilitySnapshot
+    implementation_fingerprint: str
+    deployment_generation: str
+
+
+def restore_run_execution_input(
+    execution_input: RunExecutionInput,
+    *,
+    current_authority: Callable[[], ExecutionRecoveryAuthority],
+    user_id: str | None,
+    auth_provider_type: str | None,
+    resolver: WebSecretResolver | None,
+    blob_verifier: Callable[[RetainedBlobInput], None] | None = None,
+) -> RestoredExecutionEnvelope:
+    """Validate and re-admit one recovery input without exposing parsed state.
+
+    The Pydantic payload contains nested mutable dictionaries despite its
+    frozen model. Keep it private to this synchronous invocation: no cache,
+    shared carrier, or await separates validation from restoration. Public
+    standalone entry points continue to admit their own raw inputs.
+    """
+    payload = _validated_run_execution_payload(execution_input)
+    authority = current_authority()
+    return _restore_execution_payload(
+        payload,
+        current_snapshot=authority.snapshot,
+        user_id=user_id,
+        auth_provider_type=auth_provider_type,
+        resolver=resolver,
+        implementation_fingerprint=authority.implementation_fingerprint,
+        deployment_generation=authority.deployment_generation,
+        blob_verifier=blob_verifier,
+    )

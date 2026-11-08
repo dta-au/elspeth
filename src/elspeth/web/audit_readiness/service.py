@@ -34,6 +34,7 @@ from elspeth.web.audit_readiness.models import (
 from elspeth.web.catalog.schemas import PluginKind
 from elspeth.web.composer.state import CompositionState, NodeType
 from elspeth.web.execution.completion_gates import CompletionGateFacts, advisor_signoff_check_failed, parse_completion_gates
+from elspeth.web.execution.protocol import StateValidationAssessment
 from elspeth.web.execution.schemas import (
     CHECK_OUTCOME_SECRET_REFS_NO_REFS,
     CHECK_OUTCOME_SECRET_REFS_RESOLVED,
@@ -455,7 +456,7 @@ class CompositionStateNotFoundError(LookupError):
 
 
 class _ExecutionServiceLike(Protocol):
-    async def validate_state(
+    async def assess_state(
         self,
         state: CompositionState,
         *,
@@ -463,7 +464,7 @@ class _ExecutionServiceLike(Protocol):
         session_id: UUID | None = None,
         session_operation_context: SessionOperationContext,
         completion_gates: CompletionGateFacts | None = None,
-    ) -> ValidationResult: ...
+    ) -> StateValidationAssessment: ...
 
 
 class _SessionServiceLike(Protocol):
@@ -513,7 +514,6 @@ class ReadinessService:
         settings: _SettingsLike,
         state_from_record: Callable[..., CompositionState] | None = None,
         web_plugin_policy: WebPluginPolicy | None = None,
-        plugin_snapshot_factory: Callable[[str], PluginAvailabilitySnapshot] | None = None,
         operator_profile_registry: OperatorProfileRegistry | None = None,
         catalog: CatalogService | None = None,
         tutorial_profile: str | None = None,
@@ -523,7 +523,6 @@ class ReadinessService:
         self._scoped_secret_resolver = scoped_secret_resolver
         self._settings = settings
         self._web_plugin_policy = web_plugin_policy
-        self._plugin_snapshot_factory = plugin_snapshot_factory
         self._operator_profile_registry = operator_profile_registry
         self._catalog = catalog
         self._tutorial_profile = tutorial_profile
@@ -557,13 +556,14 @@ class ReadinessService:
         # ride the record's composer_meta; the graph recompute below cannot
         # rediscover them, so they are threaded into validate_state and merged
         # into the readiness this snapshot reports.
-        validation = await self._execution_service.validate_state(
+        assessment = await self._execution_service.assess_state(
             state,
             user_id=user_id,
             session_id=session_id,
             session_operation_context=session_operation_context,
             completion_gates=parse_completion_gates(record.composer_meta),
         )
+        validation = assessment.validation
         # Pre-fetch interpretation-event signal for the llm_interpretations
         # row. Two separate reads because:
         #
@@ -613,12 +613,12 @@ class ReadinessService:
             _build_secrets_row(validation),
         )
         policy_readiness = None
-        if self._web_plugin_policy is not None and self._plugin_snapshot_factory is not None:
+        if self._web_plugin_policy is not None:
             if self._catalog is None:
                 raise RuntimeError("Plugin-policy readiness has no authoritative catalog")
             policy_readiness = build_plugin_policy_readiness(
                 policy=self._web_plugin_policy,
-                snapshot=self._plugin_snapshot_factory(user_id),
+                snapshot=assessment.plugin_snapshot,
                 tutorial_profile=self._tutorial_profile,
                 tutorial_state=_tutorial_candidate(state),
                 profile_registry=self._operator_profile_registry,

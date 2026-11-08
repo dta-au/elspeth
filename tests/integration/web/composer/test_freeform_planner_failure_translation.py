@@ -39,6 +39,7 @@ from elspeth.web.composer.diagnostic_evidence import ComposerDiagnosticEvidence,
 from elspeth.web.composer.pipeline_planner import _PROSE_NUDGE_BUDGET
 from elspeth.web.composer.progress import ComposerProgressRegistry
 from elspeth.web.composer.service import ComposerAvailability, ComposerServiceImpl
+from elspeth.web.composer.session_cache import ComposerSessionCacheRegistry
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.config import WebSettings
 from elspeth.web.dependencies import create_catalog_service
@@ -232,10 +233,12 @@ def _build_app(
     initialize_session_schema(engine)
     with engine.begin() as conn:
         ensure_test_identity(conn, identity_id="alice")
+    session_caches = ComposerSessionCacheRegistry()
     sessions = FencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test.freeform.planner.failure"),
+        retire_composer_session=session_caches.retire_session,
     )
 
     settings = WebSettings(
@@ -270,6 +273,7 @@ def _build_app(
         settings,
         sessions_service=sessions,
         session_engine=engine,
+        session_cache_registry=session_caches,
     )
 
     app = FastAPI()
@@ -285,6 +289,7 @@ def _build_app(
     app.state.scoped_secret_resolver = None
     app.state.settings = settings
     app.state.composer_service = composer
+    app.state.composer_session_cache_registry = session_caches
     app.state.interpretation_surfacing = composer._interpretation_surfacing
     app.state.rate_limiter = ComposerRateLimiter(limit=100)
     app.state.catalog_service = create_catalog_service()
@@ -332,6 +337,7 @@ def _build_app(
             settings,
             sessions_service=sessions,
             session_engine=engine,
+            session_cache_registry=session_caches,
             plugin_snapshot_factory=app.state.plugin_snapshot_factory.for_user_id,
             operator_profile_registry=app.state.operator_profile_registry,
         )

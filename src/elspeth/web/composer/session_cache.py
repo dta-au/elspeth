@@ -20,6 +20,7 @@ from threading import RLock
 from typing import TYPE_CHECKING
 
 from elspeth.web.async_workers import run_joined_sync_in_worker, run_sync_in_worker
+from elspeth.web.composer import session_cache_telemetry as telemetry
 from elspeth.web.composer._response_json import FrozenResponseJSON, encode_response_json, parse_frozen_response_json
 from elspeth.web.composer.discovery_cache import CachedDiscoveryPayload
 from elspeth.web.composer.state import ValidationSummary
@@ -153,6 +154,7 @@ class CacheStatistics:
     misses: int
     joins: int
     bypasses: int
+    evictions: int = 0
 
 
 def discovery_weight_bytes(payload: CachedDiscoveryPayload) -> int:
@@ -223,11 +225,13 @@ class WeightedMemo[K: Hashable, V](_Evictable):
         self,
         owner: ComposerSessionCache,
         max_entries: int,
+        namespace: telemetry.MemoNamespace,
         *,
         admit: Callable[[V], bool] | None = None,
         prepare: Callable[[V], V] | None = None,
     ) -> None:
         self._owner = owner
+        self._namespace = namespace
         self._max_entries = max_entries
         self._admit = admit
         self._prepare = prepare
@@ -248,6 +252,8 @@ class WeightedMemo[K: Hashable, V](_Evictable):
             return False
         _, entry = self._entries.popitem(last=False)
         self._owner._adjust_weight(-entry.weight)
+        self._owner._registry._evictions += 1
+        telemetry.record_eviction(self._namespace)
         return True
 
     def clear(self) -> None:
@@ -275,19 +281,23 @@ class WeightedMemo[K: Hashable, V](_Evictable):
                     self._entries.move_to_end(key)
                     owner._touch()
                     registry._hits += 1
+                    telemetry.record_lookup(self._namespace, "hit")
                     return MemoResult(entry.value, MemoSource.HIT)
                 pending = self._pending.get(key)
                 if pending is not None:
                     registry._joins += 1
+                    telemetry.record_lookup(self._namespace, "join")
                     owner._pins += 1
                 elif len(self._pending) < registry.limits.pending_entries and registry._reserve(owner, reservation):
                     pending = Future()
                     self._pending[key] = pending
                     owner._pins += 1
                     registry._misses += 1
+                    telemetry.record_lookup(self._namespace, "miss")
                     producer = True
             if pending is None:
                 registry._bypasses += 1
+                telemetry.record_lookup(self._namespace, "bypass")
         if pending is None:
             return MemoResult(compute(), MemoSource.BYPASS)
         try:
@@ -343,14 +353,17 @@ class WeightedMemo[K: Hashable, V](_Evictable):
                     self._entries.move_to_end(key)
                     owner._touch()
                     registry._hits += 1
+                    telemetry.record_lookup(self._namespace, "hit")
                     return MemoResult(entry.value, MemoSource.HIT)
                 running = self._pending.get(key)
                 if running is not None:
                     registry._joins += 1
+                    telemetry.record_lookup(self._namespace, "join")
                 else:
                     queued = self._queued.get(key)
                     if queued is not None:
                         registry._joins += 1
+                        telemetry.record_lookup(self._namespace, "join")
                         joined_queue = True
                     elif (
                         len(registry._jobs) < registry.limits.queued_jobs
@@ -365,6 +378,7 @@ class WeightedMemo[K: Hashable, V](_Evictable):
                         task.add_done_callback(lambda done: self._job_done(key, done))
             if running is None and queued is None:
                 registry._bypasses += 1
+                telemetry.record_lookup(self._namespace, "bypass")
         if running is not None:
             return MemoResult(await _shield_outcome(running), MemoSource.JOIN)
         if queued is not None:
@@ -429,12 +443,12 @@ class ComposerSessionCache:
         self._retired = False
         self._last_used = registry._clock()
         limits = registry.limits
-        self.validations: WeightedMemo[ValidationKey, ValidationSummary] = WeightedMemo(self, limits.validation_entries)
+        self.validations: WeightedMemo[ValidationKey, ValidationSummary] = WeightedMemo(self, limits.validation_entries, "validation")
         self.discovery: WeightedMemo[DiscoveryKey, CachedDiscoveryPayload] = WeightedMemo(
-            self, limits.discovery_entries, admit=_admitted_discovery
+            self, limits.discovery_entries, "discovery", admit=_admitted_discovery
         )
         self.projections: WeightedMemo[ProjectionKey, FrozenResponseJSON] = WeightedMemo(
-            self, limits.projection_entries, prepare=parse_frozen_response_json
+            self, limits.projection_entries, "projection", prepare=parse_frozen_response_json
         )
         self._memos: tuple[_Evictable, ...] = (self.validations, self.discovery, self.projections)
         self._schema_revision = ""
@@ -599,7 +613,8 @@ class ComposerSessionCacheRegistry:
         self._retirement_overflow = 0
         self._weight = 0
         self._closing = False
-        self._hits = self._misses = self._joins = self._bypasses = 0
+        self._hits = self._misses = self._joins = self._bypasses = self._evictions = 0
+        telemetry.register(self)
 
     def _dispose_if_drained(self, owner: ComposerSessionCache) -> None:
         if owner._retired and owner._borrows == 0 and owner._pins == 0:
@@ -643,6 +658,7 @@ class ComposerSessionCacheRegistry:
         with self._lock:
             if key is None or self._closing or self._retirement_overflow or key.session_id in self._retirements:
                 self._bypasses += 1
+                telemetry.record_lookup("owner", "bypass")
                 return SessionCacheLease(None)
             while self._evict_idle(expired_only=True):
                 pass
@@ -653,14 +669,17 @@ class ComposerSessionCacheRegistry:
                 # The bounded owner set prevents two owners for the same key.
                 if any(retained.key == key for retained in self._owners):
                     self._bypasses += 1
+                    telemetry.record_lookup("owner", "bypass")
                     return SessionCacheLease(None)
                 weight = 512 + 4 * (len(key.principal_scope) + len(key.session_id))
                 while len(self._owners) >= self.limits.max_sessions or self._weight + weight > self.limits.total_weight_bytes:
                     if not self._evict_idle(expired_only=False):
                         self._bypasses += 1
+                        telemetry.record_lookup("owner", "bypass")
                         return SessionCacheLease(None)
                 if weight > self.limits.session_weight_bytes or weight > self.limits.entry_weight_bytes:
                     self._bypasses += 1
+                    telemetry.record_lookup("owner", "bypass")
                     return SessionCacheLease(None)
                 owner = ComposerSessionCache(self, key, weight)
                 self._active[key] = owner
@@ -719,4 +738,5 @@ class ComposerSessionCacheRegistry:
                 self._misses,
                 self._joins,
                 self._bypasses,
+                self._evictions,
             )

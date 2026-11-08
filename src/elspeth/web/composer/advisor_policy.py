@@ -58,6 +58,7 @@ _ADVISOR_SIGNOFF_BLOCKED_CODE: Final[str] = ADVISOR_SIGNOFF_BLOCKED_CODE
 # result names a stable check the UI/audit can key on.
 _ADVISOR_SIGNOFF_BLOCKED_CHECK_NAME: Final[ValidationCheckName] = CHECK_ADVISOR_SIGNOFF
 ADVISOR_UNAVAILABLE_USER_DETAIL: Final[str] = "advisor model was unavailable"
+ADVISOR_TIMEOUT_USER_DETAIL: Final[str] = "the advisor review timed out before returning a verdict"
 # Fixed user-facing detail for a MALFORMED advisor failure (parse/shape error, or
 # any unclassified exception). Like the unavailable detail it carries NO provider
 # SDK text, exception class name, message, URL, or credential — the raw exception
@@ -503,6 +504,11 @@ def advisor_signoff_blocked_wording(
         return (
             rejection.public_detail,
             "An unchanged rejected request will not be retried automatically. Review the rejection reason before sending another message.",
+        )
+    if reason == "timeout":
+        return (
+            "The advisor review timed out before returning a verdict; the Composer cannot mark this turn complete.",
+            "Send another message to retry the review. Validation and the advisory review run again on your next message.",
         )
     if reason == "unavailable":
         return (

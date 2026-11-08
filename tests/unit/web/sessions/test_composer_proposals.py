@@ -4,6 +4,7 @@ import asyncio
 import threading
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
@@ -613,6 +614,44 @@ async def _create_coalesce_proposal(service, session_id: UUID, pipeline: dict[st
             composer_provider="provider",
             session_operation_context=context,
         )
+
+
+@pytest.mark.asyncio
+async def test_verified_public_payload_digest_is_reused_only_for_the_same_immutable_authority(service, monkeypatch) -> None:
+    from elspeth.web.sessions import proposal_decoder
+
+    session_id = uuid4()
+    with service._engine.begin() as conn:
+        _insert_session(conn, str(session_id))
+    row = await _create_coalesce_proposal(service, session_id, _coalesce_pipeline(("a", "b", "c")))
+    original = proposal_decoder._pipeline_audit_payload_hash
+    calls = 0
+
+    def counted(**kwargs):
+        nonlocal calls
+        calls += 1
+        return original(**kwargs)
+
+    monkeypatch.setattr(proposal_decoder, "_pipeline_audit_payload_hash", counted)
+    authority = await service.get_authoritative_pipeline_proposal(session_id=session_id, proposal_id=row.id)
+    assert calls == 1  # verification and all same-read metadata projections
+    for _ in range(3):
+        assert proposal_decoder._pipeline_public_metadata(authority) == authority.row.pipeline_metadata
+    assert calls == 1
+    # A new read must verify anew; this memo never indexes by proposal id.
+    await service.get_authoritative_pipeline_proposal(session_id=session_id, proposal_id=row.id)
+    assert calls == 2
+    changed = replace(authority, row=replace(authority.row, summary="Changed public summary"))
+    assert changed._audit_payload_hash_memo is None
+    changed_metadata = proposal_decoder._pipeline_public_metadata(changed)
+    assert calls == 3
+    assert changed_metadata.audit_payload_hash != authority.row.pipeline_metadata.audit_payload_hash
+    # A verified projection never makes a later corrupted stored commitment valid.
+    with service._engine.begin() as conn:
+        conn.execute(update(composition_proposals_table).where(composition_proposals_table.c.id == str(row.id)).values(summary="Tampered"))
+    with pytest.raises(AuditIntegrityError, match="audit payload binding mismatch"):
+        await service.get_authoritative_pipeline_proposal(session_id=session_id, proposal_id=row.id)
+    assert calls == 4
 
 
 @pytest.mark.asyncio

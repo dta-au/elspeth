@@ -44,6 +44,7 @@ from elspeth.contracts.sink import FAILSINK_ELIGIBLE_PLUGIN_TEXT
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.core import dynaconf_normalization, template_materialization
 from elspeth.core.dependency_config import CollectionProbeConfig, CommencementGateConfig, DependencyConfig
+from elspeth.core.document_intelligence_config import materialize_document_intelligence_endpoint, validate_document_intelligence_endpoint
 from elspeth.core.llm_profiles import (
     LLM_PROFILE_PRIVATE_FIELDS,
     LLMProfileSettings,
@@ -2091,6 +2092,8 @@ class ElspethSettings(BaseModel):
         description="Named pass-through scheduling queues for explicit fan-in.",
     )
 
+    azure_document_intelligence_endpoint: str | None = None
+
     # Optional - operator-owned LLM profile catalog for batch/CLI runs.
     # Mirrors WebSettings.llm_profiles/default_llm_profile (web/config.py) so
     # an `llm` transform node can select a profile alias instead of carrying
@@ -2246,6 +2249,27 @@ class ElspethSettings(BaseModel):
         for alias in value:
             validate_profile_alias(alias)
         return value
+
+    @field_validator("azure_document_intelligence_endpoint")
+    @classmethod
+    def _validate_adi_endpoint(cls, value: str | None) -> str | None:
+        return None if value is None else validate_document_intelligence_endpoint(value)
+
+    @model_validator(mode="after")
+    def _materialize_adi_endpoint(self) -> "ElspethSettings":
+        if self.azure_document_intelligence_endpoint is not None:
+            materialized = [
+                transform.model_copy(
+                    update={
+                        "options": materialize_document_intelligence_endpoint(transform.options, self.azure_document_intelligence_endpoint)
+                    }
+                )
+                if transform.plugin == "azure_document_intelligence"
+                else transform
+                for transform in self.transforms
+            ]
+            object.__setattr__(self, "transforms", materialized)
+        return self
 
     @model_validator(mode="after")
     def _validate_default_llm_profile_alias(self) -> "ElspethSettings":
