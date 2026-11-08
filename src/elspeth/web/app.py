@@ -89,6 +89,7 @@ from elspeth.web.catalog.routes import catalog_router
 from elspeth.web.composer import yaml_generator as yaml_generator_module
 from elspeth.web.composer.progress import ComposerProgressRegistry
 from elspeth.web.composer.service import ComposerServiceImpl
+from elspeth.web.composer.session_cache import ComposerSessionCacheRegistry
 from elspeth.web.composer.tools.wire_projection import loop_tool_count, strict_capable_tool_count
 from elspeth.web.composer.tutorial_abandon_routes import create_tutorial_abandon_router
 from elspeth.web.composer.tutorial_run_routes import create_tutorial_run_router
@@ -1961,6 +1962,7 @@ def _create_app(
     app.add_middleware(InstanceIdentityMiddleware, instance_id=instance_id)
 
     app.state.settings = settings
+    app.state.composer_session_cache_registry = ComposerSessionCacheRegistry(enabled=settings.composer_session_cache_enabled)
     app.state.instance_id = instance_id
     app.state.platform_identity = platform_identity
 
@@ -2307,6 +2309,7 @@ def _create_app(
         secret_service=app.state.scoped_secret_resolver,
         blob_service=app.state.blob_service,
         runtime_preflight_coordinator=runtime_preflight_coordinator,
+        session_cache_registry=app.state.composer_session_cache_registry,
         plugin_snapshot_factory=app.state.plugin_snapshot_factory.for_user_id,
         operator_profile_registry=app.state.operator_profile_registry,
     )

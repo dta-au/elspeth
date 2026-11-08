@@ -299,6 +299,9 @@ class WebSettings(BaseModel):
         default=None
     )
     composer_model: str = "gpt-5.5"
+    # Retained structural/discovery results are optional. Live policy,
+    # authorization, provider review and runtime admission are never bypassed.
+    composer_session_cache_enabled: bool = True
     composer_prompt_guard: PromptGuardSettings | None = Field(default=None, repr=False)
     composer_prompt_guard_mode: PromptGuardMode = "required"
     composer_pricing_model: str | None = Field(

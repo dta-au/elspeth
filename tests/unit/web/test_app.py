@@ -60,6 +60,7 @@ from elspeth.web.auth.providers import get_profile
 from elspeth.web.auth.sso import SsoAuthProvider, SsoRuntime
 from elspeth.web.aws_ecs_startup import AwsEcsSchemaNotReadyError, AwsEcsStartupContractError
 from elspeth.web.composer.boot_probe import ComposerBootConfigError, ComposerProbeRequest
+from elspeth.web.composer.session_cache import SessionCacheKey
 from elspeth.web.composer.state import CompositionState, PipelineMetadata, SourceSpec
 from elspeth.web.config import _JSON_COLLECTION_FIELDS, WebSettings, settings_from_env
 from elspeth.web.coordination.membership_lifecycle import (
@@ -234,6 +235,20 @@ def _settings(tmp_path: Path, **overrides) -> WebSettings:
     }
     defaults.update(overrides)
     return WebSettings(**defaults)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_composer_session_cache_has_one_application_owner(tmp_path: Path, enabled: bool) -> None:
+    app = create_app(_settings(tmp_path, composer_session_cache_enabled=enabled))
+    registry = app.state.composer_session_cache_registry
+    assert app.state.composer_service._session_caches is registry
+    assert registry.enabled is enabled
+    key = SessionCacheKey("principal-a", "session-a")
+    with registry.borrow(key) as first, registry.borrow(key) as second:
+        assert first.cache is not None
+        assert first.cache is second.cache
+    registry.begin_shutdown()
+    assert registry.snapshot().retained_sessions == 0
 
 
 def _ensure_test_user(conn: Connection, *, identity_id: str) -> None:

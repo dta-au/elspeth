@@ -40,6 +40,12 @@ def test_composer_pricing_identities_load_from_environment(required_web_env: Non
     assert settings.composer_advisor_pricing_model == "azure/gpt-4o-mini"
 
 
+def test_composer_session_cache_bypass_loads_from_environment(required_web_env: None, monkeypatch: pytest.MonkeyPatch) -> None:
+    assert web_config.settings_from_env().composer_session_cache_enabled is True
+    monkeypatch.setenv("ELSPETH_WEB__COMPOSER_SESSION_CACHE_ENABLED", "false")
+    assert web_config.settings_from_env().composer_session_cache_enabled is False
+
+
 @pytest.mark.parametrize("field", ["composer_pricing_model", "composer_advisor_pricing_model"])
 @pytest.mark.parametrize("value", ["", " ", "\t"])
 def test_composer_pricing_identity_rejects_blank(field: str, value: str) -> None:

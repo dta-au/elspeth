@@ -156,6 +156,7 @@ from elspeth.web.composer.recovery_controls import (
     recovery_tool_definitions,
 )
 from elspeth.web.composer.schema_disclosure import SchemaDisclosureTracker
+from elspeth.web.composer.session_cache import ComposerSessionCacheRegistry
 from elspeth.web.composer.session_tool import SessionToolOwner
 from elspeth.web.composer.skills import assert_skill_hash_unchanged_on_disk
 from elspeth.web.composer.state import CompositionState, ValidationSummary
@@ -576,6 +577,7 @@ class ComposerServiceImpl:
         secret_service: WebSecretResolver | None = None,
         blob_service: BlobServiceProtocol | None = None,
         runtime_preflight_coordinator: RuntimePreflightCoordinator | None = None,
+        session_cache_registry: ComposerSessionCacheRegistry | None = None,
         plugin_snapshot_factory: Callable[[str], PluginAvailabilitySnapshot] | None,
         operator_profile_registry: OperatorProfileRegistry | None,
         _composition_root: object | None = None,
@@ -586,6 +588,7 @@ class ComposerServiceImpl:
         if operator_profile_registry is None and not trained_operator_mode:
             raise TypeError("operator_profile_registry must be provided")
         self._sessions_service = sessions_service
+        self._session_caches = session_cache_registry if session_cache_registry is not None else ComposerSessionCacheRegistry()
         self._policy_context = PluginPolicyContextFactory(
             catalog,
             plugin_snapshot_factory,

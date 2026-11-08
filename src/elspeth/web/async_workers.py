@@ -657,6 +657,17 @@ async def run_stream_read_in_worker[**P, T](func: Callable[P, T], *args: P.args,
     be cancelled; its task joins completion despite repeated cancellation so
     the subscriber can retain capacity through the real SQL lifetime.
     """
+    return await run_joined_sync_in_worker(func, *args, **kwargs)
+
+
+async def run_joined_sync_in_worker[**P, T](func: Callable[P, T], *args: P.args, **kwargs: P.kwargs) -> T:
+    """Join the actual worker before propagating cancellation.
+
+    Owners of resources used by synchronous work must retain those resources
+    until the concurrent future finishes, including the RUNNING-before-entry
+    cancellation race. Queued work is cancelled without running. Admission and
+    executor ownership remain with the ordinary bounded shared worker bridge.
+    """
     concurrent_future = await _submit_shared(functools.partial(func, *args, **kwargs))
     cancelled = False
     while not concurrent_future.done():
