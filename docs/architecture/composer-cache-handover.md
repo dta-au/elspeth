@@ -101,8 +101,12 @@ Canonical run in `.claude/worktrees/composer-cache-final/work/pushed-checkpoint-
 - Both actual global authority proofs remain pending until their explicit results.
 
 The gate records stage exits, JUnit XML, freeze state and `.done` in that run
-folder. Astra is only supervising to terminal outcomes, then stopping. Preserve
-those receipts; they are local, not bundled into this documentation push.
+folder. To conserve quota, all model/agent polling has now stopped. A passive
+local collector (`work/capture-terminal-gate.py`) waits for `.done` and writes
+`terminal-handover.json` beside those receipts; it does not rerun tests, change
+source or publish results. Its exact classification loop passed pass/failure/
+error/skip controls. Preserve canonical receipts; terminal outcomes are still
+pending and are not bundled into this documentation push.
 The original completed broad run remains failed evidence: default 71,191 passed,
 53 failed, 267 skipped, 1 xfailed; PostgreSQL 1,179 passed, 3 failed, 1 skipped.
 Focused reconciliation has 51 of those default failures passing and two global
