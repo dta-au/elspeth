@@ -64,6 +64,8 @@ verifying path), not by the type of the container.
 | 7 | Approval binding reuses the cached runtime manifest | Low | Low | Unit (approval, landscape) | open — governance-on only |
 | 9 | Drop the executor's duplicate input hash | Low | Low | Engine unit + telemetry tests | open |
 | 10 | Load `chat_messages.tool_calls` once per list, filter by id | Low–Med | Medium | Reviewed-writer recipe re-pin; sessions unit | open |
+| 11 | Memoize tool-definition credential scan by tools hash | Low | Low | Unit (provider_context) | open |
+| 12 | Cache `canonical_set_pipeline_schema()` per process | Low | Low | Unit (schema_contract, planner) | open |
 
 Reported by the external profile, **not yet verified here** — each gets a
 line-level check (lane report) before it is promoted to a numbered fix:
@@ -77,8 +79,26 @@ line-level check (lane report) before it is promoted to a numbered fix:
 | P-15 Application fingerprint | Launch/recovery re-reads and hashes 990 source files (~23.8 MB) | 0.19–0.20 s per occurrence |
 | P-16 Recovery envelope | Same serialized envelope parsed three times (validation, input construction, restoration) | per recovery |
 
-Order: 1 → 2A → re-measure → 10 → 6 → 3-T1 → 2B → 4A → 7 → 9 →
-re-measure; pending items slot in once verified. Fixes 1 and 2A remove the noise that would otherwise confound
+From the in-repo systems scan (`.claude/lanes/perf-eval/07-systems-scan.md`;
+per-turn counts read from code, costs from isolated timing where stated,
+no live run). Pattern G — synchronous work on the event loop — was not in
+the original list:
+
+| Pending | Pattern | Mechanism | Scale / status |
+|---|---|---|---|
+| S-3 Event-loop stalls | G | Plugin snapshot builds (`composer_turn.py:931`, `composer/service.py:1228`, `routes/_helpers.py:299` via GET /state) and ~30–45 ms of per-provider-call preparation run synchronously on the loop, stalling stream frames and other sessions | Low risk: move to a worker thread. Fix 1 shrinks the snapshot cost first |
+| S-4 Prompt guard re-screens history | D | `prompt_guard.py:195`, `prompt_guard_clients.py:137`: all untrusted history re-screened every provider call in sequential 10,000-char batches, new HTTP client per call | Not measured (baseline ran guard bypassed). Client reuse is low risk. **Verdict caching needs a developer ruling** |
+| S-5 Full transcript read per turn | D/F | `messages.py:118` reads every row unbounded and slices in Python; frontend `fetchMessages` (`client.ts:841`) re-reads the whole session per page | Linear per turn, quadratic over a session |
+| S-6 Discovery tools re-validate unchanged state | A | `tools/_common.py:1281`, `:3829`; `_dispatch.py:923`, `:1039` — 2–3 validations of the same state per tool call, up to 24 calls/turn | Low–medium |
+| S-7 Plugin snapshot rebuilt 2+K× per turn | C | `composer_turn.py:931`, `service.py:1228`, plus once per interpretation event at `sessions/service.py:4996-5018`, each re-serializing ~120 schemas | **Needs a ruling**: sharing one snapshot across a turn changes authorization freshness within that turn |
+| S-8 Advisor transcript snapshot | D/A | `advisor_transcript.py:769` re-parses, re-hashes and re-reads blobs for the whole history 2–6×/turn | Medium; the blob re-check may be deliberate |
+| S-9 Head graph triple decode | A | Decoded 3×, checked 1–2× per read | 10–30 ms at 30–100 nodes |
+| S-10/11 Accept re-checks own arguments; serialize-then-hash twice | A | Proposal accept re-verifies arguments it just produced (10–81 ms); same value serialized then hashed separately back-to-back | Fold into fix 6 |
+| S-12 Post-turn GET fan-out | F | Frontend fires 6–7 GETs after every turn, beyond fix 2's validate/readiness pair | Extend fix 2B's coordinator |
+
+Order: 1 → 2A → re-measure → 10 → 6 (+S-10/11) → 11 → 12 → 3-T1 → 2B
+(+S-12) → 4A → 7 → 9 → re-measure; other pending items slot in once
+verified and, where marked, ruled on. Fixes 1 and 2A remove the noise that would otherwise confound
 the later measurements. Fix 10 comes next because its cost scales with
 history × proposals rather than being a fixed per-request charge; fix 6 is
 CPU-bound and scales with graph size, so both matter more for the larger
@@ -620,6 +640,55 @@ Lane notes: `.claude/lanes/perf-eval/08-manifest-rowhash-toolcalls.md`.
 
 ---
 
+## Fix 11 — Tool-definition credential scan repeated per provider call
+
+**Mechanism (verified).** `capture_provider_context`
+(`provider_gateway.py:765`, called from `pipeline_planner.py:3755`) runs
+`_check_tools` (`src/elspeth/web/composer/provider_context.py:204-212`) over
+the planner's fixed tool definitions on every provider call, scanning them
+for credential-shaped content. The tool set is process-invariant for a given
+discovery policy and dialect. Measured ~20 ms per call; up to ~0.7 s across
+a compose-loop turn.
+
+**Change.** Memoize the tools verdict by a hash of the canonical tool list
+(bounded dict, process lifetime). **Keep scanning `messages` on every
+call** — they carry user and provider content and are the actual trust
+boundary.
+
+**Tests.** `tests/unit/web/composer/` provider-context tests; add a
+positive (second call with identical tools performs no scan) and a negative
+(a tool list containing a credential-shaped string is still refused, cached
+or not).
+
+**Evidence.** _(fill in)_
+
+---
+
+## Fix 12 — `canonical_set_pipeline_schema()` regenerated per call
+
+**Mechanism (verified).** `canonical_set_pipeline_schema`
+(`src/elspeth/web/composer/tools/schema_contract.py:403-413`) deep-copies
+the registered `set_pipeline` schema and augments it with runtime naming
+constraints on every call; there is no cache in the module. It is called
+twice back-to-back at `pipeline_planner.py:3625-3626`, again after each
+discovery batch (`:5125`), at `:1595`, `:2745`, and on every schema
+rejection (`:4487`, where a `Draft202012Validator` is also rebuilt around
+it). Measured ~4.6 ms per call, ~15 ms per planner call.
+
+**Change.** Build the augmented schema once per process (the registered
+schema and the naming constraints are both static) and return a deep copy
+— callers currently rely on an isolated copy. Cache the compiled
+`Draft202012Validator` alongside it. If profiling shows the deep copy
+itself is the cost, return an immutable view instead and audit the callers
+for mutation.
+
+**Tests.** `tests/unit/web/composer/tools/` schema-contract tests; add a
+call-count assertion and a byte-identity check against the uncached result.
+
+**Evidence.** _(fill in)_
+
+---
+
 ## Measurement procedure
 
 Run before fix 1 and after each fix lands, same machine, same model, same
@@ -656,6 +725,11 @@ Record raw output, not summaries, in each fix's Evidence line.
    the same iteration?
 3. Fix 3: should the 0.25 s watch cadence itself be revisited, or only its
    query shape?
+4. S-7: may one plugin-availability snapshot be shared across a single
+   composer turn (including the interpretation events it writes), or must
+   each write re-read principal/credential state?
+5. S-4: may prompt-guard verdicts for unchanged history segments be cached
+   within a session, or must every provider call re-screen all history?
 
 ## Test environment (cloud session, set up 2026-11-08)
 
