@@ -567,7 +567,37 @@ refused.
 byte-identical across the fixture corpus; the 157 KB case drops from ~154 ms
 toward ~40 ms; the whole-tree gates (`tests/unit/architecture/`) unchanged.
 
-**Evidence.** _(fill in)_
+**Evidence (landed).** `create` freezes once, hashes through the
+module-private `_owned_pipeline_draft_hash` (no second freeze), performs the
+owned-state round trip, and seals the instance with `object.__new__` +
+`object.__setattr__` storing only values it computed itself — no flag field,
+no public trusted constructor, no proxy short-circuit. `__post_init__` keeps
+full verification for hand-built, `replace`d and `from_dict` instances (and
+itself drops from 2 freezes to 1 by hashing its own frozen tree). The
+discarded `canonical_json(preimage)` before `stable_hash` was removed; the
+size-check bytes and the hash preimage are different canonical forms and stay
+separate. Counts per `create`: freeze **4 → 1**, draft hash **2 → 1**,
+explicit `canonical_json` **6 → 1**. Timing: 781 B 0.87 → 0.27 ms; 26 KB
+21 → 6.9 ms; 157 KB 148–160 → **41 ms**. Parity: every `create` call in 76
+test files replayed through HEAD code — 616/617 identical `draft_hash` and
+`canonical_json(pipeline)`, the one difference traced to the instrument's
+copying and reproduced with HEAD vs HEAD. Reviewer check: `create` and
+`PipelineProposal(...)` yield equal instances with identical container-type
+shapes (`mappingproxy` throughout). Tests: new count test + instrument
+control, pinned HEAD byte values, forgery (direct construction, `from_dict`,
+mutated proxy), input-mutation ownership, owned-state on the `create` path;
+each control went red against a broken copy. Proposal + authority suites 124
+passed (reviewer re-run); composer suite 2963 baseline / after-run 1 failure
++ 4 errors both diagnosed unrelated — the failure
+(`test_aid_supplied_reads_in_one_turn_deliver_results_without_hatch`) is
+order-dependent and passed 3/3 alone for both agent and reviewer, the 4
+errors were teardown checks tripped by the live web server writing to
+`.elspeth/payloads` during the suite; parity re-run of the same files 2975
+passed. Architecture 1982 + 1 xfail (`-n 3`, tree frozen). ruff/mypy clean;
+lint corpus identical; soft-mapping census re-pinned +1 (`Mapping[str, Any]`
+788 → 789). Writer recipes do not pin this file. Not run: full suite,
+testcontainer. S-10/S-11 and the duplicate pair in `reviewed_anchor_hash`
+left for fix 14.
 
 Lane notes: `.claude/lanes/perf-eval/06-proposal-revalidation.md`.
 

@@ -826,7 +826,7 @@ files:
     dict[str, Any]: 20
     dict[str, object]: 2
   src/elspeth/web/composer/pipeline_proposal.py:
-    Mapping[str, Any]: 19
+    Mapping[str, Any]: 20
     dict[str, Any]: 18
   src/elspeth/web/composer/planner_authoring_aids.py:
     Mapping[str, object]: 5
@@ -1085,10 +1085,10 @@ files:
     Mapping[str, Any]: 15
     dict[str, Any]: 1
 totals:
-  Mapping[str, Any]: 788
+  Mapping[str, Any]: 789
   Mapping[str, object]: 317
   MutableMapping[str, Any]: 8
   boundary: 60
   dict[str, Any]: 1102
   dict[str, object]: 398
-  soft: 2613
+  soft: 2614

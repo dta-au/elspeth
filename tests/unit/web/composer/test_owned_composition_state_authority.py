@@ -363,3 +363,29 @@ def test_owned_state_authority_rejects_a_source_name_that_is_not_an_exact_string
 
     with pytest.raises(AuditIntegrityError, match="owned composition-state authority sections are malformed"):
         restore_owned_composition_state_authority(payload, version=1)
+
+
+def test_create_still_round_trips_an_owned_state_authority_before_sealing() -> None:
+    """``create`` seals without ``__post_init__``, so it must run the owned-state
+    restore itself: a payload that does not round-trip is refused on the
+    create path, not only on direct construction or reload."""
+    payload = _authority_payload()
+    payload["nodes"][0]["condition"] = None
+
+    with pytest.raises(AuditIntegrityError, match="encodes an absent optional field as an explicit null"):
+        _proposal(payload)
+
+
+def test_create_and_direct_construction_agree_on_an_owned_state_authority() -> None:
+    proposal = _proposal(_authority_payload())
+
+    reverified = PipelineProposal(
+        pipeline=proposal.pipeline,
+        draft_hash=proposal.draft_hash,
+        base=proposal.base,
+        repair_count=proposal.repair_count,
+        skill_hash=proposal.skill_hash,
+    )
+
+    assert reverified == proposal
+    assert PipelineProposal.from_dict(proposal.to_dict()) == proposal
