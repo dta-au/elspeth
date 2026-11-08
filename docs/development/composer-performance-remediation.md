@@ -44,9 +44,12 @@ pipeline was correct plugin output and is out of scope.
 | 4B | Reasoning-effort tuning | Medium (quality) | Low | — | open — applies on OpenRouter test models |
 | 3-T2 | Snapshot-bound per-send stream authorization | High (semantic) | Low code | Developer ruling | not started — ruling needed |
 | 5 | Allocation profiling | — | — | — | after 1 and 2A |
+| 6 | Carry-once validated proposal (no re-freeze/re-hash) | Low–Med | Medium | Unit (proposal, decoder, hashing) | open |
 
-Order: 1 → 2A → re-measure → 3-T1 → 2B → 4A → re-measure. Fixes 1 and 2A
-remove the noise that would otherwise confound the later measurements.
+Order: 1 → 2A → re-measure → 6 → 3-T1 → 2B → 4A → re-measure. Fixes 1 and
+2A remove the noise that would otherwise confound the later measurements;
+fix 6 is CPU-bound and scales with graph size, so it matters more for the
+larger graphs that follow the tutorial.
 
 ## Working rules for every fix
 
@@ -392,6 +395,91 @@ largest transient allocator (repeated `model_json_schema`). After 1 and 2A
 land: `tracemalloc` snapshots across several sessions then quiescence;
 separate transient volume from retained objects; compare instrumented vs
 minimally instrumented runs.
+
+---
+
+## Fix 6 — Carry a validated, immutable proposal once
+
+**Mechanism (verified, `src/elspeth/web/composer/pipeline_proposal.py`).**
+One `PipelineProposal.create(...)` call performs four full
+validate/copy/freeze traversals of the same pipeline, six explicit
+`canonical_json` serializations (eight counting the two inside
+`stable_hash`), two `pipeline_draft_hash` computations and two
+`project_composer_authority_payload` projections; `freeze_fields` adds a
+fifth `deep_freeze` traversal. Counts are identical at 1, 50 and 300 nodes.
+The chain:
+
+1. `create` (`:619`) → `_validate_and_freeze_canonical_mapping`.
+2. `create` (`:620`) → `pipeline_draft_hash` (`:553`), which freezes again
+   (`:561`) and serializes for the hash.
+3. Dataclass construction → `__post_init__` (`:587-588`) freezes a third
+   time.
+4. `__post_init__` (`:597`) recomputes `pipeline_draft_hash` → fourth
+   freeze and another serialization.
+
+`_validate_and_freeze_canonical_mapping` (`:231`) never short-circuits on
+already-frozen input — it rebuilds every `MappingProxyType` /
+`FrozenJsonArray` (`:172-212`) — and then serializes the result purely to
+check `JSON_MAX_TOTAL_UTF8_BYTES` (`:253-254`), discarding the bytes.
+
+Measured (isolated, 20 reps, no provider): ~0.9 ms at 781 B, 20.8 ms at
+26 KB, 154 ms at 157 KB — about 1 ms per KB, CPU-bound. This does not alone
+explain multi-second delays; it scales with graph size and with how often
+proposals are reconstructed.
+
+**Not redundant — keep.** The candidate path validates before *and* after
+`canonicalize_authored_node_review_requirements`
+(`pipeline_planner.py:3088-3099`). The second pass follows a real rewrite
+(server-owned `id`/`status` filled on review rows) and runs with
+`_interpretation_requirements_are_internal=True`, so it checks bytes the
+first never saw. Likewise `from_dict` and `proposal_decoder.py:239` (the only
+direct `PipelineProposal(` in `src/`) restore persisted/external data and
+must keep full verification ([ADR-032](../architecture/adr/032-validate-by-trust-domain.md):
+parse what we do not own; trust what we constructed).
+
+**Provider-request re-processing (same class, separate fix).** Per planner
+call the 223–310 KB payload is touched by `json.loads(canonical_json(...))`
+for the call-input snapshot, the manifest's `canonical_json` + `stable_hash`,
+the request-size `canonical_json`, and `capture_provider_context`. Most of
+these are trust-boundary or audit work; the genuine redundancy is repeat
+serialization of the *same* `messages`/`tools` snapshot. Treat as a
+follow-on once the proposal path is fixed and 4A accounting exists. Not
+instrumented live; read from code.
+
+**Change.**
+- In `create`: freeze once, hash the already-frozen pipeline (add a
+  `pipeline_draft_hash` entry point or keyword that accepts pre-frozen
+  input and skips the freeze), and drop the discarded
+  `canonical_json(preimage)` where the bytes are only used for a size check
+  that an earlier pass already performed.
+- Construction from `create`: use a private in-module constructor that
+  bypasses `__post_init__` re-verification for values `create` has just
+  verified. Do **not** add a public "already validated" flag field — a
+  flag on the dataclass can be forged by any caller; a module-private
+  constructor cannot be reached through `from_dict` or the decoder.
+- Carry canonical bytes, byte length and digest on the frozen object so
+  downstream consumers (commit, audit, hashing) reuse them instead of
+  re-serializing.
+- Leave `from_dict`, `proposal_decoder.py` and every external/persisted
+  entry on the full verification path.
+
+**Tests.** `tests/unit/web/composer/test_pipeline_proposal.py`, the coalesce
+and row-union hashing tests (grep `pipeline_draft_hash`), and
+`proposal_decoder` tests pin current behaviour. Add: a call-count assertion
+that one `create` performs exactly one freeze and one hash (positive) with an
+unpatched control showing four/two (negative); a byte-identity assertion that
+`draft_hash` and `canonical_json(proposal.pipeline)` are unchanged for the
+existing fixtures; and a forgery test showing a hand-built
+`PipelineProposal(...)` / `from_dict` with a wrong `draft_hash` is still
+refused.
+
+**Acceptance.** Freeze/hash counts per `create` drop to 1/1; draft hashes
+byte-identical across the fixture corpus; the 157 KB case drops from ~154 ms
+toward ~40 ms; the whole-tree gates (`tests/unit/architecture/`) unchanged.
+
+**Evidence.** _(fill in)_
+
+Lane notes: `.claude/lanes/perf-eval/06-proposal-revalidation.md`.
 
 ---
 
