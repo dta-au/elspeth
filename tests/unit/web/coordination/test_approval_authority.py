@@ -2,15 +2,32 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import fields
 from datetime import UTC, datetime, timedelta
+from typing import Any, ClassVar, TypedDict
 
 import pytest
 from sqlalchemy import event, insert, select, update
 from sqlalchemy.dialects import postgresql
 from tests.fixtures.identities import ensure_test_identity
+from tests.fixtures.landscape import make_landscape_db
 
+import elspeth.contracts.declaration_contracts as declaration_contracts
+from elspeth.contracts.declaration_contracts import (
+    DeclarationContract,
+    DeclarationContractViolation,
+    ExampleBundle,
+    freeze_declaration_registry,
+    implements_dispatch_site,
+)
+from elspeth.contracts.hashing import canonical_json
 from elspeth.contracts.plugin_policy_audit import WebPluginPolicyEvidence
+from elspeth.contracts.runtime_val_manifest import build_runtime_val_manifest, cached_frozen_runtime_val_manifest_json
+from elspeth.core.landscape._database_ops import DatabaseOps
+from elspeth.core.landscape.model_loaders import RunLoader
+from elspeth.core.landscape.run_lifecycle_repository import RunLifecycleRepository
+from elspeth.core.landscape.schema import runs_table
 from elspeth.web.coordination.approval_authority import (
     BOUND_EVIDENCE_FIELDS,
     EXCLUDED_EVIDENCE_FIELDS,
@@ -22,6 +39,7 @@ from elspeth.web.coordination.approval_authority import (
     ApprovalTransactionAuthority,
     ApproverRoleRequired,
     RepositoryApprovalAuthority,
+    runtime_val_manifest_sha256,
     supersede_open_approvals,
 )
 from elspeth.web.coordination.mutation_connection_registry import _resolve_mutation_connection
@@ -445,3 +463,80 @@ def test_inbox_includes_role_eligible_requests_with_addressed_first(tmp_path) ->
         )
     assert authority.inbox(approver_identity_id="cover") == ()
     engine.dispose()
+
+
+class _ApprovalManifestProbePayload(TypedDict):
+    marker: str
+
+
+class _ApprovalManifestProbeViolation(DeclarationContractViolation):
+    payload_schema = _ApprovalManifestProbePayload
+
+
+class _ApprovalManifestProbeContract(DeclarationContract):
+    """Registration-shape-only contract that changes the registry fingerprint."""
+
+    name = "approval_manifest_probe"
+    payload_schema: ClassVar[type] = _ApprovalManifestProbePayload
+    violation_class: ClassVar[type[DeclarationContractViolation]] = _ApprovalManifestProbeViolation
+
+    def applies_to(self, plugin: Any) -> bool:
+        return False
+
+    @implements_dispatch_site("post_emission_check")
+    def post_emission_check(self, inputs: Any, outputs: Any) -> None:
+        return None
+
+    @classmethod
+    def negative_example(cls) -> ExampleBundle:
+        raise NotImplementedError("approval manifest probe contract is never dispatched")
+
+    @classmethod
+    def positive_example_does_not_apply(cls) -> ExampleBundle:
+        raise NotImplementedError("approval manifest probe contract is never dispatched")
+
+
+def test_approval_manifest_hash_is_sha256_of_the_run_header_manifest_bytes() -> None:
+    """Approval binding and begin_run() share one cached manifest text, byte for byte."""
+    snapshot = declaration_contracts._snapshot_registry_for_tests()
+    try:
+        approval_hash = runtime_val_manifest_sha256()
+        db = make_landscape_db()
+        RunLifecycleRepository(db, DatabaseOps(db), RunLoader()).begin_run(
+            config={},
+            canonical_version="v1",
+            run_id="approval-manifest-run",
+            openrouter_catalog_sha256="0" * 64,
+            openrouter_catalog_source="bundled",
+        )
+        with db.connection() as conn:
+            header_json = conn.execute(
+                select(runs_table.c.runtime_val_manifest_json).where(runs_table.c.run_id == "approval-manifest-run")
+            ).scalar_one()
+        assert header_json == cached_frozen_runtime_val_manifest_json()
+        assert approval_hash == hashlib.sha256(header_json.encode("utf-8")).hexdigest()
+        # The cached text is the uncached builder's canonical JSON, not a stale copy.
+        assert header_json == canonical_json(build_runtime_val_manifest())
+    finally:
+        declaration_contracts._restore_registry_snapshot_for_tests(snapshot)
+
+
+def test_approval_manifest_hash_follows_a_registry_change() -> None:
+    """A changed registry fingerprint invalidates the shared cache for approval binding."""
+    snapshot = declaration_contracts._snapshot_registry_for_tests()
+    try:
+        before = runtime_val_manifest_sha256()
+        registry, per_site, _frozen = declaration_contracts._snapshot_registry_for_tests()
+        declaration_contracts._restore_registry_snapshot_for_tests((registry, per_site, False))
+        declaration_contracts.register_declaration_contract(_ApprovalManifestProbeContract())
+        # Freeze the extended test registry directly: prepare_for_run() then
+        # short-circuits instead of asserting the production contract set.
+        freeze_declaration_registry()
+
+        after = runtime_val_manifest_sha256()
+
+        assert after != before
+        assert after == hashlib.sha256(canonical_json(build_runtime_val_manifest()).encode("utf-8")).hexdigest()
+        assert _ApprovalManifestProbeContract.name in cached_frozen_runtime_val_manifest_json()
+    finally:
+        declaration_contracts._restore_registry_snapshot_for_tests(snapshot)

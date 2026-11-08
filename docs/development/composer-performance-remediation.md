@@ -629,7 +629,21 @@ irrelevant to the tutorial, significant for governed deployments.
 a new assertion that the two callers agree byte-for-byte and that a changed
 registry fingerprint invalidates the shared cache.
 
-**Evidence.** _(fill in)_
+**Evidence (landed; closes #346).** `cached_frozen_runtime_val_manifest_json()`
+now lives in `contracts/runtime_val_manifest.py` (the `lru_cache(maxsize=4)`
+accessor moved verbatim from `run_lifecycle_repository.py`, still keyed on
+`runtime_val_registry_fingerprint()` and still asserting frozen registries);
+`begin_run` and `runtime_val_manifest_sha256` both call it;
+`prepare_for_run()` still precedes the approval call; `resume.py:640` stays
+uncached. Warm `runtime_val_manifest_sha256()` **0.41–0.49 s → 40–80 µs**,
+one manifest build across 4 calls; run-header manifest byte-identical to
+baseline. New tests: byte agreement between the two callers; registry change
+invalidates (stale-key negative control went red). Architecture re-pins:
+whole-module recipe for `runtime_val_manifest.py`, `begin_run` fingerprint,
+14 `line=` rows, and the fencing test's reference to the moved function —
+all regenerated, architecture 1982 passed. Approval/landscape/executor
+suites 235 passed (reviewer re-run). Two pre-existing failures in
+`test_cli_quota_admission` reproduce on clean HEAD — unrelated.
 
 ---
 
@@ -654,7 +668,19 @@ a crash. Net: one of four hashes removed per attempt.
 `input_hash`, retry tests under `tests/unit/engine/`. Add a negative
 control showing the NaN/Infinity path still routes as a violation.
 
-**Evidence.** _(fill in)_
+**Evidence (landed; closes #347).** `TransformExecutor` reads
+`guard.state.input_hash` (the value `begin_node_state` derived and
+recorded) instead of calling `stable_hash(input_dict)`; output hash,
+aggregation and gates untouched. Executor `stable_hash` calls per attempt
+**2 → 1** (red/green test against HEAD); NaN/±Inf output still routes as a
+Tier-2 violation (new tests). The stub repository in
+`tests/fixtures/executors.py` now computes the hash like the real one.
+CLI example gate: `transform_pipeline` exit 0 (5/5), `error_routing` exit 1
+(17 rows, 13/4, 17 routed); sink sha256s identical to baseline; latest-run
+`node_states` digests `7d4d787084a62e98` / `fbcb7a1785284a2d` identical to
+baseline (recorded hashes unchanged — the fix removes a computation, not a
+value). Engine 3706 passed; landscape/telemetry/contracts 9954 passed;
+lint corpus differs by 4 line shifts only; census unchanged.
 
 ---
 

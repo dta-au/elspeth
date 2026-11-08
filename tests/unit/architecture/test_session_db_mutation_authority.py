@@ -1866,7 +1866,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="c569a38e8104cade",
         ordinal=1,
         authority="ApprovalAuthority",
-        line=524,
+        line=529,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -1877,7 +1877,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="6fe838fe433f806f",
         ordinal=1,
         authority="ApprovalAuthority",
-        line=546,
+        line=551,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -1888,7 +1888,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="c28afff08b74f188",
         ordinal=1,
         authority="ApprovalAuthority",
-        line=534,
+        line=539,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -1899,7 +1899,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="2faba18c5b689ec7",
         ordinal=1,
         authority="ApprovalAuthority",
-        line=638,
+        line=643,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -1910,7 +1910,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="5b088eab323c8df5",
         ordinal=1,
         authority="ApprovalAuthority",
-        line=474,
+        line=479,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -1921,7 +1921,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="9cfb13353c200db5",
         ordinal=1,
         authority="ApprovalAuthority",
-        line=590,
+        line=595,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -1932,7 +1932,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="ac140b482c767c7b",
         ordinal=1,
         authority="ApprovalAuthority",
-        line=433,
+        line=438,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -5105,7 +5105,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         fingerprint="0f528cfef4940359",
         ordinal=1,
         authority=None,
-        line=675,
+        line=680,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -5116,7 +5116,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         fingerprint="29021cc5f54842e6",
         ordinal=1,
         authority=None,
-        line=681,
+        line=686,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -5127,7 +5127,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         fingerprint="ce77dc5e8665a307",
         ordinal=1,
         authority=None,
-        line=709,
+        line=714,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -5138,7 +5138,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         fingerprint="c4cddb94685264c8",
         ordinal=1,
         authority=None,
-        line=670,
+        line=675,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -5940,12 +5940,14 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "RunLifecycleRepository.begin_run",
         "<non-session-write-connection>",
         "write_connection",
-        # X2 (5c0c9cada) made the rejected-write error value-free; the
-        # acquisition, domain and escape are unchanged.
-        "0332d27f2ddfaf65",
+        # X2 (5c0c9cada) made the rejected-write error value-free, and
+        # perf fix 7 moved the frozen manifest cache into
+        # contracts.runtime_val_manifest; the acquisition, domain and escape
+        # are unchanged.
+        "e980f7842976a870",
         1,
         None,
-        line=499,
+        line=471,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -5956,7 +5958,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "35f1c0951a247db5",
         1,
         None,
-        line=622,
+        line=594,
         connection_escape=True,
     ),
     # ADR-047 fresh-time amendment: the PRAGMA verifier installs the reviewed
@@ -6361,7 +6363,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "c585a80de69ed5e2",
         1,
         None,
-        line=871,
+        line=843,
     ),
     # C6 stage 3 (ADR-047): the barrier journal's database-clock read for
     # hold ages; the read connection is handed to read_landscape_transaction_time.

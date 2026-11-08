@@ -22,7 +22,6 @@ from sqlalchemy.exc import IntegrityError
 from elspeth.contracts.auth import AuthProviderType
 from elspeth.contracts.chargeable_admission import AdmissionRefusalReason
 from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.contracts.hashing import canonical_json
 from elspeth.contracts.plugin_policy_audit import WebPluginPolicyEvidence
 from elspeth.web.coordination.database_clock import database_now
 from elspeth.web.coordination.mutation_connection_registry import (
@@ -112,12 +111,18 @@ def build_approval_binding(
 
 
 def runtime_val_manifest_sha256() -> str:
-    """Hash the same frozen manifest the runtime records at run start."""
-    from elspeth.contracts.runtime_val_manifest import build_runtime_val_manifest
+    """Hash the same frozen manifest the runtime records at run start.
+
+    ``prepare_for_run()`` must run first: it asserts the contract manifest and
+    freezes both runtime-VAL registries, and the shared cache refuses
+    unfrozen registries and keys on their fingerprint. The cached JSON is the
+    exact text ``begin_run()`` writes into the run header.
+    """
+    from elspeth.contracts.runtime_val_manifest import cached_frozen_runtime_val_manifest_json
     from elspeth.engine.orchestrator.bootstrap import prepare_for_run
 
     prepare_for_run()
-    return hashlib.sha256(canonical_json(build_runtime_val_manifest()).encode("utf-8")).hexdigest()
+    return hashlib.sha256(cached_frozen_runtime_val_manifest_json().encode("utf-8")).hexdigest()
 
 
 @final
