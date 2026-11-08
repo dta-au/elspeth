@@ -32,6 +32,22 @@ tokens (49,664 cached), 9,522 output tokens (8,213 reasoning).
 Process-wide figures including background coordination. The 409 from the
 pipeline was correct plugin output and is out of scope.
 
+## Governing rule
+
+Every fix below is an instance of one rule: **verify external data when
+taking ownership, retain the verified immutable representation, and
+recompute only facts whose inputs changed.** Each layer today reconstructs
+or re-verifies because its interface does not carry the already-verified
+object forward. Authorization, blob availability, review state and
+transaction fences have different lifetimes from graph structure and static
+schemas; cache by lifetime, never across one.
+
+Corollary: `MappingProxyType` is not proof of ownership or immutability —
+its backing dict can still change elsewhere. "Skip freezing if it is already
+a proxy" is a correctness bug, not an optimization. Ownership is proved by
+*who constructed it* (a module-private constructor reachable only from the
+verifying path), not by the type of the container.
+
 ## Fix sequence and status
 
 | # | Fix | Risk | Complexity | Gate exposure | Status |
@@ -49,8 +65,20 @@ pipeline was correct plugin output and is out of scope.
 | 9 | Drop the executor's duplicate input hash | Low | Low | Engine unit + telemetry tests | open |
 | 10 | Load `chat_messages.tool_calls` once per list, filter by id | Low–Med | Medium | Reviewed-writer recipe re-pin; sessions unit | open |
 
+Reported by the external profile, **not yet verified here** — each gets a
+line-level check (lane report) before it is promoted to a numbered fix:
+
+| Pending | Reported mechanism | Reported scale |
+|---|---|---|
+| P-11 Review-card publication | Each interpretation card re-prepares principal/plugin availability, inline preflight config, blob info and validation inputs for the same candidate; inside the transaction each card re-fetches anchor and current-state rows; prior cards are fetched by node/kind and surfacing graphs loaded before term filtering → `0+1+…+(R−1)` lookups, worst case `O(R² × graph)` | Five cards on the complex graph (different node/kind groups, so not quadratic in that run) |
+| P-12 Rehydration / no-op reconstruction | Review-argument projection restores the same authority twice; graph-review read reconstructs the same record twice; reconciliation rebuilds every source/node/state on no change; proposal restoration hashes the audit payload twice and listing a third time. `composition_content_hash()` memoizes correctly but callers discard the instance | 1.2 ms rehydrate+hash, 0.78 ms double restore, 0.39 ms no-op reconcile, 5.8 ms proposal restore — small each, multiplied by publish/accept/list |
+| P-13 Candidate build validation shape | One build = 3 full-graph validations + N small probes; the last two full walks receive the *same* reconciled state object; `prepare_pipeline_commit` then builds the candidate again (that second build backs an integrity comparison — needs a replacement contract, not deletion) | 6.3 / 20.7 / 68.0 ms at 1 / 10 / 40 nodes |
+| P-14 Provider-request preparation | JSON round trip 5.5 ms, manifest 12.5 ms, size serialization 4.8 ms, private capture 62 ms (1.56 MiB transient), hash pair 4.8 ms, retained-payload validation ~15 ms, canonical `set_pipeline` schema built twice at 4.3 ms each | ~310 KB request; follow-on to fix 6 and 4A |
+| P-15 Application fingerprint | Launch/recovery re-reads and hashes 990 source files (~23.8 MB) | 0.19–0.20 s per occurrence |
+| P-16 Recovery envelope | Same serialized envelope parsed three times (validation, input construction, restoration) | per recovery |
+
 Order: 1 → 2A → re-measure → 10 → 6 → 3-T1 → 2B → 4A → 7 → 9 →
-re-measure. Fixes 1 and 2A remove the noise that would otherwise confound
+re-measure; pending items slot in once verified. Fixes 1 and 2A remove the noise that would otherwise confound
 the later measurements. Fix 10 comes next because its cost scales with
 history × proposals rather than being a fixed per-request charge; fix 6 is
 CPU-bound and scales with graph size, so both matter more for the larger
@@ -463,6 +491,10 @@ instrumented live; read from code.
   verified. Do **not** add a public "already validated" flag field — a
   flag on the dataclass can be forged by any caller; a module-private
   constructor cannot be reached through `from_dict` or the decoder.
+- Do **not** short-circuit `_validate_and_freeze_canonical_mapping` on
+  `isinstance(value, MappingProxyType)`: a proxy's backing dict is still
+  mutable by whoever holds it (see Governing rule). The only trusted input
+  is the object this module froze itself, on the path it controls.
 - Carry canonical bytes, byte length and digest on the frozen object so
   downstream consumers (commit, audit, hashing) reuse them instead of
   re-serializing.
