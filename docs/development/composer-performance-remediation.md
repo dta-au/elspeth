@@ -651,9 +651,31 @@ custody and recovery; add a statement-count assertion (SQLAlchemy event
 listener) that listing N committed proposals issues one `chat_messages`
 read, plus a negative control on the pre-fix shape.
 
-**Evidence.** _(fill in)_
+**Evidence (step 1 landed).** `PipelineDispatchEnvelopeIndex`
+(`sessions/proposal_authority.py`): bound to one connection and session,
+lazy single read of the same unfiltered statement, envelopes grouped by
+`invocation.tool_call_id` in row order with duplicates kept, deep copies
+returned. Threaded through `_verify_pipeline_lifecycle_authority` →
+committed/rejected verifiers from `_list_composition_proposals_on_connection`;
+single-proposal callers and the dispatch-recovery lookup unchanged. Statement
+counts (SQLAlchemy `before_cursor_execute`): list of 3 committed **3 → 1**;
+2 committed + 1 rejected-with-dispatch **3 → 1** (pre-fix count measured
+against real HEAD in a worktree); pending-only 0 → 0. Verdict parity:
+duplicate envelope and content-hash mismatch still refused with the same
+messages at HEAD and after. Mutation control: an index that forgets its
+groups fails both count tests with `3 == 1`. Writer-recipe and full-source
+pins regenerated with the gate's own `stable_ast_dump` (two function keys,
+two digests; dry-run shows no drift). Tests: lifecycle + static-writers 102
+passed (re-run by reviewer); sessions suite 3087 passed; architecture 1982
+passed + 1 xfail (`-n 3`, tree frozen); gates 263 passed; soft-mapping
+census unchanged; ruff/mypy clean; lint corpus 3674 lines, two existing
+findings moved line, none added. Not run: testcontainer (no Docker) — owed
+for this SQL read path; full suite. Step 2 (indexed prefilter) not started.
+Decision taken: function-level import in `service.py` to avoid re-pinning
+inventory `line=` rows.
 
-Lane notes: `.claude/lanes/perf-eval/08-manifest-rowhash-toolcalls.md`.
+Lane notes: `.claude/lanes/perf-eval/08-manifest-rowhash-toolcalls.md`,
+`fix10-implementation.md`.
 
 ---
 

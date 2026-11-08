@@ -10,7 +10,7 @@ from uuid import UUID, uuid4
 
 import pytest
 import structlog
-from sqlalchemy import delete, func, insert, select, update
+from sqlalchemy import delete, event, func, insert, select, update
 from sqlalchemy.pool import StaticPool
 
 from elspeth.contracts.composer_audit import ComposerToolStatus
@@ -49,7 +49,11 @@ from elspeth.web.sessions.models import (
     proposal_events_table,
     sessions_table,
 )
-from elspeth.web.sessions.proposal_authority import _pipeline_audit_payload_hash
+from elspeth.web.sessions.proposal_authority import (
+    PipelineDispatchEnvelopeIndex,
+    _persisted_pipeline_dispatch_content_hashes,
+    _pipeline_audit_payload_hash,
+)
 from elspeth.web.sessions.protocol import (
     CompositionStateData,
     StaleComposeStateError,
@@ -2573,3 +2577,170 @@ async def test_sparse_presence_recovery_rejects_tampered_audit(service: SessionS
     _replace_audit_envelope(service, session_id, message_id, envelope)
     with pytest.raises(AuditIntegrityError):
         await service.settle_pipeline_composition_proposal(**_settlement_kwargs(session_id, row.id, plan, binding))
+
+
+# --- Fix 10: one chat_messages.tool_calls read per proposal list -----------------------------
+
+
+def _is_tool_calls_history_read(statement: str) -> bool:
+    normalized = " ".join(statement.split()).lower()
+    return normalized.startswith("select chat_messages.tool_calls from chat_messages")
+
+
+class _ToolCallsHistoryReads:
+    """Count executed ``SELECT chat_messages.tool_calls`` statements on one engine."""
+
+    def __init__(self, engine) -> None:
+        self._engine = engine
+        self.statements: list[str] = []
+
+    def _record(self, _conn, _cursor, statement, _parameters, _context, _executemany) -> None:
+        self.statements.append(statement)
+
+    def __enter__(self) -> _ToolCallsHistoryReads:
+        event.listen(self._engine, "before_cursor_execute", self._record)
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        event.remove(self._engine, "before_cursor_execute", self._record)
+
+    @property
+    def history_reads(self) -> int:
+        return sum(1 for statement in self.statements if _is_tool_calls_history_read(statement))
+
+
+def test_tool_calls_history_read_matcher_is_controlled() -> None:
+    # Positive: the exact statement shape SQLAlchemy compiles for the custody read.
+    assert _is_tool_calls_history_read("SELECT chat_messages.tool_calls \nFROM chat_messages \nWHERE chat_messages.session_id = ?")
+    # Negative: other chat_messages reads, and tool_calls mentioned elsewhere, must not count.
+    assert not _is_tool_calls_history_read("SELECT chat_messages.id, chat_messages.tool_calls FROM chat_messages WHERE 1")
+    assert not _is_tool_calls_history_read("SELECT composition_proposals.id FROM composition_proposals")
+    assert not _is_tool_calls_history_read("SELECT count(*) FROM chat_messages WHERE chat_messages.tool_calls IS NOT NULL")
+
+
+async def _commit_proposals(service: SessionServiceImpl, session_id: UUID, count: int) -> list[PipelineDispatchAuditBinding]:
+    """Create, dispatch and commit ``count`` pipeline proposals in sequence on one session."""
+    bindings: list[PipelineDispatchAuditBinding] = []
+    base: AbsentBase | PresentBase = AbsentBase()
+    for index in range(count):
+        plan = replace(_plan(base), tool_call_id=f"planner-terminal-call-{index}")
+        row = await _create(service, session_id, plan)
+        binding = await _persist_dispatch(service, session_id, tool_call_id=plan.tool_call_id)
+        settled = await service.settle_pipeline_composition_proposal(**_settlement_kwargs(session_id, row.id, plan, binding))
+        assert settled.proposal.status == "committed"
+        base = PresentBase(state_id=settled.state.id, composition_content_hash=_state_content_hash(_state_data()))
+        bindings.append(binding)
+    return bindings
+
+
+@pytest.mark.asyncio
+async def test_listing_committed_proposals_reads_tool_calls_history_once(service: SessionServiceImpl) -> None:
+    session_id = uuid4()
+    _insert_session(service, session_id)
+    bindings = await _commit_proposals(service, session_id, 3)
+
+    with _ToolCallsHistoryReads(service._engine) as counter:
+        listed = await service.list_composition_proposals(session_id)
+
+    # Verdict parity: exact single matches are still accepted.
+    assert [record.status for record in listed] == ["committed", "committed", "committed"]
+    assert counter.history_reads == 1
+
+    # Negative control: the pre-fix list shape, one unshared custody check per proposal on
+    # one connection, is what the counter sees as N reads. A shared index is one read.
+    sid = str(session_id)
+    with _ToolCallsHistoryReads(service._engine) as unshared, service._engine.connect() as conn:
+        for binding in bindings:
+            assert len(_persisted_pipeline_dispatch_content_hashes(conn, session_id=sid, dispatch=binding)) == 1
+    assert unshared.history_reads == len(bindings) == 3
+    with _ToolCallsHistoryReads(service._engine) as shared, service._engine.connect() as conn:
+        index = PipelineDispatchEnvelopeIndex(conn, session_id=sid)
+        hashes = [
+            _persisted_pipeline_dispatch_content_hashes(conn, session_id=sid, dispatch=binding, dispatch_index=index)
+            for binding in bindings
+        ]
+    assert shared.history_reads == 1
+    assert hashes == [(_state_content_hash(_state_data()),)] * 3
+
+
+@pytest.mark.asyncio
+async def test_listing_pending_proposals_reads_no_tool_calls_history(service: SessionServiceImpl) -> None:
+    session_id = uuid4()
+    _insert_session(service, session_id)
+    await _create(service, session_id, _plan())
+
+    with _ToolCallsHistoryReads(service._engine) as counter:
+        listed = await service.list_composition_proposals(session_id)
+
+    assert [record.status for record in listed] == ["pending"]
+    assert counter.history_reads == 0
+
+
+@pytest.mark.asyncio
+async def test_listing_refuses_duplicate_dispatch_evidence_with_shared_index(service: SessionServiceImpl) -> None:
+    session_id = uuid4()
+    _insert_session(service, session_id)
+    bindings = await _commit_proposals(service, session_id, 3)
+    _message_id, envelope = _dispatch_audit_row(service, session_id, bindings[1].tool_call_id)
+    await _persist_cloned_audit_envelope(service, session_id, envelope)
+
+    with pytest.raises(AuditIntegrityError, match="committed pipeline proposal dispatch audit is missing or duplicated"):
+        await service.list_composition_proposals(session_id)
+
+
+@pytest.mark.asyncio
+async def test_listing_refuses_mismatched_dispatch_result_with_shared_index(service: SessionServiceImpl) -> None:
+    session_id = uuid4()
+    _insert_session(service, session_id)
+    bindings = await _commit_proposals(service, session_id, 3)
+    audit = begin_dispatch(bindings[2].tool_call_id, "set_pipeline", _pipeline(), version_before=0, actor="user:alice")
+    mismatched = finish_success(audit, result_payload=_pipeline_dispatch_result(pipeline_content_hash="f" * 64), version_after=1)
+    async with service._call_context(session_id, SessionOperationKind.COMPOSE) as compose_context:
+        await _persist_tool_invocations(
+            service, session_id, (mismatched,), None, plugin_crash_pending=False, session_operation_context=compose_context
+        )
+
+    with pytest.raises(AuditIntegrityError, match="does not match the terminal binding"):
+        await service.list_composition_proposals(session_id)
+
+
+@pytest.mark.asyncio
+async def test_rejected_dispatch_custody_reads_history_once_and_still_refuses_duplicates(service: SessionServiceImpl) -> None:
+    session_id = uuid4()
+    _insert_session(service, session_id)
+    await _commit_proposals(service, session_id, 2)
+    current = await service.get_current_state(session_id)
+    assert current is not None
+    base = PresentBase(state_id=current.id, composition_content_hash=_state_content_hash(_state_data()))
+    plan = replace(_plan(base), tool_call_id="planner-terminal-call-rejected")
+    row = await _create(service, session_id, plan)
+    binding = await _persist_dispatch(service, session_id, tool_call_id=plan.tool_call_id)
+    await service.reject_pipeline_composition_proposal(
+        session_id=session_id,
+        proposal_id=row.id,
+        draft_hash=plan.proposal.draft_hash,
+        reason="candidate_executor_mismatch",
+        dispatch=binding,
+        actor="system:pipeline-commit",
+    )
+
+    with _ToolCallsHistoryReads(service._engine) as counter:
+        listed = await service.list_composition_proposals(session_id)
+    assert [record.status for record in listed] == ["committed", "committed", "rejected"]
+    assert counter.history_reads == 1
+
+    _message_id, envelope = _dispatch_audit_row(service, session_id, plan.tool_call_id)
+    await _persist_cloned_audit_envelope(service, session_id, envelope)
+    with pytest.raises(AuditIntegrityError, match="rejected pipeline proposal dispatch audit is missing or duplicated"):
+        await service.list_composition_proposals(session_id)
+
+
+def test_dispatch_envelope_index_refuses_a_foreign_transaction_or_session(service: SessionServiceImpl) -> None:
+    session_id = str(uuid4())
+    with service._engine.connect() as conn, service._engine.connect() as other:
+        index = PipelineDispatchEnvelopeIndex(conn, session_id=session_id)
+        assert index.envelopes_for(conn, session_id=session_id, tool_call_id="absent") == ()
+        with pytest.raises(AuditIntegrityError, match="outside its transaction"):
+            index.envelopes_for(other, session_id=session_id, tool_call_id="absent")
+        with pytest.raises(AuditIntegrityError, match="outside its transaction"):
+            index.envelopes_for(conn, session_id=str(uuid4()), tool_call_id="absent")

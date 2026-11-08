@@ -4695,6 +4695,10 @@ class SessionServiceImpl:
                 raise AuditIntegrityError("proposal creation event escaped the constrained proposal query")
             by_proposal[event_row.proposal_id].append(event_row)
         enriched: list[CompositionProposalRecord] = []
+        from elspeth.web.sessions.proposal_authority import PipelineDispatchEnvelopeIndex
+
+        # Shared by every dispatch custody check below: one tool_calls history read per list.
+        dispatch_index = PipelineDispatchEnvelopeIndex(conn, session_id=sid)
         for record in records:
             events = by_proposal[str(record.id)]
             if len(events) != 1:
@@ -4704,11 +4708,7 @@ class SessionServiceImpl:
                 creation_event=_proposal_event_record_from_row(events[0]),
             )
             if authority.pipeline is not None:
-                _verify_pipeline_lifecycle_authority(
-                    conn,
-                    service=self,
-                    authority=authority.pipeline,
-                )
+                _verify_pipeline_lifecycle_authority(conn, service=self, authority=authority.pipeline, dispatch_index=dispatch_index)
             metadata = _pipeline_public_metadata(authority.pipeline) if authority.pipeline is not None else None
             enriched.append(replace(record, pipeline_metadata=metadata))
         return tuple(enriched)
