@@ -853,6 +853,12 @@ Record raw output, not summaries, in each fix's Evidence line.
   `DATA_DIR`, `PAYLOAD_STORE_PATH`, the OpenRouter models and key, and
   `COMPOSER_PROMPT_GUARD_MODE=debug-when-unconfigured` (the documented
   development mode; records `debug_bypass`, unprotected).
+- The tutorial's `llm` node needs `ELSPETH_WEB__LLM_PROFILES` with a
+  `standard` OpenRouter profile (`deepseek/deepseek-v4.1-flash`,
+  `credential_scope: server`, `credential_ref: OPENROUTER_API_KEY`) and
+  `ELSPETH_WEB__DEFAULT_LLM_PROFILE=standard`; without them the Welcome
+  step shows "Tutorial LLM profile is not configured" and "Let's go" is
+  disabled. `GET /api/system/status` → `tutorial_ready: true` confirms it.
 - Accounts: authoring requires a deployment-wide `user` role, and an
   identity cannot hold both `admin` and `user` (`role_forbidden_for_identity`).
   So: `demo` = first administrator via `elspeth composer users bootstrap-admin
