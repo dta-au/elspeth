@@ -61,8 +61,8 @@ verifying path), not by the type of the container.
 | 3-T2 | Snapshot-bound per-send stream authorization | High (semantic) | Low code | Developer ruling | not started — ruling needed |
 | 5 | Allocation profiling | — | — | — | after 1 and 2A |
 | 6 | Carry-once validated proposal (no re-freeze/re-hash) | Low–Med | Medium | Unit (proposal, decoder, hashing) | open |
-| 7 | Approval binding reuses the cached runtime manifest | Low | Low | Unit (approval, landscape) | open — governance-on only |
-| 9 | Drop the executor's duplicate input hash | Low | Low | Engine unit + telemetry tests | open |
+| 7 | Approval binding reuses the cached runtime manifest | Low | Low | Unit (approval, landscape) | **out of scope** (execution side; maintainer ruling 2026-11-08: this effort is composer only) |
+| 9 | Drop the executor's duplicate input hash | Low | Low | Engine unit + telemetry tests | **out of scope** (execution side; same ruling) |
 | 10 | Load `chat_messages.tool_calls` once per list, filter by id | Low–Med | Medium | Reviewed-writer recipe re-pin; sessions unit | open |
 | 11 | Memoize tool-definition credential scan by tools hash | Low | Low | Unit (provider_context) | open |
 | 12 | Cache `canonical_set_pipeline_schema()` per process | Low | Low | Unit (schema_contract, planner) | open |
@@ -97,11 +97,17 @@ the original list:
 | S-10/11 Accept re-checks own arguments; serialize-then-hash twice | A | Proposal accept re-verifies arguments it just produced (10–81 ms); same value serialized then hashed separately back-to-back | Fold into fix 6 |
 | S-12 Post-turn GET fan-out | F | Frontend fires 6–7 GETs after every turn, beyond fix 2's validate/readiness pair | Extend fix 2B's coordinator |
 
-Order: 1 → 2A → re-measure → 10 → 6 (+S-10/11) → 14 → 15 → 11 → 12 →
-3-T1 → 13 → 2B (+S-12) → 4A → 7 → 9 → re-measure; other pending items slot
-in once verified and, where marked, ruled on. Fix 13 sits after 3-T1 because
-it is the widest change to session-write transactions and benefits from
-fixes 1, 14 and 15 having shrunk the per-card cost first. Fixes 1 and 2A remove the noise that would otherwise confound
+Order: 1 ✓ → 10 ✓ → 6 → 14 → 15 → 11 → 12 → 2A → 3-T1 → 13 → 2B (+S-12)
+→ 4A → re-measure; other composer-side pending items slot in once verified
+and, where marked, ruled on. Fix 13 sits after 3-T1 because it is the widest
+change to session-write transactions and benefits from fixes 1, 14 and 15
+having shrunk the per-card cost first. Execution-side items (7, 9, P-15,
+P-16) are out of scope for this effort by maintainer ruling (2026-11-08);
+they stay recorded for a later execution-side pass.
+
+Smoke gate per fix in this container: the tutorial's compose transition with
+a clean transition ledger (see Test environment); the Run phase is out of
+scope for this effort. Fixes 1 and 2A remove the noise that would otherwise confound
 the later measurements. Fix 10 comes next because its cost scales with
 history × proposals rather than being a fixed per-request charge; fix 6 is
 CPU-bound and scales with graph size, so both matter more for the larger
