@@ -45,11 +45,17 @@ pipeline was correct plugin output and is out of scope.
 | 3-T2 | Snapshot-bound per-send stream authorization | High (semantic) | Low code | Developer ruling | not started — ruling needed |
 | 5 | Allocation profiling | — | — | — | after 1 and 2A |
 | 6 | Carry-once validated proposal (no re-freeze/re-hash) | Low–Med | Medium | Unit (proposal, decoder, hashing) | open |
+| 7 | Approval binding reuses the cached runtime manifest | Low | Low | Unit (approval, landscape) | open — governance-on only |
+| 9 | Drop the executor's duplicate input hash | Low | Low | Engine unit + telemetry tests | open |
+| 10 | Load `chat_messages.tool_calls` once per list, filter by id | Low–Med | Medium | Reviewed-writer recipe re-pin; sessions unit | open |
 
-Order: 1 → 2A → re-measure → 6 → 3-T1 → 2B → 4A → re-measure. Fixes 1 and
-2A remove the noise that would otherwise confound the later measurements;
-fix 6 is CPU-bound and scales with graph size, so it matters more for the
-larger graphs that follow the tutorial.
+Order: 1 → 2A → re-measure → 10 → 6 → 3-T1 → 2B → 4A → 7 → 9 →
+re-measure. Fixes 1 and 2A remove the noise that would otherwise confound
+the later measurements. Fix 10 comes next because its cost scales with
+history × proposals rather than being a fixed per-request charge; fix 6 is
+CPU-bound and scales with graph size, so both matter more for the larger
+graphs that follow the tutorial. Fix 7 only fires with workflow governance
+on; fix 9 is engine-side and scales with rows × retries.
 
 ## Working rules for every fix
 
@@ -480,6 +486,105 @@ toward ~40 ms; the whole-tree gates (`tests/unit/architecture/`) unchanged.
 **Evidence.** _(fill in)_
 
 Lane notes: `.claude/lanes/perf-eval/06-proposal-revalidation.md`.
+
+---
+
+## Fix 7 — Approval binding rebuilds the runtime manifest
+
+**Mechanism (verified).** `runtime_val_manifest_sha256()`
+(`src/elspeth/web/coordination/approval_authority.py:114-120`) calls
+`prepare_for_run()` then `build_runtime_val_manifest()` uncached on every
+approval binding — measured ~0.35 s per call here (profile: ~0.7 s). The
+Landscape run-lifecycle repository already caches the identical frozen
+manifest JSON (`_cached_frozen_runtime_val_manifest_json`, keyed on
+`runtime_val_registry_fingerprint()`) for `begin_run`, returning in 22–58 µs
+warm; both paths hash the same bytes (equality measured). The cache is
+private to Landscape, which is why approval binding cannot reach it.
+
+**Scope.** Only runs when `workflow_governance == "on"` (default `"off"`);
+irrelevant to the tutorial, significant for governed deployments.
+
+**Change.** Move the fingerprint-keyed cached accessor into
+`src/elspeth/contracts/runtime_val_manifest.py` and call it from both
+`begin_run` and `runtime_val_manifest_sha256`. Keep the uncached rebuild in
+`resume.py:640` — it is a deliberate drift check and must see the live tree.
+
+**Tests.** Approval-authority unit tests, Landscape run-lifecycle tests, and
+a new assertion that the two callers agree byte-for-byte and that a changed
+registry fingerprint invalidates the shared cache.
+
+**Evidence.** _(fill in)_
+
+---
+
+## Fix 9 — Executor and audit repository both hash every row
+
+**Mechanism (verified, incidental duplication).** The transform executor
+hashes the input (`engine/executors/transform.py:880`) and the output
+(`:737`); the Landscape repository re-hashes both independently
+(`node_states.py:154` and `:610`). Nothing compares the pairs — the
+repository is never handed the executor's value — so this is not an
+integrity cross-check; the executor's hashes feed telemetry and one test.
+(Aggregation differs: `execution_repository.py:1018` *does* verify a hash it
+is given; leave that alone.) Cost scales with rows × payload × retries.
+
+**Change.** Reuse the `NodeStateOpen.input_hash` the repository already
+computed instead of hashing input again in the executor. **Keep the
+executor's output hash**: it converts NaN/Infinity into a routed Tier-2
+violation before `guard.complete`; removing it would turn that failure into
+a crash. Net: one of four hashes removed per attempt.
+
+**Tests.** Engine executor unit tests, telemetry assertions that consume
+`input_hash`, retry tests under `tests/unit/engine/`. Add a negative
+control showing the NaN/Infinity path still routes as a violation.
+
+**Evidence.** _(fill in)_
+
+---
+
+## Fix 10 — Proposal verification loads the whole `tool_calls` history
+
+**Mechanism (verified).** Dispatch custody verification runs
+`select(chat_messages_table.c.tool_calls).where(session_id == sid)` with no
+`tool_call_id` or role filter, then matches in Python
+(`sessions/proposal_authority.py:327-335`
+`_persisted_pipeline_dispatch_content_hashes`; `sessions/service.py:8117`
+dispatch recovery). `tool_calls` is a JSON column on `chat_messages`, not a
+table, and no index helps: `tool_call_id` is populated only on tool rows
+while dispatch ids live inside JSON on audit rows. The proposal-list path
+(`_list_composition_proposals_on_connection`, `service.py:4705-4710`) calls
+`_verify_pipeline_lifecycle_authority` per committed or dispatch-bearing
+rejected proposal, so one list request does one full history load per such
+proposal. Call sites: `service.py:3664, 4144, 4598`. Cost ∝ history size ×
+proposal count; the profile measured 1.18 MB of history against a 36 KB
+state row (the 1.18 MB figure and the "retained provider-request snapshot"
+attribution were not re-verified here).
+
+**Change (two steps, both preserve the duplicate/mismatch custody checks).**
+1. Load the session's `tool_calls` rows once per list call and group
+   envelopes by `tool_call_id`; pass the grouping into
+   `_persisted_pipeline_dispatch_content_hashes` and the recovery lookup
+   instead of re-querying per proposal.
+2. Add a superset prefilter the custody check can trust (e.g. `role =
+   'audit'`, or a persisted `dispatch_tool_call_id` column on the rows that
+   carry envelopes, with a migration under the 0.8.7+ compatibility
+   posture) so a single proposal's verification reads only its candidate
+   rows. Step 2 needs a schema decision; step 1 does not.
+
+**Hazards.** `reviewed-writer-recipes.json:136` pins the AST of
+`_persisted_pipeline_dispatch_content_hashes` — any edit requires the recipe
+regenerated honestly, not bypassed. The duplicate-envelope check (`len(...)
+!= 1` at `:4598`) and the content-hash mismatch checks must produce the same
+verdicts on the same data before and after.
+
+**Tests.** `tests/unit/web/sessions/` tests for proposal listing, dispatch
+custody and recovery; add a statement-count assertion (SQLAlchemy event
+listener) that listing N committed proposals issues one `chat_messages`
+read, plus a negative control on the pre-fix shape.
+
+**Evidence.** _(fill in)_
+
+Lane notes: `.claude/lanes/perf-eval/08-manifest-rowhash-toolcalls.md`.
 
 ---
 
