@@ -888,6 +888,16 @@ Record raw output, not summaries, in each fix's Evidence line.
   `user` by `demo` through `POST /api/auth/admin/roles`. The tutorial harness
   runs as `pilot`. Local accounts created by the CLI are already active (no
   pending activation step).
+- **Smoke gate in this container = the compose transition, not the full
+  tutorial.** The cloud container has no DNS resolver (`getaddrinfo` fails
+  for every host; only the HTTPS proxy resolves names), and `web_scrape`
+  resolves the row's URL host itself before connecting — correct SSRF-guard
+  behaviour — so the tutorial's Run phase discards every row with
+  `dns_failed` regardless of code. The compose transition does complete with
+  durable evidence: on fix 1 + fix 10 code, 2 provider calls / 2 planner
+  calls in one run, 20.0 s model time, zero ledger violations, ~$0.03. The
+  full Welcome → Run → Audit → Graduation walk needs a host with DNS (the
+  maintainer's machine or staging).
 - Tutorial smoke run: the project's `tutorial-reliability.staging` spec
   requires an HTTPS origin, so a local Node TLS terminator (self-signed,
   `https://localhost:8443` → `:8451`) fronts the server; the spec runs
