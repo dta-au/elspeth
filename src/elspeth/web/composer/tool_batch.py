@@ -1605,14 +1605,33 @@ async def run_tool_batch(
                 )
                 try:
                     cached_admitted = (
-                        admitted_result_from_cached_discovery_payload(tool_name, state, discovery_cache[cache_key])
+                        await _await_started_tool_stage(
+                            run_sync_in_worker(
+                                admitted_result_from_cached_discovery_payload,
+                                tool_name,
+                                state,
+                                discovery_cache[cache_key],
+                                catalog=ctx.policy_catalog,
+                            ),
+                            audit=audit,
+                            recorder=recorder,
+                        )
                         if response_contract_for(tool_name) is not None
                         else None
                     )
                     cached_result = (
                         cached_admitted.result
                         if cached_admitted is not None
-                        else _result_from_cached_discovery_payload(state, discovery_cache[cache_key])
+                        else await _await_started_tool_stage(
+                            run_sync_in_worker(
+                                _result_from_cached_discovery_payload,
+                                state,
+                                discovery_cache[cache_key],
+                                catalog=ctx.policy_catalog,
+                            ),
+                            audit=audit,
+                            recorder=recorder,
+                        )
                     )
                     cached_result = normalize_tool_result_validation(cached_result, ctx.policy_catalog)
                     if cached_admitted is not None:
@@ -1664,6 +1683,9 @@ async def run_tool_batch(
                         ),
                     }
                 )
+                # Carry the current projection forward just as an uncached
+                # discovery does; a previous mutation refusal is not state.
+                last_validation = cached_result.validation
                 continue
 
         all_cache_hits = False

@@ -4499,6 +4499,271 @@ class TestComposerMultipleToolCallsPerTurn:
 class TestDiscoveryCache:
     """Tests for the discovery cache (F1)."""
 
+    def test_cache_reconstruction_binds_current_graph_and_policy(self) -> None:
+        """Current policy is projected once; a later snapshot still revalidates."""
+        from elspeth.web.composer.discovery_cache import CachedDiscoveryPayload, result_from_cached_discovery_payload
+        from elspeth.web.composer.tools._common import normalize_tool_result_validation
+
+        catalog = _mock_catalog()
+        snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
+        view = PolicyCatalogView.for_trained_operator(catalog, snapshot)
+        old_state = _empty_state()
+        state = replace(old_state, version=old_state.version + 1, metadata=PipelineMetadata(name="Current graph"))
+        cached = CachedDiscoveryPayload(success=True, affected_nodes=(), data={"reference": "stable discovery"})
+        original_validation = PolicyCatalogView.validate_composition_state
+        with patch.object(PolicyCatalogView, "validate_composition_state", autospec=True, side_effect=original_validation) as validate:
+            result = result_from_cached_discovery_payload(state, cached, catalog=view)
+            assert result.updated_state is state
+            assert result._validation_snapshot_hash == snapshot.snapshot_hash
+            assert normalize_tool_result_validation(result, view) is result
+            assert validate.call_count == 1
+            other_snapshot = replace(snapshot, snapshot_hash="another-current-policy")
+            other_view = PolicyCatalogView.for_trained_operator(catalog, other_snapshot)
+            revalidated = normalize_tool_result_validation(result, other_view)
+
+        assert [(call.args[0], call.args[1]) for call in validate.call_args_list] == [(view, state), (other_view, state)]
+        assert revalidated._validation_snapshot_hash == other_snapshot.snapshot_hash
+        assert revalidated.validation == state.validate()
+        assert revalidated.updated_state is state
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("tool_name", ["list_sources", "get_expression_grammar"])
+    async def test_cache_hit_validates_once_off_event_loop(self, tool_name: str) -> None:
+        """A cache hit performs one current-policy projection without blocking the loop."""
+        service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
+        state = _empty_state()
+        responses = iter(
+            [_make_llm_response(tool_calls=[{"id": call_id, "name": tool_name, "arguments": {}}]) for call_id in ("miss", "hit")]
+            + [_make_llm_response(content="Done.")]
+        )
+        provider_calls = 0
+        measuring_hit = False
+        event_loop_thread = threading.current_thread()
+        policy_threads: list[threading.Thread] = []
+        raw_threads: list[threading.Thread] = []
+        original_policy_validation = PolicyCatalogView.validate_composition_state
+        original_raw_validation = CompositionState.validate
+
+        async def respond(*args: Any, **kwargs: Any) -> _AdmittedLLMCompletion:
+            nonlocal provider_calls, measuring_hit
+            provider_calls += 1
+            measuring_hit = provider_calls == 2
+            return next(responses)
+
+        def validate_policy(view: PolicyCatalogView, current: CompositionState) -> Any:
+            if measuring_hit:
+                assert current is state
+                policy_threads.append(threading.current_thread())
+            return original_policy_validation(view, current)
+
+        def validate_raw(current: CompositionState) -> ValidationSummary:
+            if measuring_hit:
+                raw_threads.append(threading.current_thread())
+            return original_raw_validation(current)
+
+        with (
+            patch.object(service._provider_gateway, "_call_llm", side_effect=respond),
+            patch.object(PolicyCatalogView, "validate_composition_state", validate_policy),
+            patch.object(CompositionState, "validate", validate_raw),
+        ):
+            result = await service.compose("Describe the pipeline tools", [], state, session_id=session_id)
+
+        assert [invocation.cache_hit for invocation in result.tool_invocations] == [False, True]
+        assert len(policy_threads) == 1
+        assert len(raw_threads) == 1
+        assert policy_threads[0] is not event_loop_thread
+        assert raw_threads[0] is policy_threads[0]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("full_replacement", [False, True])
+    async def test_cache_hit_does_not_reuse_prior_mutation_rejection(self, full_replacement: bool) -> None:
+        """A refused mutation's envelope is never the next discovery's validation."""
+        from elspeth.web.composer import tool_batch as tool_batch_module
+        from elspeth.web.composer.tools._common import _failure_result, normalize_tool_result_validation
+
+        service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
+        state = _empty_state()
+        script = _ReconciliationLLMScript(
+            _make_llm_response(tool_calls=[{"id": "miss", "name": "list_sources", "arguments": {}}]),
+            _make_llm_response(tool_calls=[{"id": "refused", "name": "set_metadata", "arguments": {"patch": {"name": "ignored"}}}]),
+            _make_llm_response(tool_calls=[{"id": "hit", "name": "list_sources", "arguments": {}}]),
+            _make_llm_response(content="Done."),
+        )
+
+        def dispatch(
+            name: str, arguments: dict[str, Any], current: CompositionState, catalog: PolicyCatalogView, **kwargs: Any
+        ) -> ToolResult:
+            if name == "set_metadata":
+                return normalize_tool_result_validation(
+                    _failure_result(current, "Refused mutation.", with_state_validation=not full_replacement),
+                    catalog,
+                )
+            return _strict_execute_tool(name, arguments, current, catalog, **kwargs)
+
+        with (
+            patch.object(service._provider_gateway, "_call_llm", side_effect=script.respond),
+            patch.object(tool_batch_module, "execute_tool", side_effect=dispatch),
+        ):
+            result = await service.compose("Describe the available sources", [], state, session_id=session_id)
+
+        payloads = {message["tool_call_id"]: json.loads(message["content"]) for message in script.prompts[-1] if message["role"] == "tool"}
+        assert payloads["refused"]["validation"]["errors"][0]["component"] == "rejected_mutation"
+        assert payloads["hit"]["validation"] == payloads["miss"]["validation"]
+        assert all(entry["component"] != "rejected_mutation" for entry in payloads["hit"]["validation"]["errors"])
+        assert result.state is state
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("full_replacement", [False, True])
+    async def test_cache_hit_refreshes_validation_for_next_mutation_delta(self, full_replacement: bool) -> None:
+        """Cache warmth cannot make the next mutation claim it repaired a prior refusal."""
+        from elspeth.web.composer import tool_batch as tool_batch_module
+        from elspeth.web.composer.tools._common import _failure_result, normalize_tool_result_validation
+
+        deltas: list[dict[str, Any]] = []
+        for observation in ("list_sources", "get_expression_grammar"):
+            service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
+            script = _ReconciliationLLMScript(
+                _make_llm_response(tool_calls=[{"id": "miss", "name": "list_sources", "arguments": {}}]),
+                _make_llm_response(tool_calls=[{"id": "refused", "name": "set_metadata", "arguments": {"patch": {"name": "reject"}}}]),
+                _make_llm_response(tool_calls=[{"id": "observation", "name": observation, "arguments": {}}]),
+                _make_llm_response(
+                    tool_calls=[{"id": "accepted", "name": "set_metadata", "arguments": {"patch": {"name": "Accepted metadata"}}}]
+                ),
+                _make_llm_response(content="Done."),
+            )
+
+            def dispatch(
+                name: str, arguments: dict[str, Any], current: CompositionState, catalog: PolicyCatalogView, **kwargs: Any
+            ) -> ToolResult:
+                if name == "set_metadata" and arguments["patch"]["name"] == "reject":
+                    return normalize_tool_result_validation(
+                        _failure_result(current, "Refused mutation.", with_state_validation=not full_replacement),
+                        catalog,
+                    )
+                result = _strict_execute_tool(name, arguments, current, catalog, **kwargs)
+                if name == "set_metadata":
+                    deltas.append(result.to_dict()["validation_delta"])
+                return result
+
+            with (
+                patch.object(service._provider_gateway, "_call_llm", side_effect=script.respond),
+                patch.object(tool_batch_module, "execute_tool", side_effect=dispatch),
+                patch.object(service._preflight, "runtime_preflight", return_value=ValidationResult(is_valid=True, checks=[], errors=[])),
+            ):
+                result = await service.compose("Describe tools and name the draft", [], _empty_state(), session_id=session_id)
+            assert result.state.metadata.name == "Accepted metadata"
+
+        assert len(deltas) == 2
+        assert deltas[1]["resolved_errors"] == []
+        assert deltas[0] == deltas[1]
+
+    @pytest.mark.asyncio
+    async def test_cache_hit_validation_cancellation_closes_tool_audit(self) -> None:
+        """A cancelled worker projection records CANCELLED before the batch unwinds."""
+        from elspeth.web.composer.audit import ComposerToolCancellation
+
+        service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
+        state = _empty_state()
+        provider_calls = 0
+        original_validation = PolicyCatalogView.validate_composition_state
+        cancellation = asyncio.CancelledError("cancelled")
+
+        async def respond(*args: Any, **kwargs: Any) -> _AdmittedLLMCompletion:
+            nonlocal provider_calls
+            provider_calls += 1
+            return _make_llm_response(
+                tool_calls=[{"id": "miss" if provider_calls == 1 else "cancelled-hit", "name": "list_sources", "arguments": {}}]
+            )
+
+        def validate(view: PolicyCatalogView, current: CompositionState) -> Any:
+            if provider_calls == 2:
+                raise cancellation
+            return original_validation(view, current)
+
+        with (
+            patch.object(service._provider_gateway, "_call_llm", side_effect=respond),
+            patch.object(PolicyCatalogView, "validate_composition_state", validate),
+            patch.object(BufferingRecorder, "record", autospec=True, side_effect=BufferingRecorder.record) as record,
+            pytest.raises(ComposerToolCancellation) as caught,
+        ):
+            await service.compose("Describe the available sources", [], state, session_id=session_id)
+
+        assert caught.value.original_cancellation is cancellation
+        assert provider_calls == 2
+        assert [call.args[1].status for call in record.call_args_list] == [ComposerToolStatus.SUCCESS, ComposerToolStatus.CANCELLED]
+        assert [(entry.tool_call_id, entry.status) for entry in caught.value.tool_invocations] == [
+            ("cancelled-hit", ComposerToolStatus.CANCELLED)
+        ]
+
+    @pytest.mark.asyncio
+    async def test_request_cancellation_joins_started_cache_hit_before_persisting(self) -> None:
+        """Request cancellation preserves the started hit and stops the remaining batch."""
+        from elspeth.web.composer import service as service_module
+
+        service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
+        state = _empty_state()
+        worker_started = threading.Event()
+        release_worker = threading.Event()
+        cancellation_events: list[asyncio.Event] = []
+        provider_calls = 0
+        original_validation = PolicyCatalogView.validate_composition_state
+        original_await = service_module._await_tool_turn_with_deferred_cancellation
+
+        async def respond(*args: Any, **kwargs: Any) -> _AdmittedLLMCompletion:
+            nonlocal provider_calls
+            provider_calls += 1
+            assert provider_calls <= 2
+            calls = [{"id": "miss" if provider_calls == 1 else "started-hit", "name": "list_sources", "arguments": {}}]
+            if provider_calls == 2:
+                calls.append({"id": "must-not-start", "name": "list_sources", "arguments": {}})
+            return _make_llm_response(tool_calls=calls)
+
+        def validate(view: PolicyCatalogView, current: CompositionState) -> Any:
+            if provider_calls == 2:
+                worker_started.set()
+                assert release_worker.wait(10), "test did not release the cache-hit validation worker"
+            return original_validation(view, current)
+
+        async def await_turn(awaitable: Awaitable[Any], *, cancellation_requested: asyncio.Event) -> Any:
+            cancellation_events.append(cancellation_requested)
+            return await original_await(awaitable, cancellation_requested=cancellation_requested)
+
+        with (
+            patch.object(service._provider_gateway, "_call_llm", side_effect=respond),
+            patch.object(PolicyCatalogView, "validate_composition_state", validate),
+            patch.object(service_module, "_await_tool_turn_with_deferred_cancellation", side_effect=await_turn),
+            patch.object(BufferingRecorder, "record", autospec=True, side_effect=BufferingRecorder.record) as record,
+        ):
+            task = asyncio.create_task(service.compose("Describe the sources", [], state, session_id=session_id))
+            try:
+                async with asyncio.timeout(10):
+                    while not worker_started.is_set():
+                        if task.done():
+                            await task
+                        await asyncio.sleep(0.001)
+                task.cancel("session_superseded")
+                await asyncio.wait_for(cancellation_events[-1].wait(), timeout=5)
+                assert not task.done(), "request cancellation abandoned its running validation worker"
+                release_worker.set()
+                with pytest.raises(asyncio.CancelledError) as caught:
+                    await task
+            finally:
+                release_worker.set()
+                if not task.done():
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
+
+        assert caught.value.args == ("session_superseded",)
+        assert provider_calls == 2
+        assert [(call.args[1].tool_call_id, call.args[1].status) for call in record.call_args_list] == [
+            ("miss", ComposerToolStatus.SUCCESS),
+            ("started-hit", ComposerToolStatus.SUCCESS),
+        ]
+        assert service._sessions_service is not None
+        stored = await service._sessions_service.get_messages(UUID(session_id))
+        assert [message.tool_call_id for message in stored if message.role == "tool"] == ["miss", "started-hit"]
+
     @pytest.mark.asyncio
     async def test_one_compose_call_threads_one_snapshot_object(self) -> None:
         """Prompt and every tool dispatch share one principal snapshot."""

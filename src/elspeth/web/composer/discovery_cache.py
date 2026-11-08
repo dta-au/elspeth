@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel
 
@@ -20,6 +20,9 @@ from elspeth.web.composer.tools import ToolResult
 from elspeth.web.composer.tools._generation_schema_response import AdmittedPluginSchemaResponse
 from elspeth.web.composer.tools._registry import response_contract_for
 from elspeth.web.execution.runtime_preflight import RuntimePreflightEntry, RuntimePreflightKey
+
+if TYPE_CHECKING:
+    from elspeth.web.catalog.policy_view import PolicyCatalogView
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,14 +96,28 @@ def cached_discovery_payload(result: ToolResult | AdmittedDiscoveryResult) -> Ca
 def result_from_cached_discovery_payload(
     state: CompositionState,
     cached: CachedDiscoveryPayload,
+    *,
+    catalog: PolicyCatalogView | None = None,
 ) -> ToolResult:
-    """Rebuild a cached discovery result with the current state envelope."""
+    """Rebuild the current envelope, projecting request policy once when supplied.
+
+    Cache payloads carry no validation: both graph and policy may have changed
+    since discovery. The policy-bound result retains the normalizer's snapshot
+    tag so its outward authority check does not repeat the projection.
+    """
+    if catalog is None:
+        validation = state.validate()
+        snapshot_hash = None
+    else:
+        validation = catalog.validate_composition_state(state).validation
+        snapshot_hash = catalog.snapshot.snapshot_hash
     return ToolResult(
         success=cached.success,
         updated_state=state,
-        validation=state.validate(),
+        validation=validation,
         affected_nodes=cached.affected_nodes,
         data=cached.data,
+        _validation_snapshot_hash=snapshot_hash,
     )
 
 
@@ -108,13 +125,15 @@ def admitted_result_from_cached_discovery_payload(
     tool_name: str,
     state: CompositionState,
     cached: CachedDiscoveryPayload,
+    *,
+    catalog: PolicyCatalogView | None = None,
 ) -> AdmittedDiscoveryResult:
     """Re-admit canonical cached data before any success audit or disclosure."""
     contract = response_contract_for(tool_name)
     if contract is None or cached.admitted_response is None or cached.success is not True or cached.data is not None:
         raise FrameworkBugError("Malformed admitted discovery cache entry")
     response = cached.admitted_response.readmit(contract)
-    result = result_from_cached_discovery_payload(state, cached)
+    result = result_from_cached_discovery_payload(state, cached, catalog=catalog)
     return AdmittedDiscoveryResult(result, response, contract)
 
 
