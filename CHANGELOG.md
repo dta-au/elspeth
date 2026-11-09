@@ -4,7 +4,34 @@ All notable changes to ELSPETH are documented here.
 
 ---
 
-## 0.8.10 - Unreleased
+## 0.8.10 - 2026-11-09
+
+This entry records the Composer performance remediation and the fixes landed
+with it on the 0.8.10 candidate. The dated entry and package version do not
+establish qualification, a published tag or an image.
+
+### Engine and runtime
+
+- **Approval binding shares the cached runtime VAL manifest with `begin_run`.**
+  The approval hash and the run header are now derived from the same frozen
+  manifest text, keyed on the registry fingerprint, instead of rebuilding the
+  manifest on every approval binding. The resume drift check stays uncached.
+  Warm approval binding drops from about half a second to under a millisecond.
+  Closes [#346](https://github.com/dta-au/elspeth/issues/346).
+- **The transform executor reads the recorded input hash.** The executor
+  hashed every row's input on every attempt while the Landscape repository
+  hashed the same row again inside `begin_node_state`. The executor now reads
+  the hash the repository derived and recorded. Its output hash is kept because
+  it routes NaN and Infinity output as a Tier-2 violation. Recorded hashes and
+  sink output are byte-identical on the shipped examples. Closes
+  [#347](https://github.com/dta-au/elspeth/issues/347).
+- **`.env` discovery follows the working directory.** The CLI searched upward
+  from the installed package, so an editable checkout loaded the checkout's
+  `.env` from any directory and a wheel install ignored the operator's `.env`.
+  Discovery now starts from the current working directory, as documented.
+  `--env-file` and `--no-dotenv` are unchanged. Tests that assert `--no-dotenv`
+  no longer inherit the variables pytest preloaded from the checkout's `.env`.
+  Closes [#353](https://github.com/dta-au/elspeth/issues/353).
 
 ### Composer
 
@@ -21,6 +48,57 @@ All notable changes to ELSPETH are documented here.
   `ELSPETH_WEB__COMPOSER_ADVISOR_REASONING_EFFORT` accept `low`, `medium` or
   `high`; `none` is refused at startup, and the planner configuration refuses
   an unhinted or unknown effort before any provider turn.
+- **Every LLM call row records request byte sizes per component.** Each
+  composer call record carries the UTF-8 size of every message sent, in send
+  order, the size of the tool-definition array and their sum, derived from the
+  same canonical serialization the message and tool hashes already perform.
+  The contract refuses a split that does not sum or that disagrees with the
+  tool hash about whether tools were sent. The sidecar exposes sizes, never
+  content.
+- **Proposals, schemas and tool definitions are verified once.**
+  `PipelineProposal.create` freezes and hashes its tree once instead of four
+  and two times; hand-built, replaced and decoded proposals still run full
+  verification. The canonical `set_pipeline` schema and its compiled validator
+  are built once per process and served as fresh decoded copies. Passing
+  credential-scan verdicts for the fixed tool definitions are memoized by
+  content hash; a refused list is never remembered and messages are still
+  scanned on every call. Draft hashes and canonical pipelines are byte-identical.
+- **Candidate builds and review projections preserve state identity.** The
+  `set_pipeline` candidate envelope is built from the request-scoped authority,
+  removing a provisional whole-graph walk that nothing read. Restored states
+  are threaded through review projection, graph-review reads, reconciliation,
+  proposal restoration and commit binding instead of being rebuilt, so the
+  content-hash memo survives; reconciliation returns its input when every
+  component reproduces the original exactly. All outputs are byte-identical.
+- **Plugin summaries, proposal lists and review cards read once.** The catalog
+  builds plugin summaries at construction instead of regenerating about sixty
+  schemas per composer request. Dispatch custody verification reads the
+  session's `tool_calls` history once per proposal list. Publishing the review
+  cards for one candidate prepares the shared context once and locks the head
+  state per card instead of re-reading it, with per-card provenance and
+  authorization checks unchanged.
+- **Advisory validation is memoized briefly; durable records validate fresh.**
+  `POST /validate` and `GET /audit-readiness` for the same composition version
+  share a bounded ten-second single-flight memo keyed on user, session, content
+  hash, version, plugin snapshot and secret inventory. States wiring a
+  user-authored secret bypass it, failures are never stored, and execute and
+  approval binding never read it. `validate_state` and `compute_snapshot` take
+  a keyword-only `fresh` parameter, and marking a state ready for review passes
+  `fresh=True`, so nothing in the durable review record derives from the memo.
+- **Operation streams authorize on one connection.** The database clock is
+  read as a column of the operation row, and identity, session family, role
+  grants and the session columns the stream judges are read on one connection
+  with one clock sample. No revocation, expiry, cancellation or fencing
+  decision changed; SQLite's write lock is no longer taken per frame.
+- **The frontend validates once per edit and holds Run while work settles.**
+  Validation after an interpretation resolve or a YAML import goes through the
+  auto-validation queue instead of a second direct `POST /validate`; with no
+  queue registered the store still validates directly. Run and Retry are held,
+  with a short status line, while a compose turn, a proposal decision, a resolve
+  or opt-out for the session, or validation is still in flight, so the run route
+  no longer answers a bare 409. No backend change; the tutorial runs the same
+  backend as every session. Closes
+  [#352](https://github.com/dta-au/elspeth/issues/352).
 
 ### LLM gateway
 
@@ -38,6 +116,10 @@ All notable changes to ELSPETH are documented here.
 
 ### Upgrade notes
 
+Session epoch remains 78 and Landscape epoch remains 50; existing compatible
+stores need no action, and this entry authorizes no migration, reset or
+downgrade.
+
 - Remove any `none` value from the three composer reasoning-effort settings
   before upgrading; startup refuses it.
 - A derived gateway adapter must declare `reasoning` (and translate the hint)
@@ -54,7 +136,21 @@ All notable changes to ELSPETH are documented here.
   which is now hinted at the code defaults (`low` discovery, `high` candidate,
   `medium` advisor). No latency measurements exist for those surfaces yet.
 - The tier-model allowlist entry for `warn_if_not_reasoning_capable` changed
-  and is included in the end-of-release recertification.
+  and needs operator re-judging and signing before release; CI does not make
+  that claim.
+- Operators who relied on an editable checkout's `.env` being loaded from
+  another working directory must now start from that directory or pass
+  `--env-file`.
+
+### Publication and acceptance
+
+These notes describe the 0.8.10 source package. Final-head CI and the protected
+merge remain required; this entry does not establish a published tag or image.
+Automatic image publication from main remains held. The 0.8.10 tag and container
+publication follow successful required checks and the protected merge.
+Operator signing, live-provider acceptance and deployment remain separate steps.
+The PostgreSQL testcontainer suites for the statement-count changes are owed on
+a Docker host before merge.
 
 ## 0.8.9 - 2026-10-21
 
