@@ -3,7 +3,10 @@ import { getTutorialReadiness, getTutorialSample } from "@/api/client";
 import { ChatPanelContent } from "@/components/chat/ChatPanel";
 import { Button } from "@/components/ui";
 import { useComposer } from "@/hooks/useComposer";
-import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
+import {
+  interpretationMutationInFlight,
+  useInterpretationEventsStore,
+} from "@/stores/interpretationEventsStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import {
   TUTORIAL_SINK_PROMPT,
@@ -90,6 +93,11 @@ export function TutorialFreeformShell({
   const pendingReviewCount = useInterpretationEventsStore((state) =>
     Object.keys(state.pendingBySession[sessionId] ?? {}).length,
   );
+  // A resolve / opt-out POST still holds the session's COMPOSE fence even
+  // after a post-commit refreshAll has dropped its card (#352).
+  const reviewApplying = useInterpretationEventsStore((state) =>
+    interpretationMutationInFlight(state, sessionId),
+  );
   const [sampleUrls, setSampleUrls] = useState<string[] | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [sampleRetry, setSampleRetry] = useState(0);
@@ -146,7 +154,7 @@ export function TutorialFreeformShell({
   const onContinue = (): void => {
     if (checkingRef.current || !hasUserMessage || compositionState === null ||
         activeSessionId !== sessionId || isComposing || pendingProposal ||
-        proposalActionPendingIds.length > 0 || pendingReviewCount > 0) return;
+        proposalActionPendingIds.length > 0 || pendingReviewCount > 0 || reviewApplying) return;
     checkingRef.current = true;
     setChecking(true);
     setReadinessError(null);
@@ -154,11 +162,13 @@ export function TutorialFreeformShell({
     void getTutorialReadiness(sessionId)
       .then((ready) => {
         const current = useSessionStore.getState();
-        const currentReviews = useInterpretationEventsStore.getState().pendingBySession[sessionId] ?? {};
+        const reviews = useInterpretationEventsStore.getState();
+        const currentReviews = reviews.pendingBySession[sessionId] ?? {};
         if (current.activeSessionId !== sessionId || current.compositionState?.id !== stateId ||
             ready.state_id !== stateId || current.isComposing ||
             current.compositionProposals.some((proposal) => proposal.status === "pending") ||
-            current.proposalActionPendingIds.length > 0 || Object.keys(currentReviews).length > 0) {
+            current.proposalActionPendingIds.length > 0 || Object.keys(currentReviews).length > 0 ||
+            interpretationMutationInFlight(reviews, sessionId)) {
           setReadinessError("The pipeline changed while we checked it. Review the latest state and try again.");
           return;
         }
@@ -178,7 +188,7 @@ export function TutorialFreeformShell({
         sessionReady: activeSessionId === sessionId && compositionStateLoaded,
         composing: isComposing || !hasUserMessage,
         decisionPending: pendingProposal || pendingReviewCount > 0,
-        decisionApplying: proposalActionPendingIds.length > 0,
+        decisionApplying: proposalActionPendingIds.length > 0 || reviewApplying,
         hasPipeline: compositionState !== null,
       })
     : null;

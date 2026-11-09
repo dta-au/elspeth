@@ -2,6 +2,7 @@ import { type JSX, useEffect, useRef, useState } from "react";
 import { cancelTutorialRun, fetchPluginPolicy, runTutorialPipeline } from "@/api/client";
 import { titleCaseLabel } from "@/components/catalog/pluginDisplayName";
 import { AlertBanner, Button } from "@/components/ui";
+import { useSessionOperationInFlight } from "@/hooks/useSessionOperationInFlight";
 import type { TutorialRunResponse } from "@/types/api";
 import {
   TUTORIAL_RUN_PREAMBLE,
@@ -10,6 +11,7 @@ import {
   TURN_4_PRIMARY_BUTTON,
   TURN_4_READY_BODY,
   TURN_4_RUN_BUTTON,
+  TURN_4_SETTLING_BODY,
 } from "./copy";
 import type { RunResultRow, TutorialRunResult } from "./tutorialMachine";
 import { TutorialWorkspaceFrame } from "./TutorialWorkspaceFrame";
@@ -152,6 +154,10 @@ export function TutorialTurn4Run({
   const [showCancel, setShowCancel] = useState(false);
   const [retryNonce, setRetryNonce] = useState(0);
   const headingRef = useRef<HTMLHeadingElement | null>(null);
+  // #352: the Run card can mount while the build's last request (a review
+  // resolve, or the /validate it triggers) still holds the session's fence;
+  // a run dispatched then is refused with a bare 409. Run waits for it.
+  const operationInFlight = useSessionOperationInFlight(sessionId);
 
   // Move focus to the turn's heading on mount so screen-reader users
   // hear the new step. `tabIndex={-1}` on the h2 makes it
@@ -239,6 +245,7 @@ export function TutorialTurn4Run({
   }, [sessionId, retryNonce, armed]);
 
   const onRunClick = (): void => {
+    if (operationInFlight) return;
     setArmed(true);
     // The Run button the learner just pressed leaves the DOM; put focus on
     // the heading (now "Running your pipeline.") so keyboard and AT users
@@ -252,6 +259,7 @@ export function TutorialTurn4Run({
   };
 
   const onRetryClick = (): void => {
+    if (operationInFlight) return;
     clearTutorialRunCache(sessionId);
     setRetryNonce((n) => n + 1);
   };
@@ -320,7 +328,9 @@ export function TutorialTurn4Run({
     title = "Ready to run.";
     actions = (
       <>
-        <Button variant="primary" onClick={onRunClick}>{TURN_4_RUN_BUTTON}</Button>
+        <Button variant="primary" onClick={onRunClick} disabled={operationInFlight}>
+          {TURN_4_RUN_BUTTON}
+        </Button>
         {back()}
       </>
     );
@@ -336,7 +346,7 @@ export function TutorialTurn4Run({
     title = "The run did not complete.";
     actions = (
       <>
-        <Button variant="primary" onClick={onRetryClick}>Retry</Button>
+        <Button variant="primary" onClick={onRetryClick} disabled={operationInFlight}>Retry</Button>
         {back()}
       </>
     );
@@ -360,7 +370,7 @@ export function TutorialTurn4Run({
             role={armed ? "status" : undefined}
             aria-busy={running || undefined}
           >
-            {!armed && TURN_4_READY_BODY}
+            {!armed && (operationInFlight ? TURN_4_SETTLING_BODY : TURN_4_READY_BODY)}
             {running && (
               <span className="tutorial-running">
                 <span className="tutorial-progress-bar" aria-hidden="true" />

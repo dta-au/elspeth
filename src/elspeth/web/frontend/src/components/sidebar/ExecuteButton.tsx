@@ -3,6 +3,7 @@ import { useExecutionStore } from "@/stores/executionStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
 import { useAuditReadinessStore } from "@/stores/auditReadinessStore";
+import { useSessionOperationInFlight } from "@/hooks/useSessionOperationInFlight";
 import { usePluginCatalogStore } from "@/stores/pluginCatalogStore";
 import { ConfirmDialog } from "@/components/common/ConfirmDialog";
 import { Button, Input } from "@/components/ui";
@@ -412,18 +413,20 @@ export function isRunGatingReadinessRow(
 /** Which run-blocking gate is currently active, for
  *  the plain-language reason text rendered under the button
  *  (elspeth-088bf83922 T-2). Priority order: an in-flight run takes
- *  precedence (nothing else matters until it finishes); Composer activity
+ *  precedence (nothing else matters until it finishes); Composer activity,
+ *  a session operation still in flight (`useSessionOperationInFlight`, #352)
  *  and pending interpretation review follow (review also drives the dedicated
  *  aria-disabled/title/aria-describedby treatment below); then no validation
  *  result, structural validation failure, and backend execution-readiness
  *  refusal. Returns null when none apply, i.e. when `canExecute` is true.
  *  Exported for the corresponding test. */
-export type RunBlockReason = "running" | "composing" | "interpretation" | "validation" | "readiness" | "not_validated";
+export type RunBlockReason = "running" | "composing" | "settling" | "interpretation" | "validation" | "readiness" | "not_validated";
 
 export function primaryRunBlockReason(input: {
   isExecuting: boolean;
   progressRunning: boolean;
   composerBusy: boolean;
+  sessionOperationInFlight: boolean;
   isRunBlocked: boolean;
   validationFailing: boolean;
   executionReadinessBlocked: boolean;
@@ -431,6 +434,10 @@ export function primaryRunBlockReason(input: {
 }): RunBlockReason | null {
   if (input.isExecuting || input.progressRunning) return "running";
   if (input.composerBusy) return "composing";
+  // A request this client started (proposal decision, review resolve, the
+  // /validate after it) may still hold the session's fence; the server
+  // would refuse the run with 409 (#352).
+  if (input.sessionOperationInFlight) return "settling";
   if (input.isRunBlocked) return "interpretation";
   // "not_validated" (no validation result yet — empty composition, or a
   // snapshot still in flight) is distinct from "validation" (a result exists
@@ -451,6 +458,7 @@ export function primaryRunBlockReason(input: {
 const RUN_BLOCK_REASON_TEXT: Record<RunBlockReason, string> = {
   running: "The pipeline is already running.",
   composing: "Wait for the composer to finish thinking.",
+  settling: "Wait for your last change to finish saving and checking.",
   interpretation: INTERPRETATION_PENDING_RUN_BLOCK_TITLE,
   validation: "Fix the validation errors shown in the Checks tab before running.",
   readiness: "The backend has not admitted this pipeline for execution.",
@@ -576,11 +584,13 @@ export function ExecuteButton(): JSX.Element | null {
     ? Object.keys(pendingInterpretationsBySession[activeSessionId] ?? {}).length
     : 0;
   const isRunBlocked = !optedOut && pendingCount > 0;
+  const sessionOperationInFlight = useSessionOperationInFlight(activeSessionId);
 
   const canExecute =
     activeSessionId !== null &&
     validationResult?.readiness?.execution_ready === true &&
     !composerBusy &&
+    !sessionOperationInFlight &&
     !isExecuting &&
     progress?.status !== "running" &&
     !isRunBlocked;
@@ -592,6 +602,7 @@ export function ExecuteButton(): JSX.Element | null {
     isExecuting,
     progressRunning: progress?.status === "running",
     composerBusy,
+    sessionOperationInFlight,
     isRunBlocked,
     validationNotRun: validationResult == null,
     validationFailing: validationResult != null && validationResult.is_valid !== true,

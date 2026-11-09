@@ -14,6 +14,7 @@ import {
   isRunGatingReadinessRow,
   primaryRunBlockReason,
 } from "./ExecuteButton";
+import * as api from "@/api/client";
 import { useExecutionStore } from "@/stores/executionStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
@@ -183,6 +184,54 @@ describe("ExecuteButton", () => {
       expect(button).not.toHaveAttribute("aria-disabled");
       fireEvent.click(button);
       expect(useExecutionStore.getState().execute).toHaveBeenCalledWith("sess-1");
+  });
+
+  it("blocks Run while a proposal decision or review resolve for this session is in flight (#352)", async () => {
+    useExecutionStore.setState({
+      validationResult: { is_valid: true, checks: [], errors: [], warnings: [], readiness: READY_READINESS },
+      runDisclosureAckBySession: { "sess-1": true },
+      isValidating: false,
+    });
+    useSessionStore.setState({ activeSessionId: "sess-1", proposalActionPendingIds: [] });
+    render(<ExecuteButton />);
+    const button = screen.getByRole("button", { name: "Run pipeline" });
+    expect(button).toBeEnabled();
+
+    // A proposal accept/reject POST holds the session's COMPOSE fence: the
+    // current version's verdict is still execution-ready, so only the
+    // in-flight gate keeps Run from a 409.
+    act(() => useSessionStore.setState({ proposalActionPendingIds: ["proposal-1"] }));
+    expect(button).toBeDisabled();
+    expect(
+      screen.getByText("Wait for your last change to finish saving and checking."),
+    ).toBeInTheDocument();
+    fireEvent.click(button);
+    fireEvent(window, new CustomEvent(REQUEST_RUN_EVENT));
+    expect(useExecutionStore.getState().execute).not.toHaveBeenCalled();
+    act(() => useSessionStore.setState({ proposalActionPendingIds: [] }));
+    expect(button).toBeEnabled();
+
+    // A resolve POST for this session in flight gates Run the same way.
+    let release!: (value: never) => void;
+    const resolveSpy = vi
+      .spyOn(api, "resolveInterpretation")
+      .mockReturnValueOnce(new Promise((resolve) => { release = resolve; }));
+    let resolution!: Promise<unknown>;
+    act(() => {
+      resolution = useInterpretationEventsStore
+        .getState()
+        .resolveEvent("sess-1", "evt-1", { choice: "accepted_as_drafted" })
+        .catch(() => undefined);
+    });
+    expect(button).toBeDisabled();
+    await act(async () => {
+      release({ event: makeInterpretationEvent({ id: "evt-1", choice: "accepted_as_drafted" }), new_state: null } as never);
+      await resolution;
+    });
+    expect(button).toBeEnabled();
+    fireEvent.click(button);
+    expect(useExecutionStore.getState().execute).toHaveBeenCalledWith("sess-1");
+    resolveSpy.mockRestore();
   });
 
   it("blocks an open Run confirmation when Composer starts thinking", () => {
@@ -1289,6 +1338,7 @@ describe("primaryRunBlockReason", () => {
     isExecuting: false,
     progressRunning: false,
     composerBusy: false,
+    sessionOperationInFlight: false,
     isRunBlocked: false,
     validationFailing: false,
     executionReadinessBlocked: false,
@@ -1303,6 +1353,20 @@ describe("primaryRunBlockReason", () => {
     expect(
       primaryRunBlockReason({ ...allClear, validationNotRun: true }),
     ).toBe("not_validated");
+  });
+
+  it("reports 'settling' for an in-flight session operation, after composing and before interpretation (#352)", () => {
+    expect(
+      primaryRunBlockReason({
+        ...allClear,
+        sessionOperationInFlight: true,
+        isRunBlocked: true,
+        validationNotRun: true,
+      }),
+    ).toBe("settling");
+    expect(
+      primaryRunBlockReason({ ...allClear, composerBusy: true, sessionOperationInFlight: true }),
+    ).toBe("composing");
   });
 
   it("prioritises 'interpretation' over an unrun validation", () => {
