@@ -68,8 +68,7 @@ from elspeth.contracts.composer_llm_audit import (
 )
 from elspeth.contracts.composer_planner_audit import ComposerPlannerAttempt, ComposerPlannerAttemptRecorder
 from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.core.canonical import canonical_json, stable_hash
-from elspeth.web.composer.authority_hashing import composer_authority_canonical_json, composer_authority_hash
+from elspeth.web.composer.authority_hashing import canonical_json_and_hash, project_composer_authority_payload
 from elspeth.web.composer.protocol import SchemaViolation, ToolArgumentError
 from elspeth.web.composer.visible_tool_event import VisibleToolEvent
 from elspeth.web.composer.withheld_replies import WithheldReply, WithheldReplyOrigin
@@ -706,15 +705,14 @@ def begin_dispatch(
         # rows. The full string is recoverable from upstream LiteLLM
         # tracing if needed; the audit row records intent, not bytes.
         truncated = arguments[:4096]
-        canon = canonical_json({"_unparseable_arguments": truncated, "_truncated": len(arguments) > 4096})
-        h = stable_hash({"_unparseable_arguments": truncated, "_truncated": len(arguments) > 4096})
+        canon, h = canonical_json_and_hash({"_unparseable_arguments": truncated, "_truncated": len(arguments) > 4096})
         authority_canon = None
         authority_hash = None
     else:
-        canon = canonical_json(arguments)
-        h = stable_hash(arguments)
-        authority_canon = composer_authority_canonical_json(arguments) if tool_name == "set_pipeline" else None
-        authority_hash = composer_authority_hash(arguments) if tool_name == "set_pipeline" else None
+        canon, h = canonical_json_and_hash(arguments)
+        authority_canon, authority_hash = (
+            canonical_json_and_hash(project_composer_authority_payload(arguments)) if tool_name == "set_pipeline" else (None, None)
+        )
     return DispatchAudit(
         tool_call_id=tool_call_id,
         tool_name=tool_name,
@@ -773,12 +771,13 @@ def begin_dispatch_or_arg_error(
             exc,
             arguments if isinstance(arguments, Mapping) else None,
         )
+        sentinel_canonical, sentinel_hash = canonical_json_and_hash(sentinel)
         return (
             DispatchAudit(
                 tool_call_id=tool_call_id,
                 tool_name=tool_name,
-                arguments_canonical=canonical_json(sentinel),
-                arguments_hash=stable_hash(sentinel),
+                arguments_canonical=sentinel_canonical,
+                arguments_hash=sentinel_hash,
                 version_before=version_before,
                 started_at=datetime.now(UTC),
                 started_ns=time.monotonic_ns(),
@@ -800,12 +799,16 @@ def rebind_dispatch_arguments(
     before validation.  Only the authority-bearing argument canonicalization
     changes, before custody I/O or any durable proposal write occurs.
     """
+    arguments_canonical, arguments_hash = canonical_json_and_hash(arguments)
+    authority_canonical, authority_hash = (
+        canonical_json_and_hash(project_composer_authority_payload(arguments)) if audit.tool_name == "set_pipeline" else (None, None)
+    )
     return replace(
         audit,
-        arguments_canonical=canonical_json(arguments),
-        arguments_hash=stable_hash(arguments),
-        authority_arguments_canonical=(composer_authority_canonical_json(arguments) if audit.tool_name == "set_pipeline" else None),
-        authority_arguments_hash=composer_authority_hash(arguments) if audit.tool_name == "set_pipeline" else None,
+        arguments_canonical=arguments_canonical,
+        arguments_hash=arguments_hash,
+        authority_arguments_canonical=authority_canonical,
+        authority_arguments_hash=authority_hash,
     )
 
 
@@ -866,8 +869,7 @@ def finish_success(
     # ``canonical_json`` on our own dispatch output is a Tier-1-equivalent act:
     # crash on anomaly rather than substituting a degraded sentinel and reporting
     # SUCCESS, which would launder our bug into a clean-looking audit row.
-    canon = canonical_json(normalized)
-    result_hash = stable_hash(normalized)
+    canon, result_hash = canonical_json_and_hash(normalized)
     return ComposerToolInvocation(
         tool_call_id=audit.tool_call_id,
         tool_name=audit.tool_name,
@@ -922,13 +924,16 @@ def finish_arg_error(
     invariant: "version_after is None on paths that did not complete".
     """
     normalized_error_payload = _normalize_audit_payload(error_payload) if error_payload is not None else None
+    result_canonical, result_hash = (
+        canonical_json_and_hash(normalized_error_payload) if normalized_error_payload is not None else (None, None)
+    )
     return ComposerToolInvocation(
         tool_call_id=audit.tool_call_id,
         tool_name=audit.tool_name,
         arguments_canonical=audit.arguments_canonical,
         arguments_hash=audit.arguments_hash,
-        result_canonical=canonical_json(normalized_error_payload) if normalized_error_payload is not None else None,
-        result_hash=stable_hash(normalized_error_payload) if normalized_error_payload is not None else None,
+        result_canonical=result_canonical,
+        result_hash=result_hash,
         status=ComposerToolStatus.ARG_ERROR,
         error_class=error_class,
         error_message=error_message,

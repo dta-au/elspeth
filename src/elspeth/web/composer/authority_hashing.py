@@ -28,6 +28,7 @@ stored projections, and such a map is itself projected before it is stored.
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Mapping
 from types import MappingProxyType
 from typing import Any, Final, cast
@@ -163,6 +164,19 @@ def restore_composer_authority_payload(payload: Mapping[str, Any]) -> dict[str, 
             item_malformed=f"{label} authority projection branch item is malformed",
         )
     return restored
+
+
+def canonical_json_and_hash(value: object) -> tuple[str, str]:
+    """Return ``(canonical_json(value), stable_hash(value))`` from one serialization.
+
+    ``core.canonical.stable_hash`` is SHA-256 over the UTF-8 bytes of exactly
+    the text ``core.canonical.canonical_json`` returns: both apply the same
+    ``_normalize_for_canonical`` and then the ``contracts.hashing`` primitive,
+    whose ``stable_hash`` hashes its own ``canonical_json``. A caller that
+    needs both therefore serializes once; the two refuse the same inputs.
+    """
+    canonical = canonical_json(value)
+    return canonical, hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def composer_authority_canonical_json(payload: Mapping[str, Any]) -> str:

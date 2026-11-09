@@ -269,7 +269,6 @@ def reviewed_anchor_hash(reviewed_facts: Mapping[str, Any]) -> str:
         "schema": _REVIEWED_ANCHOR_SCHEMA,
         "facts": frozen_facts,
     }
-    canonical_json(preimage)
     return stable_hash(preimage)
 
 
@@ -504,7 +503,19 @@ def owned_composition_state_execution_arguments(
     version: int,
 ) -> OwnedCompositionStateSetPipelineArguments:
     """Build private set-pipeline execution arguments without losing state."""
-    state = restore_owned_composition_state_authority(authority, version=version)
+    return owned_composition_state_execution_arguments_from_restored(restore_owned_composition_state_authority(authority, version=version))
+
+
+def owned_composition_state_execution_arguments_from_restored(state: CompositionState) -> OwnedCompositionStateSetPipelineArguments:
+    """Project execution arguments from a state the caller has just restored.
+
+    ``state`` must be the return value of
+    :func:`restore_owned_composition_state_authority` for the authority being
+    projected. This projects; it does not verify. Callers that already hold the
+    restored state use it so one authority is verified once, not once per
+    projection (the restore's exact round trip makes ``state.to_dict()`` equal
+    to what a second restore of the same authority would emit).
+    """
     payload = state.to_dict()
     return OwnedCompositionStateSetPipelineArguments(
         sources=payload["sources"],
@@ -526,7 +537,7 @@ def owned_composition_state_review_arguments(authority: Mapping[str, Any]) -> Ow
     from elspeth.web.interpretation_state import SOURCE_AUTHORING_KEY
 
     state = restore_owned_composition_state_authority(authority, version=1)
-    payload = owned_composition_state_execution_arguments(authority, version=1)
+    payload = owned_composition_state_execution_arguments_from_restored(state)
     safe_sources: dict[str, Any] = {}
     for source_name, source in state.sources.items():
         options = deep_thaw(source.options)

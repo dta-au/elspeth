@@ -183,12 +183,13 @@ def _restore_authoritative_pipeline_proposal(
     private_hash = _pipeline_private_arguments_hash(row.arguments_json)
     if payload["private_arguments_hash"] != private_hash:
         raise AuditIntegrityError("pipeline proposal private arguments binding mismatch")
-    if payload["audit_payload_hash"] != _pipeline_audit_payload_hash(
+    audit_payload_hash = _pipeline_audit_payload_hash(
         summary=row.summary,
         rationale=row.rationale,
         affects=row.affects,
         arguments_redacted_json=row.arguments_redacted_json,
-    ):
+    )
+    if payload["audit_payload_hash"] != audit_payload_hash:
         raise AuditIntegrityError("pipeline proposal audit payload binding mismatch")
     if None in {
         row.composer_model_identifier,
@@ -255,9 +256,11 @@ def _restore_authoritative_pipeline_proposal(
         creation_schema=schema,
         creation_actor=creation_event.actor,
     )
+    # The metadata carries the hash verified above from these same row fields;
+    # recomputing it here would hash the identical preimage a second time.
     return replace(
         authority,
-        row=replace(row, pipeline_metadata=_pipeline_public_metadata(authority)),
+        row=replace(row, pipeline_metadata=_pipeline_public_metadata(authority, audit_payload_hash=audit_payload_hash)),
     )
 
 
@@ -292,18 +295,31 @@ def _classify_authoritative_composition_proposal(
     return AuthoritativeCompositionProposal(row=pipeline.row, pipeline=pipeline)
 
 
-def _pipeline_public_metadata(authority: AuthoritativePipelineProposal) -> PipelineProposalPublicMetadata:
+def _pipeline_public_metadata(
+    authority: AuthoritativePipelineProposal,
+    *,
+    audit_payload_hash: str | None = None,
+) -> PipelineProposalPublicMetadata:
+    """Project the public metadata, hashing the audit payload unless the caller just did.
+
+    ``audit_payload_hash`` is passed only by the restore above, with the value
+    it computed from ``authority.row`` and checked against the creation event.
+    """
     payload = authority.proposal
     return PipelineProposalPublicMetadata(
         draft_hash=payload.draft_hash,
         base=_proposal_base_payload(payload.base),
         repair_count=payload.repair_count,
         skill_hash=payload.skill_hash,
-        audit_payload_hash=_pipeline_audit_payload_hash(
-            summary=authority.row.summary,
-            rationale=authority.row.rationale,
-            affects=authority.row.affects,
-            arguments_redacted_json=authority.row.arguments_redacted_json,
+        audit_payload_hash=(
+            audit_payload_hash
+            if audit_payload_hash is not None
+            else _pipeline_audit_payload_hash(
+                summary=authority.row.summary,
+                rationale=authority.row.rationale,
+                affects=authority.row.affects,
+                arguments_redacted_json=authority.row.arguments_redacted_json,
+            )
         ),
         custody_result=authority.custody_result,
     )

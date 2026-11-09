@@ -4709,7 +4709,7 @@ class SessionServiceImpl:
             )
             if authority.pipeline is not None:
                 _verify_pipeline_lifecycle_authority(conn, service=self, authority=authority.pipeline, dispatch_index=dispatch_index)
-            metadata = _pipeline_public_metadata(authority.pipeline) if authority.pipeline is not None else None
+            metadata = authority.pipeline.row.pipeline_metadata if authority.pipeline is not None else None
             enriched.append(replace(record, pipeline_metadata=metadata))
         return tuple(enriched)
 
@@ -6946,8 +6946,12 @@ class SessionServiceImpl:
         """Resolve effective facts on a normally hydrated immutable snapshot."""
         from elspeth.web.execution.completion_gates import parse_completion_gates
 
+        rebuilt: list[CompositionState] = []  # at most one rebuild per read, and none unless a fact row exists
+
         def read_state() -> CompositionState:
-            return state_from_record(stored) if stored is not None else empty_recovery_state()
+            if not rebuilt:
+                rebuilt.append(state_from_record(stored) if stored is not None else empty_recovery_state())
+            return rebuilt[0]
 
         fact = self._graph_review_for_base_on_connection(
             conn, session_id=session_id, state_id=stored.id if stored is not None else None, read_state=read_state

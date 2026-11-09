@@ -54,7 +54,7 @@
       "_restore_authoritative_pipeline_proposal",
       "_pipeline_public_metadata"
     ],
-    "sha256": "017b0c82827778df6543a1787cc9a38aadff6eb6b3d6dd31ea1fd515c5a69416"
+    "sha256": "bb24a9fdf158582e1fc9c4b5fe3aab7bb195121346790737852e582b5d056314"
   },
   "src/elspeth/web/sessions/protocol.py": {
     "protected_exports": [],
@@ -62,6 +62,6 @@
   },
   "src/elspeth/web/sessions/service.py": {
     "protected_exports": [],
-    "sha256": "0d99117298d17718fc226a2b055c3a2c58611f65ef1ab1197023c8e676bfa7e5"
+    "sha256": "4ecbff80e68c09c1cc8d6ac1b9a663e4b6d338b328b808e0b2b73a7093e246f6"
   }
 }

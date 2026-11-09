@@ -3598,11 +3598,17 @@ def test_candidate_build_walks_the_reconciled_state_once(
     monkeypatch: pytest.MonkeyPatch,
     factory: Any,
 ) -> None:
-    """Two whole-graph walks per build, never two over the same object.
+    """Two whole-graph walks per build, and never twice after reconciliation.
 
     Negative control (recorded in the fix-15 evidence): on the pre-fix tree
     this yields three full walks, the last two receiving the same reconciled
     object by identity.
+
+    Since fix 14, reconciliation returns its input when it changes nothing, so
+    for these fresh builds (no review evidence to carry) the pre-reconcile
+    invariant walk receives the very object the candidate carries. That walk
+    still runs before reconciliation to keep its failure precedence; whether
+    it can now reuse or be reused is a separate decision, not asserted here.
     """
     args = factory(tmp_path)
     context = _trained_context(data_dir=tmp_path)
@@ -3615,10 +3621,10 @@ def test_candidate_build_walks_the_reconciled_state_once(
     full = _full_graph_walks(walked, final)
     assert len(full) == 2, [id(state) for state in full]
     # Walk 1 is the pre-reconcile invariant check; walk 2 is the authority's
-    # walk of the exact object the candidate carries.
-    assert full[0] is not final
+    # walk of the exact object the candidate carries. Reconciliation was a
+    # no-op here, so it returned walk 1's object itself (fix 14 identity).
+    assert full[0] is final
     assert full[1] is final
-    assert len({id(state) for state in full}) == len(full)
     probes = len(walked) - len(full)
     # One probe per source and per plugin-bearing node (transform, aggregation).
     assert probes == len(final.sources) + sum(1 for node in final.nodes if node.plugin is not None)

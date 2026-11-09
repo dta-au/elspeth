@@ -26,11 +26,11 @@ from elspeth.contracts.hashing import canonical_json as primitive_canonical_json
 from elspeth.contracts.secrets import WebSecretResolver
 from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.contracts.trust_boundary import trust_boundary
-from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.catalog.policy_view import PolicyCatalogView
-from elspeth.web.composer.audit import BufferingRecorder, begin_dispatch, dispatch_with_audit
+from elspeth.web.composer.audit import BufferingRecorder, DispatchAudit, begin_dispatch, dispatch_with_audit
 from elspeth.web.composer.authority_hashing import (
+    canonical_json_and_hash,
     composer_authority_hash,
     project_composer_authority_payload,
     restore_composer_authority_payload,
@@ -41,7 +41,7 @@ from elspeth.web.composer.pipeline_proposal import (
     PresentBase,
     composition_content_hash,
     is_owned_composition_state_authority,
-    owned_composition_state_execution_arguments,
+    owned_composition_state_execution_arguments_from_restored,
     restore_owned_composition_state_authority,
 )
 from elspeth.web.composer.redaction import normalize_set_pipeline_redacted_arguments, semantic_redacted_pipeline_arguments_hash
@@ -103,6 +103,21 @@ def _validate_pipeline_authority_binding(
     authority = _validate_exact_canonical_json(authority_arguments_canonical)
     if hashlib.sha256(authority_arguments_canonical.encode("utf-8")).hexdigest() != authority_arguments_hash:
         raise AuditIntegrityError("pipeline dispatch authority arguments hash is malformed")
+    restored = _validate_reversible_authority_projection(
+        authority,
+        arguments_canonical=arguments_canonical,
+        authority_arguments_canonical=authority_arguments_canonical,
+    )
+    return authority_arguments_hash, restored
+
+
+def _validate_reversible_authority_projection(
+    authority: dict[str, JsonValue],
+    *,
+    arguments_canonical: str,
+    authority_arguments_canonical: str,
+) -> dict[str, JsonValue]:
+    """Prove the authority projection restores the generic arguments and re-projects exactly."""
     try:
         restored = restore_composer_authority_payload(authority)
     except ValueError as exc:
@@ -111,7 +126,7 @@ def _validate_pipeline_authority_binding(
         raise AuditIntegrityError("pipeline dispatch authority projection differs from generic arguments")
     if primitive_canonical_json(project_composer_authority_payload(restored)) != authority_arguments_canonical:
         raise AuditIntegrityError("pipeline dispatch authority projection is not reversible")
-    return authority_arguments_hash, restored
+    return restored
 
 
 @dataclass(frozen=True, slots=True)
@@ -353,11 +368,61 @@ def _bind_executor_content_hash(
         raise AuditIntegrityError("pipeline dispatch result uses a reserved content binding field")
     payload["pipeline_content_hash_schema"] = "composer.pipeline-dispatch-result.v1"
     payload["pipeline_content_hash"] = executor_content_hash
-    result_canonical = canonical_json(payload)
+    result_canonical, result_hash = canonical_json_and_hash(payload)
     return replace(
         invocation,
         result_canonical=result_canonical,
-        result_hash=stable_hash(payload),
+        result_hash=result_hash,
+    )
+
+
+def _dispatch_binding_for_own_invocation(
+    invocation: ComposerToolInvocation,
+    *,
+    audit: DispatchAudit,
+) -> PipelineDispatchAuditBinding:
+    """Bind the dispatch this commit just recorded without re-reading its own text.
+
+    Module-private, for exactly one caller: ``prepare_pipeline_proposal_commit``,
+    where ``audit`` is the envelope it opened with :func:`begin_dispatch` and
+    ``invocation`` is :func:`_bind_executor_content_hash`'s return for the one
+    invocation that dispatch recorded. Ownership is proved by object identity:
+    the argument texts must be the very strings ``begin_dispatch`` produced
+    (``finish_success`` and ``replace`` copy the references), so their
+    canonicality and their SHA-256 bindings hold by construction, as do the
+    result text and hash ``_bind_executor_content_hash`` produced from one
+    serialization. Anything else — an equal but separately built string, a
+    missing authority binding — takes the full :meth:`from_invocation` path.
+
+    The authority projection's reversibility is a property of the arguments,
+    not of how the text was produced, so it is still proved here exactly as
+    the full path proves it.
+    """
+    authority_canonical = audit.authority_arguments_canonical
+    authority_hash = audit.authority_arguments_hash
+    if (
+        type(invocation) is not ComposerToolInvocation
+        or type(authority_canonical) is not str
+        or type(authority_hash) is not str
+        or invocation.arguments_canonical is not audit.arguments_canonical
+        or invocation.arguments_hash is not audit.arguments_hash
+        or invocation.authority_arguments_canonical is not authority_canonical
+        or invocation.authority_arguments_hash is not authority_hash
+        or invocation.result_canonical is None
+        or invocation.result_hash is None
+    ):
+        return PipelineDispatchAuditBinding.from_invocation(invocation)
+    _validate_reversible_authority_projection(
+        _validate_exact_canonical_json(authority_canonical),
+        arguments_canonical=audit.arguments_canonical,
+        authority_arguments_canonical=authority_canonical,
+    )
+    return PipelineDispatchAuditBinding(
+        tool_call_id=invocation.tool_call_id,
+        tool_name=invocation.tool_name,
+        status=invocation.status,
+        arguments_hash=authority_hash,
+        result_hash=invocation.result_hash,
     )
 
 
@@ -407,10 +472,7 @@ async def prepare_pipeline_proposal_commit(
             pipeline_arguments,
             version=current_state.version + 1,
         )
-        execution_arguments = owned_composition_state_execution_arguments(
-            pipeline_arguments,
-            version=current_state.version + 1,
-        )
+        execution_arguments = owned_composition_state_execution_arguments_from_restored(proposed_state)
         proposed_content_hash = composition_content_hash(proposed_state)
     else:
         execution_arguments = pipeline_arguments
@@ -556,7 +618,7 @@ async def prepare_pipeline_proposal_commit(
         raise AuditIntegrityError("pipeline commit dispatch audit does not bind exact proposal arguments")
     executor_hash = composition_content_hash(result.updated_state)
     invocation = _bind_executor_content_hash(invocation, executor_content_hash=executor_hash)
-    binding = PipelineDispatchAuditBinding.from_invocation(invocation)
+    binding = _dispatch_binding_for_own_invocation(invocation, audit=audit)
     if not result.success or not result.validation.is_valid:
         raise PipelineCommitError(
             "pipeline proposal failed current executor validation",

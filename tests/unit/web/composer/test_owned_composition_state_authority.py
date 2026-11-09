@@ -389,3 +389,152 @@ def test_create_and_direct_construction_agree_on_an_owned_state_authority() -> N
 
     assert reverified == proposal
     assert PipelineProposal.from_dict(proposal.to_dict()) == proposal
+
+
+# Byte values produced by the pre-fix-14 implementation (HEAD ed2b92c0, which
+# restored the authority twice per review projection) for ``_state(blob_ids=...)``.
+_HEAD_PROJECTION_DIGESTS = {
+    (_BLOB_A,): (
+        "f8887c0ce33cae431419d0cd3d5c181a365a149e1997727764392c21d863fbf7",
+        "96b07def68399fc56e1fae781243ca8fe7452637ac7f581587141d60e00cb779",
+    ),
+    (_BLOB_A, _BLOB_B): (
+        "5078baf4886ff045ef20db1e6ab9110c75708a02b8f906f330a3de50fc2dbab7",
+        "0abf2c539e061aa0be2a15c108dad6afe82bcddd6935f3eb5e15c229dabc1cd3",
+    ),
+}
+
+
+@pytest.mark.parametrize("blob_ids", list(_HEAD_PROJECTION_DIGESTS), ids=["one-source", "two-sources"])
+def test_owned_state_projections_keep_their_pre_fix14_bytes(blob_ids: tuple[str, ...]) -> None:
+    authority = owned_composition_state_authority(_state(blob_ids=blob_ids))
+    review_digest, execution_digest = _HEAD_PROJECTION_DIGESTS[blob_ids]
+
+    assert hashlib.sha256(canonical_json(owned_composition_state_review_arguments(authority)).encode()).hexdigest() == review_digest
+    assert (
+        hashlib.sha256(canonical_json(owned_composition_state_execution_arguments(authority, version=1)).encode()).hexdigest()
+        == execution_digest
+    )
+
+
+def test_owned_state_review_projection_restores_the_authority_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The review projection verifies the authority once and projects from that state.
+
+    Negative control: the pre-fix-14 implementation restored it twice per call
+    (once itself, once inside ``owned_composition_state_execution_arguments``);
+    the counter below wraps the module global that both of those calls resolved.
+    """
+    import elspeth.web.composer.pipeline_proposal as pipeline_proposal
+
+    authority = owned_composition_state_authority(_state(blob_ids=(_BLOB_A, _BLOB_B)))
+    restores: list[int] = []
+    real_restore = pipeline_proposal.restore_owned_composition_state_authority
+
+    def counting_restore(payload: Any, *, version: int) -> CompositionState:
+        restores.append(version)
+        return real_restore(payload, version=version)
+
+    monkeypatch.setattr(pipeline_proposal, "restore_owned_composition_state_authority", counting_restore)
+
+    pipeline_proposal.owned_composition_state_review_arguments(authority)
+    assert restores == [1]
+    restores.clear()
+    pipeline_proposal.owned_composition_state_execution_arguments(authority, version=4)
+    assert restores == [4]
+
+
+def test_owned_state_review_projection_still_refuses_an_authority_that_does_not_round_trip() -> None:
+    payload = _authority_payload()
+    payload["nodes"][0]["condition"] = None
+
+    with pytest.raises(AuditIntegrityError, match="encodes an absent optional field as an explicit null"):
+        owned_composition_state_review_arguments(payload)
+
+
+def _owned_dispatch() -> tuple[Any, Any]:
+    from elspeth.web.composer import pipeline_commit
+
+    authority = owned_composition_state_authority(_state(blob_ids=(_BLOB_A, _BLOB_B)))
+    audit = begin_dispatch("call-owned-state", "set_pipeline", authority, version_before=7, actor="test")
+    payload = _dispatch_result()
+    del payload["pipeline_content_hash_schema"], payload["pipeline_content_hash"]
+    invocation = finish_success(audit, result_payload=payload, version_after=8)
+    return audit, pipeline_commit._bind_executor_content_hash(invocation, executor_content_hash=stable_hash({"state": "owned"}))
+
+
+def _count_canonical_rereads(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    from elspeth.web.composer import pipeline_commit
+
+    reads: list[str] = []
+    real = pipeline_commit._validate_exact_canonical_json
+
+    def counting(payload: str) -> Any:
+        reads.append(payload)
+        return real(payload)
+
+    monkeypatch.setattr(pipeline_commit, "_validate_exact_canonical_json", counting)
+    return reads
+
+
+def test_commit_binds_its_own_dispatch_without_rereading_the_text_it_produced(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Only the authority projection is re-read (the reversibility check needs it).
+
+    Negative control: the full ``from_invocation`` re-reads all three canonical
+    texts (arguments, authority, result), which is what the commit did before fix 14.
+    """
+    from elspeth.web.composer import pipeline_commit
+
+    audit, invocation = _owned_dispatch()
+    reads = _count_canonical_rereads(monkeypatch)
+
+    full = PipelineDispatchAuditBinding.from_invocation(invocation)
+    assert reads == [invocation.arguments_canonical, invocation.authority_arguments_canonical, invocation.result_canonical]
+    reads.clear()
+
+    own = pipeline_commit._dispatch_binding_for_own_invocation(invocation, audit=audit)
+    assert reads == [audit.authority_arguments_canonical]
+    assert own == full
+    assert own.arguments_hash == composer_authority_hash(owned_composition_state_authority(_state(blob_ids=(_BLOB_A, _BLOB_B))))
+
+
+def test_commit_binding_falls_back_to_full_verification_for_text_it_did_not_produce(monkeypatch: pytest.MonkeyPatch) -> None:
+    from dataclasses import replace
+
+    from elspeth.web.composer import pipeline_commit
+
+    audit, invocation = _owned_dispatch()
+    # Equal value, different object: not provably the string this dispatch produced.
+    copied = replace(invocation, arguments_canonical="".join(list(invocation.arguments_canonical)))
+    assert copied.arguments_canonical == invocation.arguments_canonical
+    assert copied.arguments_canonical is not audit.arguments_canonical
+    reads = _count_canonical_rereads(monkeypatch)
+
+    assert pipeline_commit._dispatch_binding_for_own_invocation(copied, audit=audit) == PipelineDispatchAuditBinding.from_invocation(
+        invocation
+    )
+    assert len(reads) == 6
+
+
+def test_commit_binding_still_refuses_an_irreversible_authority_projection() -> None:
+    from dataclasses import replace
+
+    from elspeth.web.composer import pipeline_commit
+
+    audit, _invocation = _owned_dispatch()
+    foreign = canonical_json(project_composer_authority_payload({"sources": {}, "nodes": [], "edges": [], "outputs": []}))
+    forged_audit = replace(
+        audit,
+        authority_arguments_canonical=foreign,
+        authority_arguments_hash=hashlib.sha256(foreign.encode()).hexdigest(),
+    )
+    payload = _dispatch_result()
+    del payload["pipeline_content_hash_schema"], payload["pipeline_content_hash"]
+    invocation = pipeline_commit._bind_executor_content_hash(
+        finish_success(forged_audit, result_payload=payload, version_after=8),
+        executor_content_hash=stable_hash({"state": "owned"}),
+    )
+
+    with pytest.raises(AuditIntegrityError, match="authority projection differs from generic arguments"):
+        pipeline_commit._dispatch_binding_for_own_invocation(invocation, audit=forged_audit)
+    with pytest.raises(AuditIntegrityError, match="authority projection differs from generic arguments"):
+        PipelineDispatchAuditBinding.from_invocation(invocation)

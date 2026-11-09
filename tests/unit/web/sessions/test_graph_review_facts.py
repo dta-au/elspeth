@@ -921,3 +921,32 @@ async def test_both_read_qualification_owners_reject_unadmitted_lower_fact(opera
     assert lower_calls == [first]
     assert len(facts(store)) == 1
     assert store[2].get(session_id=store[4], operation_id=running.claim.operation_id).status == "running"
+
+
+@pytest.mark.asyncio
+async def test_graph_review_read_rebuilds_the_stored_state_once_and_only_when_a_fact_exists(operation_store, monkeypatch):
+    """Negative control: the pre-fix-14 read rebuilt the same record twice when a fact existed."""
+    import elspeth.web.sessions.service as session_service
+
+    store = operation_store
+    base = await seed(store)
+    rebuilt = []
+    real_state_from_record = session_service.state_from_record
+
+    def counting_state_from_record(record):
+        rebuilt.append(record.id)
+        return real_state_from_record(record)
+
+    monkeypatch.setattr(session_service, "state_from_record", counting_state_from_record)
+    with store[0].connect() as conn:
+        assert store[3]._graph_review_on_connection(conn, session_id=store[4], stored=base) is None
+    assert rebuilt == []
+
+    _record, running = await begin(store, base)
+    fact = blocked(store, running, base)
+    await finish(store, running, fact)
+    store[1].release(running.session_operation_context)
+    rebuilt.clear()
+    with store[0].connect() as conn:
+        assert store[3]._graph_review_on_connection(conn, session_id=store[4], stored=base) == fact
+    assert rebuilt == [base.id]

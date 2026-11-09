@@ -1427,3 +1427,122 @@ def test_set_pipeline_accepts_wired_pending_vague_term() -> None:
     result = _execute_set_pipeline(deep_thaw(_exact_arguments(wired).data), wired, _trained_context())
 
     assert result.success, result.data
+
+
+def _model_choice_states() -> tuple[CompositionState, CompositionState]:
+    """A resolved model-choice review plus an untouched tail node, and an
+    unrelated-metadata proposal that carries the review forward."""
+    model = "bedrock/example.model"
+    resolved = _requirement(
+        requirement_id="model_choice_review:model",
+        kind=InterpretationKind.LLM_MODEL_CHOICE,
+        user_term="llm_model_choice:model",
+        status="resolved",
+        draft=model,
+        accepted_value=model,
+        resolved_prompt_template_hash=model_choice_artifact_hash(model),
+    )
+    pending = {**resolved, "status": "pending", "event_id": None, "accepted_value": None, "resolved_prompt_template_hash": None}
+    tail = _node(node_id="tail", plugin="passthrough", input_name="out", output_name="final")
+    previous = _state(nodes=(_node(options={"model": model, INTERPRETATION_REQUIREMENTS_KEY: [resolved]}), tail))
+    proposed = replace(
+        _state(nodes=(_node(options={"model": model, INTERPRETATION_REQUIREMENTS_KEY: [pending]}), tail)),
+        metadata=PipelineMetadata(name="unrelated metadata edit"),
+    )
+    return previous, proposed
+
+
+def _digest(state: CompositionState) -> str:
+    return sha256(json.dumps(deep_thaw(state.to_dict()), sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def test_reconcile_returns_the_proposed_object_when_nothing_changes() -> None:
+    """Identity, so the instance's content-hash memo survives the call.
+
+    Negative control: the pre-fix-14 implementation rebuilt every source and
+    node and returned a new object here (``is`` was False, no node shared).
+    """
+    from elspeth.web.composer.pipeline_proposal import composition_content_hash
+
+    previous, _proposed = _model_choice_states()
+    expected_hash = composition_content_hash(previous)
+
+    reconciled = reconcile_authoritative_reviews(previous, previous)
+
+    assert reconciled is previous
+    assert composition_content_hash(reconciled) == expected_hash
+    plain = _state(nodes=(_node(plugin="passthrough"),))
+    assert reconcile_authoritative_reviews(plain, plain) is plain
+
+
+def test_reconcile_returns_a_new_object_and_shares_only_untouched_components_when_a_node_changes() -> None:
+    previous, proposed = _model_choice_states()
+
+    reconciled = reconcile_authoritative_reviews(previous, proposed)
+
+    assert reconciled is not proposed
+    assert reconciled.nodes[0] is not proposed.nodes[0]
+    assert reconciled.nodes[0].options[INTERPRETATION_REQUIREMENTS_KEY][0]["status"] == "resolved"
+    assert reconciled.nodes[1] is proposed.nodes[1]
+    assert set(reconciled.sources) == set(proposed.sources)
+    assert all(reconciled.sources[name] is source for name, source in proposed.sources.items())
+    assert reconciled.metadata == proposed.metadata
+
+
+def test_reconcile_output_matches_the_pre_fix14_implementation() -> None:
+    """Pinned values recorded from HEAD ed2b92c0 for the same fixtures."""
+    from elspeth.web.composer.pipeline_proposal import composition_content_hash
+
+    previous, proposed = _model_choice_states()
+    noop = reconcile_authoritative_reviews(previous, previous)
+    carried = reconcile_authoritative_reviews(previous, proposed)
+
+    assert composition_content_hash(noop) == "220e4842ad56d1c22347bd60d93d0df56ec7a7e493db7fd8172427b899130046"
+    assert composition_content_hash(carried) == "f4ed7faeb9b85df73e16a4d484b778dc1ff8c547da0d08828c8bd7b5fe35525c"
+    assert noop.to_dict() == previous.to_dict()
+    assert _digest(carried) == _digest(replace(previous, metadata=proposed.metadata))
+
+
+def test_reconcile_still_validates_review_evidence_when_nothing_changes() -> None:
+    """The identity fast path compares the reconciled content; it never skips reconciliation."""
+    from elspeth.web.interpretation_state import InterpretationReviewIntegrityError
+
+    model = "bedrock/example.model"
+    drifted = _requirement(
+        requirement_id="model_choice_review:model",
+        kind=InterpretationKind.LLM_MODEL_CHOICE,
+        user_term="llm_model_choice:model",
+        status="resolved",
+        draft=model,
+        accepted_value=model,
+        resolved_prompt_template_hash=model_choice_artifact_hash("bedrock/other.model"),
+    )
+    state = _state(nodes=(_node(options={"model": model, INTERPRETATION_REQUIREMENTS_KEY: [drifted]}),))
+
+    with pytest.raises(InterpretationReviewIntegrityError, match="hash drifted"):
+        reconcile_authoritative_reviews(state, state)
+
+
+@pytest.mark.parametrize(
+    ("original", "reconciled"),
+    [
+        ({"a": 1}, {"a": True}),
+        ({"a": 1}, {"a": 1.0}),
+        ({"a": 0.0}, {"a": -0.0}),
+        ({"a": 1, "b": 2}, {"b": 2, "a": 1}),
+        ({"a": [{"x": 1, "y": 2}]}, {"a": [{"y": 2, "x": 1}]}),
+        ({"a": [1]}, {"a": [1, 1]}),
+        ({"a": None}, {"a": "None"}),
+    ],
+    ids=["bool-vs-int", "int-vs-float", "signed-zero", "key-order", "nested-key-order", "list-length", "null-vs-text"],
+)
+def test_reconcile_no_change_comparison_is_exact_not_python_equality(original: dict[str, object], reconciled: dict[str, object]) -> None:
+    """Each pair is ``==``-equal or survives into different persisted bytes; neither may count as unchanged."""
+    from elspeth.web.interpretation_state import _kept_unless_reconciled_differently
+
+    node = _node(plugin="passthrough", options={**original, "schema": {"mode": "observed"}})
+    changed = _kept_unless_reconciled_differently(node, {**reconciled, "schema": node.options["schema"]})
+    assert changed is not node
+    assert deep_thaw(changed.options) == {**reconciled, "schema": {"mode": "observed"}}
+    assert _kept_unless_reconciled_differently(node, dict(node.options)) is node
+    assert _kept_unless_reconciled_differently(node, deep_thaw(node.options)) is node

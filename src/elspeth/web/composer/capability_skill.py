@@ -10,7 +10,8 @@ from types import MappingProxyType
 from typing import Any, Final, cast
 
 from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.core.canonical import canonical_json, stable_hash
+from elspeth.core.canonical import stable_hash
+from elspeth.web.composer.authority_hashing import canonical_json_and_hash
 from elspeth.web.composer.skills import load_skill_with_hash
 
 PLANNER_DISCOVERY_TOOL_NAMES: Final[tuple[str, ...]] = (
@@ -198,8 +199,8 @@ def build_planner_capability_manifest(
     """
     if tool_surface not in {"full", "terminal_only"}:
         raise ValueError("tool_surface must be 'full' or 'terminal_only'")
-    canonical_json(messages)
-    canonical_json(tools)
+    _messages_canonical, rendered_prompt_hash = canonical_json_and_hash(messages)
+    _tools_canonical, effective_tool_hash = canonical_json_and_hash(tools)
     core = load_pipeline_capability_core()
     system_contents = [message["content"] for message in messages if message["role"] == "system"]
     if not system_contents or type(system_contents[0]) is not str or not system_contents[0].startswith(core):
@@ -232,7 +233,8 @@ def build_planner_capability_manifest(
     parameters = _schema_mapping(terminal["parameters"], path="$tools[-1].function.parameters")
     properties = _schema_mapping(parameters["properties"], path="$tools[-1].function.parameters.properties")
     advertised_schema = _schema_mapping(properties["pipeline"], path="$tools[-1].function.parameters.properties.pipeline")
-    if stable_hash(advertised_schema) != stable_hash(canonical_schema):
+    canonical_schema_hash = stable_hash(advertised_schema)
+    if canonical_schema_hash != stable_hash(canonical_schema):
         raise AuditIntegrityError("planner terminal does not advertise the canonical pipeline schema")
     # Restricted request terminals are projections of the canonical authoring
     # language, so their root field inventory intentionally differs.  The
@@ -244,9 +246,9 @@ def build_planner_capability_manifest(
     return PlannerCapabilityManifest(
         planner_implementation_id=PLANNER_IMPLEMENTATION_ID,
         capability_core_hash=hashlib.sha256(core.encode("utf-8")).hexdigest(),
-        canonical_schema_hash=stable_hash(advertised_schema),
-        effective_tool_hash=stable_hash(tools),
-        rendered_prompt_hash=stable_hash(messages),
+        canonical_schema_hash=canonical_schema_hash,
+        effective_tool_hash=effective_tool_hash,
+        rendered_prompt_hash=rendered_prompt_hash,
     )
 
 

@@ -888,7 +888,36 @@ carry it on the restored proposal. Keep every external/persisted entry
 proposal_decoder tests, sessions list/read tests; add identity assertions
 (`reconcile(x) is x` on no change; one restore per safe-sources call).
 
-**Evidence.** _(fill in)_
+**Evidence (landed).** (a) review projections restore the authority once
+(review_args 1.01 → 0.45 ms at 40 nodes); the commit path also restored
+twice and now restores once
+(`owned_composition_state_execution_arguments_from_restored`). (b) the
+graph-review read rebuilds the stored state once, still never when there is
+no fact. (c) `reconcile_authoritative_reviews` keeps a component as the same
+object when its reconciled options reproduce the originals exactly — strict
+JSON identity (`_identical_json_value`: same types, key order and float
+bits; `1 == True`, `1 == 1.0`, `0.0 == -0.0` all count as changes) with
+per-key identity shortcuts — and returns `proposed` itself when every
+component is kept; reconcile+hash 1.54 → 0.22 ms at 40 nodes; 377 reconcile
+calls replayed through HEAD gave identical bytes. (d) the audit-payload hash
+runs once per restore+list instead of three times; the decoder's tamper
+check is unchanged and passes the verified hash forward. (e) the commit
+binds its own dispatch via `_dispatch_binding_for_own_invocation`: ownership
+proved by object identity of the argument/result texts against the
+`DispatchAudit` envelope the same call opened, the reversibility proof still
+run, and anything not identical falls back to `from_invocation` (26 → 18 ms
+at 95 KB); S-11 serialize-then-hash collapsed to `canonical_json_and_hash`
+in `begin_dispatch` (25 → 17 ms), the other audit envelopes, the commit
+result, the planner capability manifest and `reviewed_anchor_hash`. 29 new
+tests with HEAD-pinned bytes; every HEAD control and all 7 mutants went
+red. Scoped suites: one order-dependent failure each before and after
+(`test_advisor_structured_checkpoint`, the known planner flake), both pass
+alone. Re-pins: census +1 (2615), full-source digests for
+`proposal_decoder.py` and `service.py`, 20 `line=` rows +4 — all via the
+gates' own tooling. Fix 15's walk-count test now asserts `full[0] is final`
+(the pre-reconcile walk receives the object the candidate carries), which
+is the correct claim once reconcile preserves identity. Architecture and
+lint corpus deferred to the batch gate.
 
 ---
 

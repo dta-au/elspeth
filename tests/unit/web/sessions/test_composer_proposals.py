@@ -1227,3 +1227,85 @@ async def test_accept_composition_proposal_writes_forward_event(service) -> None
         "proposal.accepted",
     ]
     assert events[-1].payload == {"committed_state_id": str(committed.committed_state_id)}
+
+
+@pytest.mark.asyncio
+async def test_restore_and_list_compute_the_audit_payload_hash_once_per_proposal(service, monkeypatch) -> None:
+    """The decoder's verification hash is the one carried to the public metadata.
+
+    Negative control: the pre-fix-14 implementation computed it twice inside the
+    restore (verification, then ``_pipeline_public_metadata``) and a third time on
+    the list path, so this counter read 3 for one listed proposal.
+    """
+    import elspeth.web.sessions.proposal_decoder as proposal_decoder
+
+    session_id = uuid4()
+    with service._engine.begin() as conn:
+        _insert_session(conn, str(session_id))
+    pipeline = {
+        "source": {"plugin": "csv", "on_success": "rows", "options": {}, "on_validation_failure": "discard"},
+        "nodes": [],
+        "edges": [],
+        "outputs": [],
+    }
+    async with _session_operation_context(service, session_id, SessionOperationKind.COMPOSE) as context:
+        created = await service.create_pipeline_composition_proposal(
+            session_id=session_id,
+            plan=_pipeline_plan_result(pipeline=pipeline),
+            summary="Replace the pipeline.",
+            rationale="Requested by the user.",
+            affects=("graph",),
+            arguments_redacted_json=redact_tool_call_arguments("set_pipeline", pipeline, telemetry=NoopRedactionTelemetry()),
+            actor="composer-web:user-alice",
+            composer_model_identifier="planner-model",
+            composer_model_version="planner-model-v1",
+            composer_provider="provider",
+            session_operation_context=context,
+        )
+    calls: list[str] = []
+    real_hash = proposal_decoder._pipeline_audit_payload_hash
+
+    def counting_hash(**kwargs):
+        calls.append(kwargs["summary"])
+        return real_hash(**kwargs)
+
+    monkeypatch.setattr(proposal_decoder, "_pipeline_audit_payload_hash", counting_hash)
+
+    listed = await service.list_composition_proposals(session_id)
+    assert calls == ["Replace the pipeline."]
+    assert listed == [created]
+    assert listed[0].pipeline_metadata == created.pipeline_metadata
+
+    calls.clear()
+    restored = await service.get_authoritative_pipeline_proposal(session_id=session_id, proposal_id=created.id)
+    assert calls == ["Replace the pipeline."]
+    assert restored.row == created
+
+
+@pytest.mark.asyncio
+async def test_restore_still_refuses_a_tampered_audit_payload_binding(service) -> None:
+    """Carrying the computed hash forward does not weaken the decoder's own check."""
+    session_id = uuid4()
+    with service._engine.begin() as conn:
+        _insert_session(conn, str(session_id))
+    async with _session_operation_context(service, session_id, SessionOperationKind.COMPOSE) as context:
+        created = await service.create_pipeline_composition_proposal(
+            session_id=session_id,
+            plan=_pipeline_plan_result(),
+            summary="Replace the pipeline.",
+            rationale="Requested by the user.",
+            affects=("graph",),
+            arguments_redacted_json=_pipeline_public_arguments(),
+            actor="composer-web:user-alice",
+            composer_model_identifier="planner-model",
+            composer_model_version="planner-model-v1",
+            composer_provider="provider",
+            session_operation_context=context,
+        )
+    with service._engine.begin() as conn:
+        conn.execute(
+            update(composition_proposals_table).where(composition_proposals_table.c.id == str(created.id)).values(summary="Tampered.")
+        )
+
+    with pytest.raises(AuditIntegrityError, match="audit payload binding mismatch"):
+        await service.list_composition_proposals(session_id)
