@@ -383,3 +383,16 @@ def test_manifest_is_hash_only_and_never_copies_private_prompt_values(tmp_path: 
         "effective_tool_hash",
         "rendered_prompt_hash",
     }
+
+
+def test_manifest_hashes_are_the_separate_stable_hashes_of_what_it_validated() -> None:
+    """Byte identity with the pre-fix-14 manifest, which hashed each input separately."""
+    rendered = build_system_prompt(None)
+    messages = _messages(rendered)
+    tools = planner_tool_definitions(dialect=ToolContractDialect.NONE)
+
+    manifest = build_planner_capability_manifest(messages=messages, tools=tools, canonical_schema=canonical_set_pipeline_schema())
+
+    assert manifest.rendered_prompt_hash == stable_hash(messages)
+    assert manifest.effective_tool_hash == stable_hash(tools)
+    assert manifest.canonical_schema_hash == stable_hash(tools[-1]["function"]["parameters"]["properties"]["pipeline"])

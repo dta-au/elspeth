@@ -8,6 +8,7 @@ import { useExecutionStore } from "./executionStore";
 import { useAuditReadinessStore } from "./auditReadinessStore";
 import { useAuthStore } from "./authStore";
 import { useInterpretationEventsStore } from "./interpretationEventsStore";
+import * as api from "@/api/client";
 import type { Session } from "../types/api";
 import type { InterpretationEvent, InterpretationKind } from "../types/interpretation";
 import {
@@ -1469,6 +1470,217 @@ describe("requestValidate — forced manual validate entry point", () => {
       await Promise.resolve();
     });
     expect(validate).not.toHaveBeenCalled();
+  });
+});
+
+// The real executionStore.validate, captured before any test replaces it via
+// setState. The resolve-path tests below drive it end to end (sequence and
+// version guards included) against a stubbed api.validatePipeline, so a
+// POST /validate count is the count of validatePipeline calls.
+const realExecutionValidate = useExecutionStore.getState().validate;
+
+function validationResultFor(isValid: boolean) {
+  return {
+    is_valid: isValid,
+    checks: [],
+    errors: isValid
+      ? []
+      : [{ component_id: null, component_type: null, message: "pending review", suggestion: null }],
+    warnings: [],
+    readiness: {
+      authoring_valid: true,
+      execution_ready: isValid,
+      completion_ready: isValid,
+      blockers: [],
+    },
+  } as never;
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
+
+async function flushMicrotasks(): Promise<void> {
+  await act(async () => {
+    for (let i = 0; i < 6; i += 1) await Promise.resolve();
+  });
+}
+
+describe("applyResolvedInterpretation — validation routed through the queue (Fix 2A)", () => {
+  let validatePipeline: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    _resetSubscriptionsForTesting();
+    vi.restoreAllMocks();
+    useAuthStore.setState({ token: "tok", user: { user_id: "user-a" } as never });
+    useSessionStore.setState({
+      activeSessionId: "sess-1",
+      compositionState: null,
+      selectedNodeId: null,
+      sessions: [{ id: "sess-1", title: "x" } as never],
+      injectSystemMessage: vi.fn(),
+    } as never);
+    useExecutionStore.setState({
+      validate: realExecutionValidate,
+      isExecuting: false,
+      progress: null,
+      validationResult: null,
+    } as never);
+    useInterpretationEventsStore.setState({
+      refreshAll: vi.fn().mockResolvedValue(undefined),
+    } as never);
+    validatePipeline = vi
+      .spyOn(api, "validatePipeline")
+      .mockResolvedValue(validationResultFor(true));
+    initStoreSubscriptions();
+  });
+
+  /** Seed: version `v` auto-validated and landed (pending review → invalid). */
+  async function seedValidated(version: number, state = compositionWithSource(version)) {
+    validatePipeline.mockResolvedValueOnce(validationResultFor(false));
+    useSessionStore.setState({ compositionState: state as never } as never);
+    await waitFor(() => expect(validatePipeline).toHaveBeenCalledTimes(1));
+    await waitFor(() =>
+      expect(useExecutionStore.getState().validationResult?.is_valid).toBe(false),
+    );
+    await flushMicrotasks();
+    validatePipeline.mockClear();
+  }
+
+  it("accept/amend (version minted by the resolve) issues exactly ONE POST /validate", async () => {
+    await seedValidated(1);
+    const gate = deferred<never>();
+    validatePipeline.mockReturnValueOnce(gate.promise);
+
+    useSessionStore.getState().applyResolvedInterpretation(compositionWithSource(2) as never);
+
+    expect(validatePipeline).toHaveBeenCalledTimes(1);
+    gate.resolve(validationResultFor(true));
+    await waitFor(() =>
+      expect(useExecutionStore.getState().validationResult?.is_valid).toBe(true),
+    );
+    await flushMicrotasks();
+    expect(validatePipeline).toHaveBeenCalledTimes(1);
+  });
+
+  it("negative control: the pre-fix direct validate() beside the version bump costs TWO POSTs", async () => {
+    // Replays the old applyResolvedInterpretation body by hand: publish the
+    // minted state (the subscriber queues + fires its POST), then call
+    // executionStore.validate() directly. Pins the count Fix 2A removes, so
+    // the one-POST assertion above cannot pass vacuously.
+    await seedValidated(1);
+    useSessionStore.setState({ compositionState: compositionWithSource(2) as never } as never);
+    void useExecutionStore.getState().validate("sess-1");
+    await flushMicrotasks();
+    expect(validatePipeline).toHaveBeenCalledTimes(2);
+  });
+
+  it("opt-out (null resolve) issues exactly ONE POST for the unchanged version and the Run gate clears", async () => {
+    await seedValidated(1);
+    expect(useExecutionStore.getState().validationResult?.is_valid).toBe(false);
+
+    useSessionStore.getState().applyResolvedInterpretation(null);
+
+    await waitFor(() =>
+      expect(useExecutionStore.getState().validationResult?.is_valid).toBe(true),
+    );
+    await flushMicrotasks();
+    expect(validatePipeline).toHaveBeenCalledTimes(1);
+    expect(useSessionStore.getState().compositionState?.version).toBe(1);
+  });
+
+  it("negative control: an unforced entry for the unchanged version would POST nothing", async () => {
+    // Why the opt-out request must be forced: the version is already in the
+    // queue's same-version cache, so a re-publish of it is skipped.
+    await seedValidated(1);
+    useSessionStore.setState({ compositionState: { ...compositionWithSource(1) } as never } as never);
+    await flushMicrotasks();
+    expect(validatePipeline).not.toHaveBeenCalled();
+    expect(useExecutionStore.getState().validationResult?.is_valid).toBe(false);
+  });
+
+  it("content-equal accept (verdict carried forward, nothing in flight) still re-checks the gate with ONE POST", async () => {
+    // The subscriber carries a landed verdict across a content-only bump
+    // without POSTing. That verdict predates the resolve, so the forced
+    // entry must still validate the minted version — once.
+    await seedValidated(1, compositionAtNewVersion(1));
+
+    useSessionStore.getState().applyResolvedInterpretation(compositionAtNewVersion(2) as never);
+
+    await waitFor(() =>
+      expect(useExecutionStore.getState().validationResult?.is_valid).toBe(true),
+    );
+    await flushMicrotasks();
+    expect(validatePipeline).toHaveBeenCalledTimes(1);
+  });
+
+  it("rapid successive resolves keep one POST in flight and the latest version wins", async () => {
+    await seedValidated(1);
+    const first = deferred<never>();
+    const second = deferred<never>();
+    validatePipeline.mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
+
+    useSessionStore.getState().applyResolvedInterpretation(compositionWithSource(2) as never);
+    useSessionStore.getState().applyResolvedInterpretation(compositionWithSource(3) as never);
+    useSessionStore.getState().applyResolvedInterpretation(compositionWithSource(4) as never);
+    await flushMicrotasks();
+    // v2 is in flight; v3 was superseded in the single pending slot by v4.
+    expect(validatePipeline).toHaveBeenCalledTimes(1);
+
+    // The v2 verdict lands after the composition moved to v4: stale, dropped.
+    first.resolve(validationResultFor(false));
+    await waitFor(() => expect(validatePipeline).toHaveBeenCalledTimes(2));
+    expect(useExecutionStore.getState().validationResult).toBeNull();
+
+    second.resolve(validationResultFor(true));
+    await waitFor(() =>
+      expect(useExecutionStore.getState().validationResult?.is_valid).toBe(true),
+    );
+    await flushMicrotasks();
+    expect(validatePipeline).toHaveBeenCalledTimes(2);
+  });
+
+  it("a session switch mid-flight applies nothing cross-session and queues nothing for the new session", async () => {
+    await seedValidated(1);
+    const gate = deferred<never>();
+    validatePipeline.mockReturnValueOnce(gate.promise);
+
+    useSessionStore.getState().applyResolvedInterpretation(compositionWithSource(2) as never);
+    expect(validatePipeline).toHaveBeenCalledTimes(1);
+    useExecutionStore.setState({ validationResult: null } as never);
+    useSessionStore.setState({ activeSessionId: "sess-2", compositionState: null } as never);
+
+    gate.resolve(validationResultFor(true));
+    await flushMicrotasks();
+    expect(useExecutionStore.getState().validationResult).toBeNull();
+    expect(validatePipeline).toHaveBeenCalledTimes(1);
+  });
+
+  it("a resolve while a run is executing does not POST (same guard as requestValidate)", async () => {
+    await seedValidated(1);
+    useExecutionStore.setState({ isExecuting: true } as never);
+
+    useSessionStore.getState().applyResolvedInterpretation(null);
+    useSessionStore.getState().applyResolvedInterpretation(compositionWithSource(2) as never);
+    await flushMicrotasks();
+
+    expect(validatePipeline).not.toHaveBeenCalled();
+  });
+
+  it("a null resolve on an empty composition does not POST", async () => {
+    useSessionStore.setState({
+      compositionState: { version: 5, sources: {}, nodes: [], edges: [], outputs: [] } as never,
+    } as never);
+    await flushMicrotasks();
+
+    useSessionStore.getState().applyResolvedInterpretation(null);
+    await flushMicrotasks();
+
+    expect(validatePipeline).not.toHaveBeenCalled();
   });
 });
 

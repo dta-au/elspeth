@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from collections import Counter
+from collections.abc import Callable
+from typing import Any
+
 import pytest
 
 from elspeth.contracts.plugin_capabilities import (
@@ -801,3 +805,91 @@ class TestOneOfRoutingPredicate:
         fields = svc._extract_config_fields(schema)
         assert [f.name for f in fields] == ["top_field"]
         assert fields[0].required is True
+
+
+class TestSummaryCache:
+    """Listing reuses the summaries built at construction.
+
+    ``build_plugin_snapshot`` lists every kind on every composer request, so
+    a listing that regenerates plugin JSON schemas costs a full pydantic
+    ``model_json_schema`` pass per plugin per request.
+    """
+
+    @staticmethod
+    def _counting_catalog(monkeypatch: pytest.MonkeyPatch) -> tuple[CatalogServiceImpl, Counter[str], int]:
+        """Build a catalog whose every registered plugin counts its schema calls.
+
+        Each registered class gets its own patched classmethod, so a subclass
+        registered alongside its parent is counted under its own name.
+        """
+        manager = PluginManager()
+        manager.register_builtin_plugins()
+        calls: Counter[str] = Counter()
+        classes = [*manager.get_sources(), *manager.get_transforms(), *manager.get_sinks()]
+        for plugin_cls in classes:
+            original = plugin_cls.get_config_schema
+            key = f"{plugin_cls.__module__}.{plugin_cls.__qualname__}"
+
+            def counting(cls: type, _original: Callable[[], dict[str, Any]] = original, _key: str = key) -> dict[str, Any]:
+                calls[_key] += 1
+                return _original()
+
+            monkeypatch.setattr(plugin_cls, "get_config_schema", classmethod(counting))
+        return CatalogServiceImpl(manager), calls, len(classes)
+
+    def test_construction_generates_each_schema_exactly_once(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Negative control for the listing test below: the counter does see
+        # schema generation, once per registered plugin, during construction.
+        _, calls, plugin_count = self._counting_catalog(monkeypatch)
+
+        assert plugin_count == 60
+        assert len(calls) == plugin_count
+        assert set(calls.values()) == {1}
+
+    def test_repeated_listing_generates_no_schemas(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        catalog, calls, plugin_count = self._counting_catalog(monkeypatch)
+        after_construction = calls.copy()
+        assert sum(after_construction.values()) == plugin_count
+
+        for _ in range(3):
+            catalog.list_sources()
+            catalog.list_transforms()
+            catalog.list_sinks()
+
+        assert calls == after_construction
+
+    def test_counter_detects_schema_regeneration(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Instrument control: the per-call path the listing used to take
+        # registers on the counter, so the zero above is not a blind spot.
+        from elspeth.plugins.sources.csv_source import CSVSource
+
+        catalog, calls, _ = self._counting_catalog(monkeypatch)
+        before = sum(calls.values())
+
+        catalog._catalog_schema(CSVSource, "source")
+
+        assert sum(calls.values()) == before + 1
+
+    def test_listing_returns_fresh_list_with_equal_content(self, catalog: CatalogServiceImpl) -> None:
+        for list_kind in (catalog.list_sources, catalog.list_transforms, catalog.list_sinks):
+            first = list_kind()
+            second = list_kind()
+            assert first is not second
+            assert first == second
+            first.clear()
+            assert list_kind() == second
+
+    def test_summaries_match_freshly_generated_schemas(self, catalog: CatalogServiceImpl) -> None:
+        # The cached summary must equal one rebuilt from a freshly generated
+        # schema, so caching cannot drift from what the plugin would emit now.
+        for kind, summaries, classes in (
+            ("source", catalog.list_sources(), catalog._source_classes),
+            ("transform", catalog.list_transforms(), catalog._transform_classes),
+            ("sink", catalog.list_sinks(), catalog._sink_classes),
+        ):
+            by_name = {summary.name: summary for summary in summaries}
+            for plugin_cls in classes:
+                fresh_schema = catalog._catalog_schema(plugin_cls, kind)
+                assert fresh_schema == catalog.get_schema(kind, plugin_cls.name).json_schema
+                fresh_fields = catalog._extract_config_fields(fresh_schema)
+                assert by_name[plugin_cls.name].config_fields == fresh_fields

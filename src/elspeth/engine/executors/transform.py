@@ -874,10 +874,11 @@ class TransformExecutor:
         # Resolve step position from node_id (injected StepResolver)
         step = self._step_resolver(NodeID(node_id))
 
-        # Extract dict from PipelineRow for hashing and Landscape recording
-        # Landscape stores raw dicts, not PipelineRow objects
+        # Extract dict from PipelineRow for Landscape recording (Landscape
+        # stores raw dicts, not PipelineRow objects). The input hash is the
+        # one begin_node_state() derives from this dict and records; the
+        # executor reads it from the opened state rather than hashing again.
         input_dict = token.row_data.to_dict()
-        input_hash = stable_hash(input_dict)
 
         # Detect row-pipelined concurrent transforms (accept/connect_output pattern).
         # ``is_batch_aware`` is intentionally not used here: that flag belongs to
@@ -1010,7 +1011,7 @@ class TransformExecutor:
                 self._populate_result_audit_fields(
                     result=result,
                     transform=transform,
-                    input_hash=input_hash,
+                    input_hash=guard.state.input_hash,
                     duration_ms=duration_ms,
                 )
 

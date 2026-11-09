@@ -120,6 +120,7 @@ class ExecutionService(Protocol):
         user_id: str | None = None,
         session_id: UUID | None = None,
         completion_gates: CompletionGateFacts | None = None,
+        fresh: bool = False,
     ) -> ValidationResult:
         """Async dry-run validation for an already materialized composition state.
 
@@ -133,6 +134,10 @@ class ExecutionService(Protocol):
         parsed off the caller's ``composition_states`` record; the recompute
         cannot rediscover those turn events, so the implementation merges them
         into the returned readiness (withholding ``completion_ready`` only).
+
+        ``fresh=True`` bypasses the implementation's short-lived advisory
+        result memo; callers writing the verdict into a durable audit-bearing
+        record must pass it.
         """
         ...
 

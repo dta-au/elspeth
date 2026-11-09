@@ -213,8 +213,18 @@ from `0.0` to `2.0` or integer seed is forwarded unchanged. These settings are
 shared by the primary model, advisor and auto-title; choose values supported
 by every configured route, or leave them unset. Reasoning models do not
 universally require zero; see [sampling compatibility](configuration.md#environment-configuration).
-Composer reasoning-effort setting `none` omits the effort hint; it does not
-send an explicit provider instruction to disable reasoning.
+Composer and advisor must be reasoning models. The reasoning-effort settings
+(`ELSPETH_WEB__COMPOSER_DISCOVERY_REASONING_EFFORT`,
+`ELSPETH_WEB__COMPOSER_CANDIDATE_REASONING_EFFORT`,
+`ELSPETH_WEB__COMPOSER_ADVISOR_REASONING_EFFORT`) accept `low`, `medium` or
+`high`; `none` is refused at startup. Every composer-plane request carries the
+hint, and a model, provider or gateway that cannot honour it refuses the
+request rather than running it unhinted. Some models accept a temperature only
+with reasoning disabled (for example OpenAI GPT-5.1/5.2), so on those routes
+leave `ELSPETH_WEB__COMPOSER_TEMPERATURE` unset. Behind the ELSPETH LLM gateway,
+the gateway adapter must declare the `reasoning` capability, and a GPT-5.4+-named
+model alias is bridged by LiteLLM to `/v1/responses`, which the gateway does not
+serve: name the alias something else.
 
 Custom endpoints may route on an operator-defined deployment alias that is
 absent from the pricing catalogue. Set `ELSPETH_WEB__COMPOSER_PRICING_MODEL`

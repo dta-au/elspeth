@@ -7,8 +7,12 @@ never labels a filtered prefix as a reconstructable request.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import re
+from threading import Lock
+from typing import Final
 
 from pydantic import JsonValue
 from rfc8785 import CanonicalizationError
@@ -226,6 +230,40 @@ def _check_tools(tools: JsonValue) -> None:
             _safe_data(tool["cache_control"])
 
 
+# Pass-verdict memo for the tools half of the scan. ``_check_tools`` is a pure
+# function of the detached tool list (module-constant detector policies; no
+# principal, session or message input), and the advertised lists are
+# server-authored and fixed per dialect and discovery policy, so one passing
+# scan per distinct list is enough. The key is the SHA-256 of a sorted-key
+# JSON encoding of the list ``_copy_json`` already proved to be finite JSON,
+# so any changed byte of a definition is a new key and is rescanned. Only
+# passes are recorded: a refused list raises on every call. Messages carry
+# user and provider content and stay scanned on every call.
+_TOOLS_PASS_MEMO: dict[str, None] = {}
+_TOOLS_PASS_MEMO_MAX: Final[int] = 16
+_TOOLS_PASS_MEMO_LOCK = Lock()
+
+
+def _tools_memo_key(tools: JsonValue) -> str:
+    encoded = json.dumps(tools, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return hashlib.sha256(encoded.encode("ascii")).hexdigest()
+
+
+def _check_tools_memoized(tools: JsonValue) -> None:
+    if tools is None:
+        return
+    key = _tools_memo_key(tools)
+    with _TOOLS_PASS_MEMO_LOCK:
+        if key in _TOOLS_PASS_MEMO:
+            return
+    _check_tools(tools)
+    with _TOOLS_PASS_MEMO_LOCK:
+        if key not in _TOOLS_PASS_MEMO:
+            if len(_TOOLS_PASS_MEMO) >= _TOOLS_PASS_MEMO_MAX:
+                _TOOLS_PASS_MEMO.pop(next(iter(_TOOLS_PASS_MEMO)))
+            _TOOLS_PASS_MEMO[key] = None
+
+
 def capture_provider_context(*, messages: object, tools: object) -> PrivateProviderContext:
     """Snapshot only explicitly supplied ordered messages/tools before await.
 
@@ -247,7 +285,7 @@ def capture_provider_context(*, messages: object, tools: object) -> PrivateProvi
             )
         )
         _check_messages(context["messages"], budget)
-        _check_tools(context["tools"])
+        _check_tools_memoized(context["tools"])
         content = canonical_json(context)
         if len(content.encode("utf-8")) > JSON_MAX_TOTAL_UTF8_BYTES:
             raise JsonBoundaryError("provider context exceeds encoded bounds")

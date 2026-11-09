@@ -357,3 +357,67 @@ async def test_dispatch_with_audit_records_plugin_crash_when_success_payload_ext
     assert inv.error_message == "TypeError"
     assert inv.version_before == 1
     assert inv.version_after is None
+
+
+_PAIR_CORPUS = (
+    {"b": 1, "a": [1.5, "x", None, True]},
+    {"when": datetime(2026, 5, 4, 12, 0, tzinfo=UTC), "nested": ({"k": (1, 2)},)},
+    ["scalar", 0, -0.0, 10**15],
+    "plain text",
+    {"sources": {"s": {"plugin": "csv", "options": {}}}, "nodes": [], "edges": [], "outputs": []},
+)
+
+
+@pytest.mark.parametrize("value", _PAIR_CORPUS)
+def test_canonical_json_and_hash_is_exactly_the_separate_pair(value: object) -> None:
+    from elspeth.core.canonical import canonical_json, stable_hash
+    from elspeth.web.composer.authority_hashing import canonical_json_and_hash
+
+    assert canonical_json_and_hash(value) == (canonical_json(value), stable_hash(value))
+
+
+def test_canonical_json_and_hash_refuses_what_the_separate_pair_refuses() -> None:
+    from elspeth.core.canonical import canonical_json
+    from elspeth.web.composer.authority_hashing import canonical_json_and_hash
+
+    for bad in ({"x": float("nan")}, {"x": object()}):
+        with pytest.raises((ValueError, TypeError)) as separate:
+            canonical_json(bad)
+        with pytest.raises(type(separate.value)):
+            canonical_json_and_hash(bad)
+
+
+def test_dispatch_envelopes_carry_the_same_canonical_text_and_hashes_as_before() -> None:
+    """Byte identity with the pre-fix-14 separate ``canonical_json`` / ``stable_hash`` calls."""
+    from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
+    from elspeth.core.canonical import canonical_json, stable_hash
+    from elspeth.web.composer.audit import begin_dispatch_or_arg_error, finish_arg_error, finish_success, rebind_dispatch_arguments
+    from elspeth.web.composer.authority_hashing import composer_authority_canonical_json, composer_authority_hash
+
+    arguments = _PAIR_CORPUS[-1]
+    audit = begin_dispatch("tc", "set_pipeline", arguments, version_before=1, actor="t")
+    assert (audit.arguments_canonical, audit.arguments_hash) == (canonical_json(arguments), stable_hash(arguments))
+    assert (audit.authority_arguments_canonical, audit.authority_arguments_hash) == (
+        composer_authority_canonical_json(arguments),
+        composer_authority_hash(arguments),
+    )
+    raw = begin_dispatch("tc", "set_pipeline", "{not json", version_before=1, actor="t")
+    sentinel = {"_unparseable_arguments": "{not json", "_truncated": False}
+    assert (raw.arguments_canonical, raw.arguments_hash) == (canonical_json(sentinel), stable_hash(sentinel))
+    rebound = rebind_dispatch_arguments(audit, _PAIR_CORPUS[0])
+    assert (rebound.arguments_canonical, rebound.arguments_hash) == (canonical_json(_PAIR_CORPUS[0]), stable_hash(_PAIR_CORPUS[0]))
+    assert rebound.authority_arguments_hash == composer_authority_hash(_PAIR_CORPUS[0])
+    failed, exc = begin_dispatch_or_arg_error("tc", "upsert_node", {"x": float("nan")}, version_before=1, actor="t")
+    assert exc is not None
+    assert failed.arguments_hash == hashlib.sha256(failed.arguments_canonical.encode("utf-8")).hexdigest()
+
+    success = finish_success(audit, result_payload={"ok": True, "n": [1, 2]}, version_after=2)
+    assert (success.result_canonical, success.result_hash) == (
+        canonical_json({"ok": True, "n": [1, 2]}),
+        stable_hash({"ok": True, "n": [1, 2]}),
+    )
+    category = next(iter(ToolArgumentErrorCategory))
+    with_payload = finish_arg_error(audit, error_class="E", error_category=category, error_message="m", error_payload={"e": 1})
+    assert (with_payload.result_canonical, with_payload.result_hash) == (canonical_json({"e": 1}), stable_hash({"e": 1}))
+    without = finish_arg_error(audit, error_class="E", error_category=category, error_message="m")
+    assert (without.result_canonical, without.result_hash) == (None, None)

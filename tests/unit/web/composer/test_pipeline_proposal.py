@@ -2,18 +2,20 @@
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import fields, is_dataclass, replace
 from decimal import Decimal
 from types import MappingProxyType
-from typing import Any
+from typing import Any, cast
 from uuid import UUID
 
 import numpy as np
 import pytest
 
+import elspeth.web.composer.pipeline_proposal as pipeline_proposal_module
 from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.freeze import FrozenJsonArray, deep_thaw, freeze_fields
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.web.composer.pipeline_proposal import (
     AbsentBase,
@@ -609,3 +611,183 @@ class TestCompositionContentHashMemo:
         bumped = replace(state, version=state.version + 1)
         assert bumped._content_hash_memo is None
         assert composition_content_hash(bumped) == baseline
+
+
+# --- Fix 6: create verifies once and seals what it verified -----------------
+
+# Values recorded from the pre-change implementation (``git show
+# af393ba6:src/elspeth/web/composer/pipeline_proposal.py`` loaded under a
+# temporary module name) for ``_pipeline()``. They pin that freezing and
+# hashing once changed no output byte.
+_HEAD_PRESENT_DRAFT_HASH = "88494d51a6166aa181d149445b8ac754d98852bb8878d16f52ddb22661c9bb5c"
+_HEAD_ABSENT_DRAFT_HASH = "3dfb9df4d731928bdcb4d5be2c457b9077e94a10f498bcd68c435a6049b7c14f"
+_HEAD_PIPELINE_CANONICAL_SHA256 = "9dd80072f3ed2699ace3bbed1e0b06db406c7bf5e33cd7c5ca9771a53c6ae9f8"
+
+
+@pytest.mark.parametrize(
+    ("base", "repair_count", "expected_draft_hash"),
+    [
+        pytest.param(PresentBase(state_id=_STATE_ID, composition_content_hash="b" * 64), 1, _HEAD_PRESENT_DRAFT_HASH, id="present"),
+        pytest.param(AbsentBase(), 0, _HEAD_ABSENT_DRAFT_HASH, id="absent"),
+    ],
+)
+def test_create_output_bytes_match_the_pre_carry_once_implementation(
+    base: AbsentBase | PresentBase,
+    repair_count: int,
+    expected_draft_hash: str,
+) -> None:
+    proposal = _create_proposal(base=base, repair_count=repair_count)
+
+    assert proposal.draft_hash == expected_draft_hash
+    assert hashlib.sha256(canonical_json(proposal.pipeline).encode("utf-8")).hexdigest() == _HEAD_PIPELINE_CANONICAL_SHA256
+    assert canonical_json(proposal.pipeline) == canonical_json(_pipeline())
+
+
+def _count_calls(monkeypatch: pytest.MonkeyPatch, target: Callable[..., Any], name: str, counts: dict[str, int]) -> None:
+    def counted(*args: Any, **kwargs: Any) -> Any:
+        counts[name] += 1
+        return target(*args, **kwargs)
+
+    counts[name] = 0
+    monkeypatch.setattr(pipeline_proposal_module, name, counted)
+
+
+def _instrument(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    _count_calls(
+        monkeypatch, pipeline_proposal_module._validate_and_freeze_canonical_mapping, "_validate_and_freeze_canonical_mapping", counts
+    )
+    _count_calls(monkeypatch, pipeline_proposal_module._owned_pipeline_draft_hash, "_owned_pipeline_draft_hash", counts)
+    _count_calls(monkeypatch, pipeline_proposal_module.pipeline_draft_hash, "pipeline_draft_hash", counts)
+    _count_calls(monkeypatch, stable_hash, "stable_hash", counts)
+    _count_calls(monkeypatch, freeze_fields, "freeze_fields", counts)
+    return counts
+
+
+def test_create_freezes_once_and_hashes_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    """One ``create`` = one validate/freeze traversal and one draft hash.
+
+    Negative control (measured on af393ba6 with the same wrappers): one
+    ``create`` performed 4 ``_validate_and_freeze_canonical_mapping``
+    traversals, 2 ``pipeline_draft_hash`` and 2 ``stable_hash`` calls, plus a
+    ``freeze_fields`` rebuild; this assertion is red against that code.
+    """
+    counts = _instrument(monkeypatch)
+
+    _create_proposal()
+
+    assert counts == {
+        "_validate_and_freeze_canonical_mapping": 1,
+        "_owned_pipeline_draft_hash": 1,
+        "pipeline_draft_hash": 0,
+        "stable_hash": 1,
+        "freeze_fields": 0,
+    }
+
+
+def test_direct_construction_still_runs_full_verification(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Positive control for the instrument, and the hand-built path's floor.
+
+    A hand-built ``PipelineProposal(...)`` must still freeze, hash and compare
+    in ``__post_init__``; if the wrappers did not intercept the module's
+    calls, this would read zero and the create assertion above would be
+    meaningless.
+    """
+    proposal = _create_proposal()
+    counts = _instrument(monkeypatch)
+
+    PipelineProposal(
+        pipeline=_pipeline(),
+        draft_hash=proposal.draft_hash,
+        base=proposal.base,
+        repair_count=proposal.repair_count,
+        skill_hash=proposal.skill_hash,
+    )
+
+    assert counts == {
+        "_validate_and_freeze_canonical_mapping": 1,
+        "_owned_pipeline_draft_hash": 1,
+        "pipeline_draft_hash": 0,
+        "stable_hash": 1,
+        "freeze_fields": 1,
+    }
+
+
+def test_create_seals_exactly_what_full_verification_accepts() -> None:
+    proposal = _create_proposal()
+
+    reverified = PipelineProposal(
+        pipeline=proposal.pipeline,
+        draft_hash=proposal.draft_hash,
+        base=proposal.base,
+        repair_count=proposal.repair_count,
+        skill_hash=proposal.skill_hash,
+    )
+
+    assert reverified == proposal
+    assert PipelineProposal.from_dict(proposal.to_dict()) == proposal
+
+
+def test_hand_built_proposal_with_another_pipelines_valid_hash_is_refused() -> None:
+    other = _create_proposal(pipeline={"value": "other"})
+
+    with pytest.raises(AuditIntegrityError, match="draft_hash mismatch"):
+        PipelineProposal(
+            pipeline=_pipeline(),
+            draft_hash=other.draft_hash,
+            base=other.base,
+            repair_count=other.repair_count,
+            skill_hash=other.skill_hash,
+        )
+
+
+def test_from_dict_with_another_pipelines_valid_hash_is_refused() -> None:
+    payload = _create_proposal().to_dict()
+    payload["draft_hash"] = _create_proposal(pipeline={"value": "other"}).draft_hash
+
+    with pytest.raises(AuditIntegrityError, match="draft_hash mismatch"):
+        PipelineProposal.from_dict(payload)
+
+
+def test_hand_built_proxy_is_not_trusted_as_already_frozen() -> None:
+    """A ``MappingProxyType`` input is re-verified, not trusted by type."""
+    backing = _pipeline()
+    proposal = _create_proposal(pipeline=backing)
+    backing["nodes"] = []
+
+    with pytest.raises(AuditIntegrityError, match="draft_hash mismatch"):
+        PipelineProposal(
+            pipeline=MappingProxyType(backing),
+            draft_hash=proposal.draft_hash,
+            base=proposal.base,
+            repair_count=proposal.repair_count,
+            skill_hash=proposal.skill_hash,
+        )
+
+
+def _container_ids(value: object) -> set[int]:
+    if type(value) in {dict, MappingProxyType}:
+        mapping = cast(Mapping[str, object], value)
+        return {id(value)}.union(*(_container_ids(child) for child in mapping.values()))
+    if type(value) in {list, FrozenJsonArray}:
+        sequence = cast(list[object], value)
+        return {id(value)}.union(*(_container_ids(child) for child in sequence))
+    return set()
+
+
+@pytest.mark.parametrize("wrap", [pytest.param(dict, id="dict"), pytest.param(MappingProxyType, id="mapping-proxy")])
+def test_create_owns_its_tree_after_the_caller_mutates_the_input(wrap: Callable[[dict[str, Any]], Mapping[str, Any]]) -> None:
+    backing = _pipeline()
+    proposal = _create_proposal(pipeline=wrap(backing))
+    expected_canonical = canonical_json(_pipeline())
+
+    assert not _container_ids(proposal.pipeline) & _container_ids(backing)
+
+    backing["source"]["options"]["columns"].append("late_mutation")
+    backing["nodes"][0]["options"]["rules"][0]["column"] = "changed"
+    backing["edges"] = []
+    backing["late"] = "key"
+
+    assert canonical_json(proposal.pipeline) == expected_canonical
+    assert proposal.draft_hash == _HEAD_PRESENT_DRAFT_HASH
+    assert PipelineProposal.from_dict(proposal.to_dict()) == proposal

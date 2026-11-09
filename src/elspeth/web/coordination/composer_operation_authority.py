@@ -20,7 +20,7 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json
 from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.coordination.contracts import SessionOperationContext, SessionOperationKind
-from elspeth.web.coordination.database_clock import database_now
+from elspeth.web.coordination.database_clock import database_now, database_now_column, database_now_value
 from elspeth.web.coordination.rate_limit_authority import ComposerQuotaAdmission
 from elspeth.web.sessions.composer_operations import (
     COMPOSER_OPERATION_PUBLIC_FAILURE_TYPES,
@@ -123,6 +123,24 @@ def _record_from_row(row: Row[Any], *, request_json: str | None = None) -> Compo
 def _read(conn: Connection, session_id: UUID, operation_id: str, *, body: bool = False) -> Row[Any] | None:
     columns = tuple(jobs.c) if body else tuple(c for c in jobs.c if c.name != "request_json")
     return conn.execute(select(*columns).where(*_key(session_id, operation_id)).limit(1)).one_or_none()
+
+
+def _read_at_database_now(
+    conn: Connection, session_id: UUID, operation_id: str, columns: tuple[Any, ...]
+) -> tuple[Row[Any] | None, datetime]:
+    """Read the row and the database clock in one statement on one connection.
+
+    The clock is one more column of the same SELECT, so a found row costs one
+    round trip instead of two and its time is still the database's (ADR-047).
+    Without a row there is no select list to carry it, so the clock is read
+    on its own exactly as before.
+    """
+    row = conn.execute(
+        select(*columns, database_now_column(conn.dialect.name)).where(*_key(session_id, operation_id)).limit(1)
+    ).one_or_none()
+    if row is None:
+        return None, database_now(conn)
+    return row, database_now_value(row.database_now)
 
 
 def _saved_failure_revisions(
@@ -413,8 +431,7 @@ class ComposerAsyncOperationAuthority:
     def get_with_database_now(self, *, session_id: UUID, operation_id: str) -> tuple[ComposerOperationRecord | None, datetime]:
         _identity(session_id, operation_id)
         with self._engine.connect() as conn:
-            row = _read(conn, session_id, operation_id)
-            now = database_now(conn)
+            row, now = _read_at_database_now(conn, session_id, operation_id, tuple(c for c in jobs.c if c.name != "request_json"))
             return (_record_from_row(row) if row is not None else None), now
 
     def get_for_turn(self, *, session_id: UUID, operation_id: str) -> ComposerOperationRecord | None:

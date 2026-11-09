@@ -3546,3 +3546,127 @@ def test_every_component_rejection_names_its_subject_and_no_other_rejection_does
         if not in_component and not says_none:
             wrong.append(f"line {call.lineno}: {callee} outside any component body names a subject")
     assert not wrong, "\n".join(wrong)
+
+
+# --- Fix 15: one candidate build validates each graph representation once ---
+#
+# ``_mutation_result`` used to compute a provisional ``new_state.validate()``
+# that ``normalize_tool_result_validation`` unconditionally discarded and
+# replaced with the request-scoped profile authority's walk over the SAME
+# reconciled object. The builder now asks that authority once. The remaining
+# whole-graph walks are the pre-reconcile mutation-blocking invariant check and
+# the authoritative walk; per-component probes (one per source and transform)
+# are unchanged.
+
+
+def _record_state_walks(monkeypatch: pytest.MonkeyPatch) -> list[CompositionState]:
+    walked: list[CompositionState] = []
+    original = CompositionState.validate
+
+    def _recording_validate(self: CompositionState) -> ValidationSummary:
+        walked.append(self)
+        return original(self)
+
+    monkeypatch.setattr(CompositionState, "validate", _recording_validate)
+    return walked
+
+
+def _full_graph_walks(walked: list[CompositionState], final: CompositionState) -> list[CompositionState]:
+    """Walks over a whole candidate graph, as opposed to one-component probes."""
+    shape = (frozenset(final.sources), tuple(node.id for node in final.nodes), tuple(output.name for output in final.outputs))
+    return [
+        state
+        for state in walked
+        if (frozenset(state.sources), tuple(node.id for node in state.nodes), tuple(output.name for output in state.outputs)) == shape
+    ]
+
+
+_FIX15_CANDIDATE_FACTORIES = [
+    pytest.param(_linear_args, id="linear"),
+    pytest.param(_named_multi_source_queue_args, id="named_multi_source_queue"),
+    pytest.param(_fork_coalesce_args, id="fork_coalesce"),
+    pytest.param(_gate_args, id="gate"),
+    pytest.param(_aggregation_args, id="aggregation"),
+    pytest.param(_structured_llm_args, id="structured_llm"),
+    pytest.param(_multi_output_args, id="multi_output"),
+]
+
+
+@pytest.mark.parametrize("factory", _FIX15_CANDIDATE_FACTORIES)
+def test_candidate_build_walks_the_reconciled_state_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    factory: Any,
+) -> None:
+    """Two whole-graph walks per build, and never twice after reconciliation.
+
+    Negative control (recorded in the fix-15 evidence): on the pre-fix tree
+    this yields three full walks, the last two receiving the same reconciled
+    object by identity.
+
+    Since fix 14, reconciliation returns its input when it changes nothing, so
+    for these fresh builds (no review evidence to carry) the pre-reconcile
+    invariant walk receives the very object the candidate carries. That walk
+    still runs before reconciliation to keep its failure precedence; whether
+    it can now reuse or be reused is a separate decision, not asserted here.
+    """
+    args = factory(tmp_path)
+    context = _trained_context(data_dir=tmp_path)
+    walked = _record_state_walks(monkeypatch)
+
+    candidate = build_set_pipeline_candidate(args, _empty_state(), context)
+
+    assert candidate.acceptable is True
+    final = candidate.result.updated_state
+    full = _full_graph_walks(walked, final)
+    assert len(full) == 2, [id(state) for state in full]
+    # Walk 1 is the pre-reconcile invariant check; walk 2 is the authority's
+    # walk of the exact object the candidate carries. Reconciliation was a
+    # no-op here, so it returned walk 1's object itself (fix 14 identity).
+    assert full[0] is final
+    assert full[1] is final
+    probes = len(walked) - len(full)
+    # One probe per source and per plugin-bearing node (transform, aggregation).
+    assert probes == len(final.sources) + sum(1 for node in final.nodes if node.plugin is not None)
+
+
+@pytest.mark.parametrize("factory", _FIX15_CANDIDATE_FACTORIES)
+def test_candidate_validation_equals_a_fresh_authoritative_normalization(tmp_path: Path, factory: Any) -> None:
+    """The single walk produces exactly what normalizing a provisional envelope did."""
+    context = _trained_context(data_dir=tmp_path)
+
+    candidate = build_set_pipeline_candidate(factory(tmp_path), _empty_state(), context)
+
+    assert candidate.result._validation_snapshot_hash == context.catalog.snapshot.snapshot_hash
+    provisional = replace(candidate.result, validation=candidate.result.updated_state.validate(), _validation_snapshot_hash=None)
+    renormalized = normalize_tool_result_validation(provisional, context.catalog)
+    assert renormalized is not provisional
+    assert renormalized == candidate.result
+    assert renormalized.validation == candidate.result.validation
+    assert renormalized.to_dict() == candidate.result.to_dict()
+
+
+def test_profile_lowering_still_validates_the_lowered_graph(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Negative control: when lowering changes the graph, the lowered graph is walked.
+
+    The authority's walk must run on the executable (lowered) representation,
+    a different object with different content from the authored state the
+    candidate carries; dropping the provisional walk must not drop this one.
+    """
+    (tmp_path / "outputs").mkdir(exist_ok=True)
+    context = _operator_profile_view(tmp_path)
+    walked = _record_state_walks(monkeypatch)
+
+    candidate = build_set_pipeline_candidate(_ab_multi_query_args(tmp_path), _empty_state(), context)
+
+    assert candidate.acceptable is True
+    final = candidate.result.updated_state
+    full = _full_graph_walks(walked, final)
+    assert len(full) == 2, [id(state) for state in full]
+    lowered = full[1]
+    assert lowered is not final
+    assert lowered != final
+    assert full[0] is not lowered
+    monkeypatch.undo()
+    assert context.catalog.validate_authored_state(final).executable_state == lowered
+    assert candidate.result.validation == context.catalog.validate_composition_state(final).validation

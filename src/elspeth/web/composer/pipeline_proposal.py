@@ -269,7 +269,6 @@ def reviewed_anchor_hash(reviewed_facts: Mapping[str, Any]) -> str:
         "schema": _REVIEWED_ANCHOR_SCHEMA,
         "facts": frozen_facts,
     }
-    canonical_json(preimage)
     return stable_hash(preimage)
 
 
@@ -504,7 +503,19 @@ def owned_composition_state_execution_arguments(
     version: int,
 ) -> OwnedCompositionStateSetPipelineArguments:
     """Build private set-pipeline execution arguments without losing state."""
-    state = restore_owned_composition_state_authority(authority, version=version)
+    return owned_composition_state_execution_arguments_from_restored(restore_owned_composition_state_authority(authority, version=version))
+
+
+def owned_composition_state_execution_arguments_from_restored(state: CompositionState) -> OwnedCompositionStateSetPipelineArguments:
+    """Project execution arguments from a state the caller has just restored.
+
+    ``state`` must be the return value of
+    :func:`restore_owned_composition_state_authority` for the authority being
+    projected. This projects; it does not verify. Callers that already hold the
+    restored state use it so one authority is verified once, not once per
+    projection (the restore's exact round trip makes ``state.to_dict()`` equal
+    to what a second restore of the same authority would emit).
+    """
     payload = state.to_dict()
     return OwnedCompositionStateSetPipelineArguments(
         sources=payload["sources"],
@@ -526,7 +537,7 @@ def owned_composition_state_review_arguments(authority: Mapping[str, Any]) -> Ow
     from elspeth.web.interpretation_state import SOURCE_AUTHORING_KEY
 
     state = restore_owned_composition_state_authority(authority, version=1)
-    payload = owned_composition_state_execution_arguments(authority, version=1)
+    payload = owned_composition_state_execution_arguments_from_restored(state)
     safe_sources: dict[str, Any] = {}
     for source_name, source in state.sources.items():
         options = deep_thaw(source.options)
@@ -558,7 +569,40 @@ def pipeline_draft_hash(
     skill_hash: str,
 ) -> str:
     """Hash the complete authority-bearing proposal envelope under v4."""
-    frozen_pipeline = _validate_and_freeze_canonical_mapping(pipeline, "pipeline")
+    return _owned_pipeline_draft_hash(
+        frozen_pipeline=_validate_and_freeze_canonical_mapping(pipeline, "pipeline"),
+        base=base,
+        repair_count=repair_count,
+        skill_hash=skill_hash,
+    )
+
+
+def _owned_pipeline_draft_hash(
+    *,
+    frozen_pipeline: Mapping[str, Any],
+    base: ProposalBase,
+    repair_count: int,
+    skill_hash: str,
+) -> str:
+    """Hash the v4 envelope over a pipeline this module has just frozen itself.
+
+    Module-private. ``frozen_pipeline`` must be the value
+    ``_validate_and_freeze_canonical_mapping`` returned on the caller's own
+    path in this module, never a caller-supplied mapping: that function builds
+    every container afresh, so nothing outside this module holds a reference
+    to the tree and it cannot change between freeze and hash. Being a
+    ``MappingProxyType`` proves nothing (its backing dict may be mutable
+    elsewhere), which is why the public ``pipeline_draft_hash`` always
+    re-freezes.
+
+    ``stable_hash`` is ``sha256(canonical_json(...))`` over the same
+    normalisation, so it raises everything a separate ``canonical_json`` of
+    the preimage would; the discarded pre-serialisation that used to precede
+    it was a pure duplicate. The preimage (schema, authority projection of the
+    pipeline, base, counters) is a different canonical form from the bare
+    pipeline whose bytes ``_validate_and_freeze_canonical_mapping`` measures
+    for the size limit, so those bytes cannot be shared with the hash.
+    """
     if type(repair_count) is not int or repair_count < 0:
         raise AuditIntegrityError("repair_count must be a non-negative integer")
     _require_hash(skill_hash, "skill_hash")
@@ -570,7 +614,6 @@ def pipeline_draft_hash(
         "repair_count": repair_count,
         "skill_hash": skill_hash,
     }
-    canonical_json(preimage)
     return stable_hash(preimage)
 
 
@@ -594,8 +637,10 @@ class PipelineProposal:
             raise AuditIntegrityError("repair_count must be a non-negative integer")
         _require_hash(self.skill_hash, "skill_hash")
 
-        expected_draft_hash = pipeline_draft_hash(
-            pipeline=frozen_pipeline,
+        # ``frozen_pipeline`` was built by this method's own freeze above, so
+        # it is hashed without freezing it a second time.
+        expected_draft_hash = _owned_pipeline_draft_hash(
+            frozen_pipeline=frozen_pipeline,
             base=self.base,
             repair_count=self.repair_count,
             skill_hash=self.skill_hash,
@@ -615,23 +660,41 @@ class PipelineProposal:
         skill_hash: str,
         supplied_draft_hash: str | None = None,
     ) -> Self:
-        """Construct a proposal, optionally verifying its supplied draft hash."""
+        """Construct a proposal, optionally verifying its supplied draft hash.
+
+        Verifies once and seals what it verified. Every check ``__post_init__``
+        performs is performed here, in the same first-failure order, on the
+        single tree this call froze: the strict-JSON freeze and size limit,
+        ``repair_count``/``skill_hash``/base (inside the hash), the supplied
+        hash, and the owned-state round trip. The instance is then sealed with
+        ``object.__new__`` so ``__post_init__`` does not freeze and hash the
+        same tree a second, third and fourth time.
+
+        There is deliberately no separate "already validated" constructor or
+        flag field: the only way to reach the unchecked seal is through this
+        method, which computes every sealed value itself, so a caller cannot
+        hand it a pipeline or hash to trust. A hand-built
+        ``PipelineProposal(...)``, ``dataclasses.replace`` and ``from_dict``'s
+        payload freeze still run full verification.
+        """
         frozen_pipeline = _validate_and_freeze_canonical_mapping(pipeline, "pipeline")
-        computed_draft_hash = pipeline_draft_hash(
-            pipeline=frozen_pipeline,
+        computed_draft_hash = _owned_pipeline_draft_hash(
+            frozen_pipeline=frozen_pipeline,
             base=base,
             repair_count=repair_count,
             skill_hash=skill_hash,
         )
         if supplied_draft_hash is not None and supplied_draft_hash != computed_draft_hash:
             raise AuditIntegrityError("PipelineProposal draft_hash mismatch")
-        return cls(
-            pipeline=frozen_pipeline,
-            draft_hash=computed_draft_hash,
-            base=base,
-            repair_count=repair_count,
-            skill_hash=skill_hash,
-        )
+        if is_owned_composition_state_authority(frozen_pipeline):
+            restore_owned_composition_state_authority(frozen_pipeline, version=1)
+        proposal = object.__new__(cls)
+        object.__setattr__(proposal, "pipeline", frozen_pipeline)
+        object.__setattr__(proposal, "draft_hash", computed_draft_hash)
+        object.__setattr__(proposal, "base", base)
+        object.__setattr__(proposal, "repair_count", repair_count)
+        object.__setattr__(proposal, "skill_hash", skill_hash)
+        return proposal
 
     def to_dict(self) -> PipelineProposalData:
         """Return the strict JSON-safe envelope used for persistence."""

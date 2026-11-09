@@ -723,14 +723,21 @@ def _model(completion: _ScriptedCompletion, **overrides: object) -> PlannerModel
         "provider": "test-provider",
         "temperature": 0.0,
         "seed": 7,
-        "timeout_seconds": 5.0,
+        # A hang guard, not an assertion: every test that asserts the
+        # wall-clock TIMEOUT sets its own timeout_seconds. The scripted
+        # four-call protocols here take 2.0-2.6 s uninstrumented and
+        # 3.6-3.7 s under --cov on an idle box, so CI's coverage lane
+        # (two workers on a co-loaded runner) exceeded the former 5 s
+        # value with a "planner wall-clock budget exhausted" failure
+        # (dta-au/elspeth#354, 3.13 shard 2).
+        "timeout_seconds": 30.0,
         "max_composition_turns": 4,
         "max_discovery_turns": 3,
         "max_tool_calls_per_turn": 3,
         "max_api_attempts": 1,
         "api_retry_base_seconds": 0.0,
-        "discovery_reasoning_effort": "none",
-        "candidate_reasoning_effort": "none",
+        "discovery_reasoning_effort": "low",
+        "candidate_reasoning_effort": "high",
         "tool_contract_dialect": ToolContractDialect.NONE,
         "escape_hatch_tool_contract_dialect": ToolContractDialect.NONE,
     }
@@ -9266,7 +9273,10 @@ async def test_aid_supplied_reads_in_one_turn_deliver_results_without_hatch(
     assert completion.requests[1]["model"] == "anthropic/claude-planner"
     tool_results = [json.loads(message["content"]) for message in completion.requests[1]["messages"] if message["role"] == "tool"]
     assert [result["success"] for result in tool_results] == [True, True]
-    assert [invocation.tool_name for invocation in recorder.invocations] == ["list_models", "get_expression_grammar"]
+    # Same-turn discovery calls run as concurrent tasks and each records its
+    # invocation when it finishes, so the recorder holds completion order,
+    # not call order (observed flipped 1 run in 11 locally).
+    assert sorted(invocation.tool_name for invocation in recorder.invocations) == ["get_expression_grammar", "list_models"]
 
 
 @pytest.mark.asyncio
@@ -10409,8 +10419,18 @@ async def test_openrouter_models_get_the_native_reasoning_object(
     assert "reasoning_effort" not in sent
 
 
+@pytest.mark.parametrize("field_name", ["discovery_reasoning_effort", "candidate_reasoning_effort"])
+@pytest.mark.parametrize("effort", ["none", "", "extreme"])
+def test_planner_model_config_refuses_an_unhinted_or_unknown_reasoning_effort(field_name: str, effort: str) -> None:
+    """Composer and advisor must be reasoning models: a planner config that
+    would send an unhinted or mis-hinted call is refused at construction,
+    before any provider turn."""
+    with pytest.raises(ValueError, match=field_name):
+        _model(_ScriptedCompletion(), **{field_name: effort})
+
+
 @pytest.mark.asyncio
-async def test_none_reasoning_effort_leaves_planner_kwargs_unhinted(
+async def test_every_planner_request_carries_a_reasoning_hint(
     tmp_path: Path,
     tool_context: ToolContext,
 ) -> None:
@@ -10419,8 +10439,7 @@ async def test_none_reasoning_effort_leaves_planner_kwargs_unhinted(
     await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion)
 
     (sent,) = completion.requests
-    assert "reasoning" not in sent
-    assert "reasoning_effort" not in sent
+    assert sent["reasoning_effort"] == "low"
 
 
 def test_explain_tool_advertisement_is_dropped_once_every_code_is_enriched() -> None:

@@ -209,6 +209,12 @@ class ChatRequest(BaseModel):
     tools: list[ChatTool] | None = None
     tool_choice: str | NamedToolChoice | None = None
     response_format: ResponseFormat | None = None
+    # The chat-completions reasoning hint. ELSPETH's composer and advisor must
+    # be reasoning models and send it on every call; an adapter that does not
+    # declare ``Capability.REASONING`` refuses it (``_check_capabilities``)
+    # rather than forward the call with the hint dropped. "none" is not in the
+    # vocabulary: a caller that wants no reasoning omits the field.
+    reasoning_effort: Literal["low", "medium", "high"] | None = None
 
     @model_validator(mode="before")
     @classmethod

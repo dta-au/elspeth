@@ -10,7 +10,6 @@ import json
 import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Final, get_args
 
 from sqlalchemy import func, or_, select
@@ -42,12 +41,7 @@ from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.plugin_policy_audit import WebPluginPolicyEvidence, decode_admission_decision
 from elspeth.contracts.preflight import PreflightResult
 from elspeth.contracts.run_start import RunStartPermitBinding
-from elspeth.contracts.runtime_val_manifest import (
-    RuntimeValRegistryFingerprint,
-    _assert_runtime_val_registries_frozen,
-    build_runtime_val_manifest,
-    runtime_val_registry_fingerprint,
-)
+from elspeth.contracts.runtime_val_manifest import cached_frozen_runtime_val_manifest_json
 from elspeth.contracts.scheduler import TokenWorkStatus
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.core.ids import generate_id
@@ -209,28 +203,6 @@ def _validate_openrouter_catalog_snapshot(*, sha256: str, source: str) -> None:
         raise AuditIntegrityError(f"openrouter_catalog_source must be one of {sorted(_OPENROUTER_CATALOG_SOURCES)!r}, got {source!r}")
 
 
-@lru_cache(maxsize=4)
-def _cached_frozen_runtime_val_manifest_json(fingerprint: RuntimeValRegistryFingerprint) -> str:
-    """Serialize the frozen runtime-VAL registries once per registry state.
-
-    Building the manifest hashes source, bytecode, and transitive helper
-    dependencies (seconds of work), so ``begin_run()`` must not pay it per
-    run. The cache is keyed on ``runtime_val_registry_fingerprint()``
-    rather than being process-wide: a process whose registries change
-    between runs must never write an earlier registry's manifest into a
-    later run header (elspeth-68bc1e3d3a). The uncached builder remains
-    authoritative for direct drift probes that deliberately mutate code
-    objects.
-    """
-    del fingerprint  # cache key only; the builder reads the live registries
-    return canonical_json(build_runtime_val_manifest())
-
-
-def _frozen_runtime_val_manifest_json() -> str:
-    _assert_runtime_val_registries_frozen()
-    return _cached_frozen_runtime_val_manifest_json(runtime_val_registry_fingerprint())
-
-
 def _already_terminal_error(run_id: str, existing_status: str) -> AuditIntegrityError:
     return AuditIntegrityError(
         f"Cannot complete run {run_id}: already terminal "
@@ -390,7 +362,7 @@ class RunLifecycleRepository:
         # orchestrator has frozen both registries; begin_run is called from
         # Orchestrator.run() which sequences prepare_for_run() (which
         # freezes) before this call.
-        runtime_val_manifest_json = _frozen_runtime_val_manifest_json()
+        runtime_val_manifest_json = cached_frozen_runtime_val_manifest_json()
 
         run = Run(
             run_id=run_id,

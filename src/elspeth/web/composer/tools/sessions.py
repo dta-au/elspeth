@@ -2050,6 +2050,7 @@ def build_set_pipeline_candidate(
             affected,
             data=data,
             full_replacement=True,
+            catalog=context.catalog,
         )
     )
 

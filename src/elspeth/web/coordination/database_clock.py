@@ -47,8 +47,54 @@ rather than describing it as a no-op refactor.
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Any, Final
 
+from sqlalchemy import ColumnElement, literal_column
 from sqlalchemy.engine import Connection
+
+# The select-list form of the same two clock expressions ``database_now``
+# executes on its own. A read that needs a row AND the time can carry the
+# clock as one more column of its own SELECT instead of paying a second round
+# trip; the value still comes from the database (ADR-047) and is admitted by
+# ``database_now_value``, so both forms return the same type, zone and
+# precision.
+_DATABASE_NOW_EXPRESSIONS: Final[dict[str, str]] = {
+    "postgresql": "clock_timestamp()",
+    "sqlite": "CURRENT_TIMESTAMP",
+}
+
+
+def database_now_column(dialect_name: str) -> ColumnElement[Any]:
+    """Return the database clock as a labelled select-list column.
+
+    The column is untyped on purpose: SQLAlchemy then hands the driver's
+    value through unchanged, exactly as ``exec_driver_sql`` does for
+    ``database_now``, and ``database_now_value`` admits it. An unsupported
+    dialect raises for the same reason ``database_now`` does.
+    """
+    if dialect_name not in _DATABASE_NOW_EXPRESSIONS:
+        raise NotImplementedError(f"sessions database time not implemented for {dialect_name}")
+    return literal_column(_DATABASE_NOW_EXPRESSIONS[dialect_name]).label("database_now")
+
+
+def database_now_value(value: object) -> datetime:
+    """Admit the driver's clock value as an aware UTC datetime.
+
+    SQLite hands back a string; PostgreSQL hands back a datetime. Exactly
+    those two: the driver's value is foreign data, and a subclass of either
+    is not something a driver produces.
+
+    Naive values are UTC by construction — SQLite's CURRENT_TIMESTAMP is
+    documented as UTC — so they are stamped, not converted. Aware values are
+    CONVERTED, so the return is UTC in fact and not merely in name.
+    """
+    if type(value) is str:
+        value = datetime.fromisoformat(value)
+    if type(value) is not datetime:
+        raise RuntimeError("sessions database clock returned a non-datetime value")
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
 
 
 def database_now(conn: Connection) -> datetime:
@@ -70,18 +116,4 @@ def database_now(conn: Connection) -> datetime:
         value = conn.exec_driver_sql("SELECT CURRENT_TIMESTAMP").scalar_one()
     else:
         raise NotImplementedError(f"sessions database time not implemented for {dialect}")
-
-    # SQLite hands back a string; PostgreSQL hands back a datetime. Exactly
-    # those two: the driver's value is foreign data, and a subclass of either
-    # is not something a driver produces.
-    if type(value) is str:
-        value = datetime.fromisoformat(value)
-    if type(value) is not datetime:
-        raise RuntimeError("sessions database clock returned a non-datetime value")
-
-    # Naive values are UTC by construction — SQLite's CURRENT_TIMESTAMP is
-    # documented as UTC — so they are stamped, not converted. Aware values are
-    # CONVERTED, so the return is UTC in fact and not merely in name.
-    if value.tzinfo is None:
-        return value.replace(tzinfo=UTC)
-    return value.astimezone(UTC)
+    return database_now_value(value)

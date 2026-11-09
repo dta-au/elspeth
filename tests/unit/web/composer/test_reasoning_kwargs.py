@@ -8,9 +8,13 @@ from elspeth.web.composer.reasoning import apply_reasoning_kwargs
 
 
 @pytest.mark.parametrize("effort", [None, "none"])
-def test_none_effort_is_a_no_op(effort: str | None) -> None:
+def test_missing_or_none_effort_is_refused(effort: str | None) -> None:
+    """Composer and advisor must be reasoning models: every call carries a
+    hint, so an absent or ``"none"`` effort is a programmer error, never a
+    silent unhinted call."""
     kwargs: dict[str, object] = {"model": "openrouter/anthropic/claude-sonnet-5"}
-    apply_reasoning_kwargs(kwargs, model="openrouter/anthropic/claude-sonnet-5", effort=effort)
+    with pytest.raises(ValueError, match="reasoning effort"):
+        apply_reasoning_kwargs(kwargs, model="openrouter/anthropic/claude-sonnet-5", effort=effort)
     assert kwargs == {"model": "openrouter/anthropic/claude-sonnet-5"}
 
 
@@ -68,12 +72,51 @@ def test_litellm_preserves_the_native_reasoning_object_for_openrouter() -> None:
     )
 
 
-@pytest.mark.parametrize("model", ["gpt-5.5", "openai/gpt-5.5"], ids=["bare-alias", "openai-prefixed"])
-def test_openai_surface_models_stay_unhinted(model: str) -> None:
-    """litellm's responses_api_bridge_check routes GPT-5.4+ chat calls with
-    tools + reasoning_effort to /v1/responses; chat-completions-only
-    gateways (ELSPETH's own is extra="forbid") do not serve it. Unhinted
-    until elspeth-9a46553771 lands the gateway contract field."""
+@pytest.mark.parametrize(
+    "model",
+    ["gpt-5.5", "openai/gpt-5.5", "gw-alias", "openai/gw-alias"],
+    ids=["bare-gpt", "openai-gpt", "bare-gateway-alias", "openai-gateway-alias"],
+)
+def test_openai_surface_models_are_hinted(model: str) -> None:
+    """Bare and ``openai/`` models — direct OpenAI and OpenAI-compatible
+    gateways, ELSPETH's own included — carry ``reasoning_effort``. A
+    provider or gateway that cannot honour it must reject the call loudly;
+    the composer no longer drops the hint on its behalf."""
     kwargs: dict[str, object] = {}
     apply_reasoning_kwargs(kwargs, model=model, effort="high")
-    assert kwargs == {}
+    assert kwargs == {"reasoning_effort": "high"}
+
+
+@pytest.mark.parametrize("model", ["openai/gw-alias", "gw-alias"])
+def test_gateway_alias_hint_reaches_the_chat_completions_wire(model: str) -> None:
+    """A non-GPT gateway alias with tools stays on /chat/completions and
+    carries ``reasoning_effort`` through litellm's param shaping (measured on
+    the locked litellm). Fails if litellm starts dropping or rerouting it."""
+    import litellm
+
+    kwargs: dict[str, object] = {}
+    apply_reasoning_kwargs(kwargs, model=model, effort="medium")
+    params = litellm.utils.get_optional_params(
+        model=model.removeprefix("openai/"),
+        custom_llm_provider="openai",
+        tools=[{"type": "function", "function": {"name": "f", "parameters": {"type": "object", "properties": {}}}}],
+        **kwargs,
+    )
+    assert params.get("reasoning_effort") == "medium", f"litellm dropped reasoning_effort for {model!r}; got {params!r}"
+
+
+def test_registry_advisory_states_the_hint_is_sent_and_a_refusal_will_fail_the_call(caplog: pytest.LogCaptureFixture) -> None:
+    """The advisory must not imply an unhinted call is merely 'ignored':
+    the hint is always sent, so a model that cannot reason is refused by its
+    provider or gateway on the first call."""
+    import logging
+
+    from elspeth.web.composer.reasoning import warn_if_not_reasoning_capable
+
+    with caplog.at_level(logging.WARNING, logger="elspeth.web.composer.reasoning"):
+        warn_if_not_reasoning_capable(model="openai/gw-alias", role="candidate", effort="high")
+
+    message = caplog.records[-1].getMessage()
+    assert "may be ignored" not in message
+    assert "composer and advisor must be reasoning models" in message
+    assert "'high'" in message

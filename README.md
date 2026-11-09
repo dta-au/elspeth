@@ -4,7 +4,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
-![Status: 0.8.9](https://img.shields.io/badge/status-0.8.9-green.svg)
+![Status: 0.8.10](https://img.shields.io/badge/status-0.8.10-green.svg)
 
 ELSPETH builds, validates, runs, and audits data and LLM workflows whose
 outputs need to be reviewed and explained. You can author a pipeline in
@@ -98,7 +98,48 @@ ELSPETH supports audit export and optional signing. The
 [export settings and limits](docs/reference/configuration.md#export-settings)
 describe what is exported and how to configure it.
 
-## What changed in 0.8.9
+## What changed in 0.8.10
+
+0.8.10 carries the Composer performance remediation. Proposals, the
+`set_pipeline` schema and fixed tool definitions are verified once; restored
+states keep their identity through review projection, reconciliation and commit
+binding; plugin summaries, proposal lists and review cards read once per
+request; advisory validation shares a brief memo that durable review records
+never read; and operation streams authorize on one connection. Every LLM call
+row records the byte size of each request component. Approval binding shares
+the cached runtime manifest with run start, and the transform executor reads
+the recorded input hash. Outputs, hashes and decisions are byte-identical to
+0.8.9. See the [release notes](CHANGELOG.md).
+
+Composer and advisor models must be reasoning models: a reasoning hint is sent
+on every composer-plane call, `ELSPETH_WEB__COMPOSER_*_REASONING_EFFORT=none`
+is refused at startup, and gateway adapters must declare the `reasoning`
+capability to serve the Composer. The frontend holds Run while a session
+operation is still in flight, and `.env` discovery starts from the working
+directory.
+
+Session epoch 78 replaces session epoch 77 and retains its committed graph-review
+authority while strengthening quota custody and shared rate-limit policy binding.
+Landscape epoch 50 replaces epoch 49 and records durable provider-attempt identity
+on run calls. Both epochs are unchanged from 0.8.9, so an existing epoch 78 session
+store and epoch 50 Landscape store need no action. Preserve epoch 75, both epoch 76
+session-store contracts, epoch 77 session stores and epoch 49 Landscape stores; use
+a separately provisioned epoch 78 session store and epoch 50 Landscape store. Keep
+old workers isolated from the new stores. Compatible stores still require exact
+schema admission; unsupported stores are preserved and refused before incompatible
+writes. Backwards compatibility is permitted and considered from 0.8.5 within
+explicitly supported boundaries. This release authorizes no in-place migration,
+reset or downgrade. Package metadata is 0.8.10; the package version alone does not
+establish qualification or image publication. Automatic image publication from
+main is held; verify the release tag and image digest before installing a
+published image.
+
+Quota API quantities now use decimal strings for exact signed-64-bit values;
+older numeric clients must adapt their response parsing. Proxy deployments must
+explicitly configure `ELSPETH_WEB__TRUSTED_PROXY_HOSTS` with their actual numeric
+forwarding peers; the default trusts no forwarding headers.
+
+## Previously in 0.8.9
 
 0.8.9 combines Composer, Azure Container Apps and engine improvements.
 Full-replacement refusals and incremental output refusals
@@ -134,44 +175,7 @@ verification and later web connections are outside that measurement. Offline
 instruction rehearsal does not establish live cloud acceptance. These ACA
 enhancements were developed under 0.8.8 and are included in 0.8.9.
 
-Session epoch 78 replaces session epoch 77 and retains its committed graph-review
-authority while strengthening quota custody and shared rate-limit policy binding.
-Landscape epoch 50 replaces epoch 49 and records durable provider-attempt identity
-on run calls. Preserve epoch 75, both epoch 76 session-store contracts, epoch 77
-session stores and epoch 49 Landscape stores; use a separately provisioned epoch 78
-session store and epoch 50 Landscape store. Keep old workers isolated from the new stores.
-Compatible stores still require exact schema admission; unsupported stores are
-preserved and refused before incompatible writes. Backwards compatibility is
-permitted and considered from 0.8.5 within explicitly supported boundaries. This
-release authorizes no in-place migration, reset or downgrade. Package metadata
-is 0.8.9; the package version alone does not establish qualification or image
-publication. Automatic image publication from main is held; verify the release
-tag and image digest before installing a published image.
-
-Quota API quantities now use decimal strings for exact signed-64-bit values;
-older numeric clients must adapt their response parsing. Proxy deployments must
-explicitly configure `ELSPETH_WEB__TRUSTED_PROXY_HOSTS` with their actual numeric
-forwarding peers; the default trusts no forwarding headers.
-
-## Previously in 0.8.6
-
-0.8.6 strengthens Composer final-reply review, retained operation outcomes,
-and bounded blob inspection. Replies are reviewed against the current request,
-saved changes and delivered inspection evidence, or withheld when admission
-cannot be established within existing limits. Reply admission does not clear
-graph or execution blockers. See the [release notes](CHANGELOG.md).
-
-Session epoch 76 replaces session epoch 75; Landscape epoch 49 is unchanged.
-Preserve epoch 75 session stores and use a separately provisioned epoch 76
-session store. Keep old workers isolated from the new store. Compatible stores
-still require exact schema admission; unsupported stores are preserved and
-refused before incompatible writes. Backwards compatibility is permitted and
-considered from 0.8.5 within explicitly supported boundaries. This candidate
-authorizes no in-place migration, reset or downgrade. Package metadata is 0.8.6;
-the package version alone does not establish qualification or image publication.
-Automatic image publication from main is held; verify the release tag and image
-digest before installing a published image. See the
-[release notes](CHANGELOG.md) and [deployment runbooks](docs/runbooks/index.md)
+See the [release notes](CHANGELOG.md) and [deployment runbooks](docs/runbooks/index.md)
 before upgrading.
 
 ## Recovery and deployment

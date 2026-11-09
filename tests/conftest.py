@@ -203,6 +203,44 @@ def _allow_raw_secrets_in_tests(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ELSPETH_ALLOW_RAW_SECRETS", "true")
 
 
+# Keys a root autouse fixture above owns for every test; the dotenv-free
+# fixture below must not undo them even when ``.env`` carries the same value.
+_TEST_HARNESS_OWNED_ENV_KEYS = frozenset({"ELSPETH_ALLOW_RAW_SECRETS"})
+
+
+@pytest.fixture
+def dotenv_free_environment(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Give an in-process ``elspeth --no-dotenv`` the environment it asks for.
+
+    ``pyproject.toml``'s ``env_files = [".env"]`` makes pytest-dotenv load the
+    checkout's ``.env`` into ``os.environ`` before collection.  ``--no-dotenv``
+    only stops the CLI's own load, so a ``CliRunner`` invocation still sees
+    every variable that file set -- in a checkout whose ``.env`` points
+    ``ELSPETH_WEB__SESSION_DB_URL`` at a live server, the test reaches the live
+    sessions store (GitHub issue #353).  CI has no ``.env``, which is why it
+    stayed green there.
+
+    This removes each variable pytest-dotenv loaded, found the way that plugin
+    finds the file (each ``env_files`` name, searched upward from the pytest
+    invocation directory), when its current value still equals the file's
+    value.  A variable the shell exported with a different value is kept: it
+    did not come from ``.env``.
+    """
+    from dotenv import dotenv_values
+
+    invocation_dir = request.config.invocation_params.dir
+    for filename in request.config.getini("env_files"):
+        candidates = [directory / filename for directory in (invocation_dir, *invocation_dir.parents)]
+        found = [candidate for candidate in candidates if candidate.is_file()]
+        if not found:
+            continue
+        for key, value in dotenv_values(found[0]).items():
+            if key in _TEST_HARNESS_OWNED_ENV_KEYS or value is None:
+                continue
+            if os.environ.get(key) == value:
+                monkeypatch.delenv(key)
+
+
 @pytest.fixture(autouse=True)
 def _isolate_planner_authoring_aids_memo() -> Iterator[None]:
     """Clear the process-global authoring-aids memo between tests.

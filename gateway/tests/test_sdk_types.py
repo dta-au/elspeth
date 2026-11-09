@@ -23,6 +23,7 @@ def test_capability_vocabulary_is_closed():
         "json_schema",
         "seed",
         "usage",
+        "reasoning",
     }
 
 

@@ -175,6 +175,7 @@ class _ExecutionServiceLike(Protocol):
         session_id: UUID | None = None,
         session_operation_context: SessionOperationContext,
         completion_gates: CompletionGateFacts | None = None,
+        fresh: bool = False,
     ) -> Any: ...
 
 
@@ -185,6 +186,7 @@ class _ReadinessServiceLike(Protocol):
         session_id: UUID,
         user_id: str,
         session_operation_context: SessionOperationContext,
+        fresh: bool = False,
     ) -> AuditReadinessSnapshot: ...
 
 
@@ -432,6 +434,9 @@ class ShareableReviewService:
             session_id=session_id,
             session_operation_context=session_operation_context,
             completion_gates=parse_completion_gates(state_record.composer_meta),
+            # The mark writes this verdict into a durable review record; an
+            # audit-bearing record is never derived from the advisory memo.
+            fresh=True,
         )
         if not validation.is_valid:
             # elspeth-3830c620a2: a pending-interpretation handoff is
@@ -462,6 +467,9 @@ class ShareableReviewService:
             session_id=session_id,
             user_id=user_id,
             session_operation_context=session_operation_context,
+            # The snapshot is written into the durable review blob: its
+            # validation row must not come from the advisory memo either.
+            fresh=True,
         )
         if _has_error_readiness_row(audit_readiness):
             raise CompositionNotRunnableError(

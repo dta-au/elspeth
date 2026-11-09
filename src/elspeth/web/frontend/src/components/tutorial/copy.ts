@@ -22,6 +22,13 @@ export const TURN_4_RUN_BUTTON = "Run";
 export const TURN_4_READY_BODY =
   "The pipeline pane shows the graph you just confirmed. Look it over — " +
   "nothing runs until you click Run.";
+/**
+ * Shown on the pre-run card while a request the build started (the last
+ * review's save, or the check that follows it) is still settling. Run stays
+ * disabled until it does: the server refuses a run while that request holds
+ * the session (#352).
+ */
+export const TURN_4_SETTLING_BODY = "Finishing the last check on your pipeline…";
 export const TURN_4_PRIMARY_BUTTON = "Continue";
 export const TURN_5_PRIMARY_BUTTON = "Continue";
 export const TURN_7_PRIMARY_BUTTON = "Take me to the composer";

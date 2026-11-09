@@ -27,6 +27,7 @@ _GATED_CAPABILITY_EXTRA = {
         }
     },
     "seed": {"seed": 7},
+    "reasoning": {"reasoning_effort": "medium"},
 }
 
 

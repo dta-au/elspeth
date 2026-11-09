@@ -17427,7 +17427,7 @@ def begin_run(self, config: Mapping[str, Any], canonical_version: str, *, run_id
     settings_json = canonical_json(config)
     config_hash = stable_hash(config)
     timestamp = now()
-    runtime_val_manifest_json = _frozen_runtime_val_manifest_json()
+    runtime_val_manifest_json = cached_frozen_runtime_val_manifest_json()
     run = Run(run_id=run_id, started_at=timestamp, config_hash=config_hash, settings_json=settings_json, canonical_version=canonical_version, status=status, run_mode=run_mode, replay_from_run_id=replay_from_run_id, reproducibility_grade=reproducibility_grade)
     worker_id = leader_worker_id or mint_worker_id(run.run_id)
     coordination = self._coordination_repo
@@ -17552,7 +17552,7 @@ _COORDINATION_FINALIZATION_DEPENDENCIES = {
         "canonical_json": "elspeth.core.canonical.canonical_json",
         "stable_hash": "elspeth.core.canonical.stable_hash",
         "now": "elspeth.core.landscape._helpers.now",
-        "_frozen_runtime_val_manifest_json": "elspeth.core.landscape.run_lifecycle_repository._frozen_runtime_val_manifest_json",
+        "cached_frozen_runtime_val_manifest_json": "elspeth.contracts.runtime_val_manifest.cached_frozen_runtime_val_manifest_json",
         "SQLAlchemyError": "sqlalchemy.exc.SQLAlchemyError",
         "ReproducibilityGrade": "elspeth.contracts.ReproducibilityGrade",
         "WebPluginPolicyEvidence": "elspeth.contracts.plugin_policy_audit.WebPluginPolicyEvidence",

@@ -506,10 +506,117 @@ def test_directional_guard_does_not_skip_a_malformed_advertised_union_branch() -
 
 def test_registered_schema_lookup_rejects_missing_internal_definition_name(monkeypatch: pytest.MonkeyPatch) -> None:
     module = _schema_contract_module()
+    # The augmented schema is built once per process; drop any build an
+    # earlier test left so this call reaches the registry lookup.
+    module._canonical_set_pipeline_schema_text.cache_clear()
     monkeypatch.setattr(module, "get_tool_definitions", lambda: ({},))
 
     with pytest.raises(KeyError, match="name"):
         module.canonical_set_pipeline_schema()
+    # A failed build is not cached: the next call rebuilds and re-raises.
+    with pytest.raises(KeyError, match="name"):
+        module.canonical_set_pipeline_schema()
+
+
+@pytest.fixture
+def fresh_canonical_schema_cache() -> Any:
+    module = _schema_contract_module()
+    module.canonical_set_pipeline_validator.cache_clear()
+    module._canonical_set_pipeline_schema_text.cache_clear()
+    yield module
+    module.canonical_set_pipeline_validator.cache_clear()
+    module._canonical_set_pipeline_schema_text.cache_clear()
+
+
+def _uncached_canonical_set_pipeline_schema(module: Any) -> dict[str, Any]:
+    """The pre-cache per-call construction, reproduced as the identity oracle."""
+    augmented = deepcopy(_registered_set_pipeline_schema())
+    module._disclose_runtime_naming_constraints(augmented)
+    module.assert_set_pipeline_schema_compatible(advertised_schema=augmented)
+    return augmented
+
+
+def test_canonical_schema_is_built_and_verified_once_per_process(
+    fresh_canonical_schema_cache: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = fresh_canonical_schema_cache
+    disclosures: list[object] = []
+    verifications: list[object] = []
+    real_disclose = module._disclose_runtime_naming_constraints
+    real_verify = module.assert_set_pipeline_schema_compatible
+
+    def counting_disclose(schema: Any) -> None:
+        disclosures.append(schema)
+        real_disclose(schema)
+
+    def counting_verify(**kwargs: Any) -> None:
+        verifications.append(kwargs)
+        real_verify(**kwargs)
+
+    monkeypatch.setattr(module, "_disclose_runtime_naming_constraints", counting_disclose)
+    monkeypatch.setattr(module, "assert_set_pipeline_schema_compatible", counting_verify)
+    schemas = [module.canonical_set_pipeline_schema() for _ in range(5)]
+    module.canonical_set_pipeline_validator()
+    module.canonical_set_pipeline_validator()
+
+    assert len(disclosures) == 1
+    assert len(verifications) == 1
+    assert all(schema == schemas[0] for schema in schemas)
+
+
+def test_cached_canonical_schema_is_byte_identical_to_the_uncached_build(fresh_canonical_schema_cache: Any) -> None:
+    import json
+
+    from elspeth.contracts.hashing import canonical_json
+
+    module = fresh_canonical_schema_cache
+    uncached = _uncached_canonical_set_pipeline_schema(module)
+    for _ in range(2):
+        cached = module.canonical_set_pipeline_schema()
+        assert cached == uncached
+        # Key order is part of what the provider is shown, so compare the
+        # order-preserving encoding as well as the canonical one.
+        assert json.dumps(cached) == json.dumps(uncached)
+        assert canonical_json(cached) == canonical_json(uncached)
+
+
+def test_canonical_schema_copies_are_independent(fresh_canonical_schema_cache: Any) -> None:
+    module = fresh_canonical_schema_cache
+    first = module.canonical_set_pipeline_schema()
+    second = module.canonical_set_pipeline_schema()
+    assert first is not second
+    assert first["properties"]["nodes"]["items"] is not second["properties"]["nodes"]["items"]
+
+    first["required"].append("attacker_added")
+    first["properties"]["nodes"]["items"]["properties"]["id"]["pattern"] = ".*"
+    first["properties"].clear()
+
+    third = module.canonical_set_pipeline_schema()
+    assert third == second
+    assert "attacker_added" not in third["required"]
+    assert third["properties"]["nodes"]["items"]["properties"]["id"]["pattern"] == r"^[a-zA-Z][a-zA-Z0-9_-]*$"
+
+
+def test_cached_validator_matches_a_freshly_compiled_validator(fresh_canonical_schema_cache: Any) -> None:
+    module = fresh_canonical_schema_cache
+    validator = module.canonical_set_pipeline_validator()
+    assert module.canonical_set_pipeline_validator() is validator
+    # Mutating a handed-out schema copy cannot reach the validator's own copy.
+    module.canonical_set_pipeline_schema()["properties"].clear()
+    malformed: dict[str, Any] = {
+        "source": {"plugin": "csv", "on_success": "fork", "options": {}},
+        "nodes": [{"id": "9bad", "node_type": "transform", "plugin": "passthrough", "input": "fork"}],
+        "edges": [],
+        "outputs": [],
+    }
+    fresh = Draft202012Validator(_uncached_canonical_set_pipeline_schema(module))
+
+    def projected(errors: Any) -> list[tuple[tuple[Any, ...], tuple[Any, ...], str]]:
+        return sorted((tuple(e.absolute_path), tuple(e.absolute_schema_path), str(e.validator)) for e in errors)
+
+    cached_errors = projected(validator.iter_errors(malformed))
+    assert cached_errors
+    assert cached_errors == projected(fresh.iter_errors(malformed))
 
 
 @pytest.mark.parametrize(

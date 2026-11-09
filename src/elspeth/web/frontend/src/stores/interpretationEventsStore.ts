@@ -104,8 +104,15 @@ interface InterpretationEventsState {
   refreshRequestBySession: Record<string, symbol>;
   /** Every terminal choice suppresses cards, including uncounted retirements. */
   terminalIdsBySession: Record<string, ReadonlySet<string>>;
-  /** Outstanding writes belong to this store lifetime, never a later login. */
-  mutationRequests: ReadonlySet<symbol>;
+  /**
+   * Outstanding writes belong to this store lifetime, never a later login.
+   * Keyed request → session id so a Run control can tell whether a resolve /
+   * opt-out POST for ITS session is still in flight: the server holds that
+   * session's COMPOSE fence until the POST returns, and a refreshAll serviced
+   * in the post-commit window can drop the card from `pendingBySession`
+   * before then (#352). See `interpretationMutationInFlight`.
+   */
+  mutationRequests: ReadonlyMap<symbol, string>;
   // ── Primary projections ──────────────────────────────────────────────────
   pendingBySession: Record<string, Record<string, InterpretationEvent>>;
   resolvedCountBySession: Record<string, ResolvedCounts>;
@@ -259,6 +266,41 @@ function incrementResolvedCount(
   return { ...prev, [sessionId]: next };
 }
 
+function withMutationRequest(
+  requests: ReadonlyMap<symbol, string>,
+  request: symbol,
+  sessionId: string,
+): ReadonlyMap<symbol, string> {
+  const next = new Map(requests);
+  next.set(request, sessionId);
+  return next;
+}
+
+function withoutMutationRequest(
+  requests: ReadonlyMap<symbol, string>,
+  request: symbol,
+): ReadonlyMap<symbol, string> {
+  const next = new Map(requests);
+  next.delete(request);
+  return next;
+}
+
+/**
+ * True while a resolve or opt-out POST for `sessionId` is outstanding. Both
+ * hold the session's COMPOSE fence server-side until they return, so a Run
+ * dispatched meanwhile is refused with 409 "Session operation is already
+ * active" (#352). Read through a selector so callers re-render on change.
+ */
+export function interpretationMutationInFlight(
+  state: Pick<InterpretationEventsState, "mutationRequests">,
+  sessionId: string,
+): boolean {
+  for (const owner of state.mutationRequests.values()) {
+    if (owner === sessionId) return true;
+  }
+  return false;
+}
+
 // ── Store ────────────────────────────────────────────────────────────────────
 
 export const useInterpretationEventsStore = create<InterpretationEventsState>(
@@ -269,7 +311,7 @@ export const useInterpretationEventsStore = create<InterpretationEventsState>(
     optedOutBySession: {},
     refreshRequestBySession: {},
     terminalIdsBySession: {},
-    mutationRequests: new Set(),
+    mutationRequests: new Map(),
 
     async refreshPending(sessionId: string) {
       const request = Symbol();
@@ -422,16 +464,14 @@ export const useInterpretationEventsStore = create<InterpretationEventsState>(
       // changing the event projections (atomicity invariant).
       const request = Symbol();
       set((state) => ({
-        mutationRequests: new Set([...state.mutationRequests, request]),
+        mutationRequests: withMutationRequest(state.mutationRequests, request, sessionId),
       }));
       let response;
       try {
         response = await api.resolveInterpretation(sessionId, eventId, body);
       } catch (error) {
         set((state) => ({
-          mutationRequests: new Set(
-            [...state.mutationRequests].filter((id) => id !== request),
-          ),
+          mutationRequests: withoutMutationRequest(state.mutationRequests, request),
         }));
         throw error;
       }
@@ -472,9 +512,7 @@ export const useInterpretationEventsStore = create<InterpretationEventsState>(
           : [...priorResolved, resolvedEvent];
 
         return {
-          mutationRequests: new Set(
-            [...state.mutationRequests].filter((id) => id !== request),
-          ),
+          mutationRequests: withoutMutationRequest(state.mutationRequests, request),
           terminalIdsBySession: {
             ...state.terminalIdsBySession,
             [sessionId]: new Set([
@@ -506,15 +544,13 @@ export const useInterpretationEventsStore = create<InterpretationEventsState>(
       // Register request custody; API errors leave event projections untouched.
       const request = Symbol();
       set((state) => ({
-        mutationRequests: new Set([...state.mutationRequests, request]),
+        mutationRequests: withMutationRequest(state.mutationRequests, request, sessionId),
       }));
       try {
         await api.optOutOfInterpretations(sessionId);
       } catch (error) {
         set((state) => ({
-          mutationRequests: new Set(
-            [...state.mutationRequests].filter((id) => id !== request),
-          ),
+          mutationRequests: withoutMutationRequest(state.mutationRequests, request),
         }));
         throw error;
       }
@@ -522,9 +558,7 @@ export const useInterpretationEventsStore = create<InterpretationEventsState>(
       set((state) => {
         if (!state.mutationRequests.has(request)) return state;
         return {
-          mutationRequests: new Set(
-            [...state.mutationRequests].filter((id) => id !== request),
-          ),
+          mutationRequests: withoutMutationRequest(state.mutationRequests, request),
           optedOutBySession: { ...state.optedOutBySession, [sessionId]: true },
           // Clear pending events for the session — the UX is "interpretations
           // silenced from now on". The backend may still hold pending rows

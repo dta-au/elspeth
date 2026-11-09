@@ -3446,42 +3446,83 @@ def _reconcile_source_options(
     return options
 
 
+def _identical_json_value(left: Any, right: Any) -> bool:
+    """Exact equality of two thawed JSON values: same types, key order and float bits.
+
+    Plain ``==`` is too loose to decide "nothing changed": ``1 == True``,
+    ``1 == 1.0`` and ``0.0 == -0.0`` all hold, and dict equality ignores key
+    order, yet each of those differences survives into persisted bytes.
+    """
+    if type(left) is not type(right):
+        return False
+    if type(left) is dict:
+        return list(left) == list(right) and all(_identical_json_value(left[key], right[key]) for key in left)
+    if type(left) is list:
+        return len(left) == len(right) and all(_identical_json_value(a, b) for a, b in zip(left, right, strict=True))
+    if type(left) is float:
+        return bool(left.hex() == right.hex())
+    return bool(left == right)
+
+
+def _kept_unless_reconciled_differently[SpecT: (NodeSpec, SourceSpec)](spec: SpecT, reconciled: Mapping[str, Any]) -> SpecT:
+    """Return ``spec`` itself when reconciliation reproduced its options exactly.
+
+    The reconcilers start from ``dict(spec.options)``, so every key they did not
+    rewrite still holds the original object and is settled by identity; only
+    the few rewritten keys (review rows, rendered prompt, approval hash,
+    authoring metadata) are thawed and compared. That is far cheaper than the
+    ``replace`` it avoids, which re-validates and re-freezes every option.
+    Otherwise the result is ``replace(spec, options=reconciled)``, as before.
+    """
+    original = spec.options
+    if list(original) == list(reconciled) and all(
+        reconciled[key] is original[key] or _identical_json_value(deep_thaw(reconciled[key]), deep_thaw(original[key])) for key in original
+    ):
+        return spec
+    return replace(spec, options=reconciled)
+
+
 def reconcile_authoritative_reviews(
     previous: CompositionState,
     proposed: CompositionState,
 ) -> CompositionState:
-    """Rehydrate only coherent, still-applicable server-owned review evidence."""
+    """Rehydrate only coherent, still-applicable server-owned review evidence.
+
+    Every source and node is reconciled (and so validated) exactly as before.
+    A component whose reconciled options reproduce its own options exactly is
+    kept as the same object, and when every component is kept the result is
+    ``proposed`` itself, so instance identity — and the content-hash memo on
+    it — survives a no-op reconciliation.
+    """
     previous_sources = previous.sources
-    reconciled_sources = {
-        source_name: replace(
+    reconciled_sources: dict[str, SourceSpec] = {}
+    for source_name, source in proposed.sources.items():
+        source_options = _reconcile_source_options(
+            previous_sources[source_name] if source_name in previous_sources else None,
             source,
-            options=_reconcile_source_options(
-                previous_sources[source_name] if source_name in previous_sources else None,
-                source,
-                component_id=source_component_id(source_name),
-            ),
+            component_id=source_component_id(source_name),
         )
-        for source_name, source in proposed.sources.items()
-    }
+        reconciled_sources[source_name] = _kept_unless_reconciled_differently(source, source_options)
     previous_nodes = {node.id: node for node in previous.nodes}
     proposed_graph = _output_stream_graph(proposed.nodes)
-    reconciled_nodes = tuple(
-        replace(
+    reconciled_nodes: list[NodeSpec] = []
+    for node in proposed.nodes:
+        node_options = _reconcile_node_options(
+            previous_nodes[node.id] if node.id in previous_nodes else None,
             node,
-            options=_reconcile_node_options(
-                previous_nodes[node.id] if node.id in previous_nodes else None,
-                node,
-                previous_nodes=previous.nodes,
-                proposed_nodes=proposed.nodes,
-                proposed_graph=proposed_graph,
-            ),
+            previous_nodes=previous.nodes,
+            proposed_nodes=proposed.nodes,
+            proposed_graph=proposed_graph,
         )
-        for node in proposed.nodes
-    )
+        reconciled_nodes.append(_kept_unless_reconciled_differently(node, node_options))
+    if all(reconciled_sources[name] is source for name, source in proposed.sources.items()) and all(
+        reconciled is node for reconciled, node in zip(reconciled_nodes, proposed.nodes, strict=True)
+    ):
+        return proposed
     return replace(
         proposed,
         sources=reconciled_sources,
-        nodes=reconciled_nodes,
+        nodes=tuple(reconciled_nodes),
     )
 
 

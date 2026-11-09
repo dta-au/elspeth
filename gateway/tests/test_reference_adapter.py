@@ -28,6 +28,7 @@ def test_descriptor_identity_and_all_capabilities():
             Capability.JSON_SCHEMA,
             Capability.SEED,
             Capability.USAGE,
+            Capability.REASONING,
         }
     )
 
@@ -576,3 +577,21 @@ def test_classify_error_no_body():
     classification = adapter.classify_error(UpstreamFailure(status=500, body=None))
     assert classification.code == "upstream_response_invalid"
     assert classification.retryable is False
+
+
+@pytest.mark.parametrize("effort", ["low", "medium", "high"])
+def test_build_invoke_forwards_reasoning_effort_as_generation_deliberation(effort):
+    adapter = ReferenceV1InvokeAdapter()
+    request = CanonicalRequest(
+        model_target={"target": "backend-a"},
+        model_alias="gpt-4o",
+        messages=(CanonicalMessage(role="user", content="hi"),),
+        temperature=None,
+        seed=None,
+        max_tokens=None,
+        reasoning_effort=effort,
+    )
+
+    plan = adapter.build_invoke(request)
+
+    assert plan.body["generation"] == {"target": "backend-a", "deliberation": effort}

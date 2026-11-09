@@ -1049,18 +1049,19 @@ against 192s). The operator decision is recorded on `elspeth-930a163c85`.
 Treat the pin as evidence, not as a default worth tidying: every green
 acceptance result on this module was obtained at `medium`, so changing it
 re-opens the measurement rather than merely adjusting a knob. The legal values
-are `none`, `low`, `medium`, and `high`; `none` sends no hint at all and is the
-opt-out for non-reasoning deployments.
+are `low`, `medium`, and `high`. Composer and advisor must be reasoning models:
+there is no unhinted opt-out, and `none` is refused at settings load.
 
 **This measurement is specific to this module, and does not generalise to the
 other deployment surfaces.** It was taken on Bedrock Anthropic Sonnet 4.6 —
 `variables.tf` constrains `composer_model` to a `bedrock/` provider ID, so that
 is the only model class this module can run. The hint is also applied per
 provider prefix rather than uniformly: `composer/reasoning.py` sends Bedrock and
-Anthropic models a LiteLLM `reasoning_effort`, sends some other prefixes a
-different form again, and deliberately sends **nothing** for bare or
-`openai/`-prefixed aliases such as the `gpt-5.5` default. Read that module for
-the branch table before assuming this knob does anything on a given model.
+Anthropic models, and bare or `openai/`-prefixed aliases such as the `gpt-5.5`
+default, a LiteLLM `reasoning_effort`, and sends some other prefixes a
+different form again. Every composer-plane call carries a hint; a model,
+provider or gateway that cannot honour it refuses the call rather than running
+it unhinted. Read that module for the branch table.
 
 <!-- "some other prefixes" is deliberately generic, not vague: this package is
 Bedrock-only, and test_bedrock_composer_uses_the_task_role_without_static_credentials
@@ -1068,12 +1069,9 @@ asserts it contains no reference to certain other providers anywhere — includi
 in this README, which that test reads. Naming them here fails that gate. -->
 
 The `deploy/compose` and `deploy/linux-systemd` bundles set no `composer_model`,
-so they boot on that `gpt-5.5` default, where the knob is inert — pinning it
-there would document a control their shipped configuration never applies. That
-is a property of the default model, not of those bundles: selecting a model
-whose prefix *does* carry the hint makes the knob live again, at the code
-default `high` and on a much shorter wall clock (85s), with no measurements on
-that provider at any effort. Measure before pinning it there. The related
+so they boot on that `gpt-5.5` default, where the knob is live at the code
+defaults (`high` candidate) on a much shorter wall clock (85s), with no
+measurements on that provider at any effort. Measure before pinning it there. The related
 wall-clock-versus-turn-budget question on those surfaces is tracked on
 `elspeth-f159d2394b`.
 

@@ -13,8 +13,8 @@ import {
   UnavailableComponentRow,
   unavailablePluginDisplayName,
 } from "@/components/catalog/UnavailableComponentRow";
-import { useExecutionStore } from "@/stores/executionStore";
 import { captureSessionPublicationGuard, useSessionStore } from "@/stores/sessionStore";
+import { requestValidateAfterImport } from "@/stores/subscriptions";
 import type { BlobMetadata } from "@/types/api";
 import type { ApiError, PluginPolicyFinding } from "@/types/index";
 import { hasCompositionContent } from "@/utils/compositionState";
@@ -957,12 +957,20 @@ export function ImportYamlModal({ onClose }: ImportYamlModalProps): JSX.Element 
       // any session-context change. There is no dedicated "refresh current
       // session" action to call instead; growing one was out of this
       // change's ownership (sessionStore.ts).
-      void selectSession(activeSessionId);
-      // Re-run validation explicitly so the rail's existing validation
-      // banner actually reflects the imported state -- selectSession clears
-      // validationResult (R4-H3) and nothing else repopulates it on a plain
-      // refetch.
-      void useExecutionStore.getState().validate(activeSessionId);
+      //
+      // Validation goes through the auto-validation queue, never a direct
+      // executionStore.validate(): selectSession clears validationResult
+      // (R4-H3), and publishing the imported head usually makes the
+      // auto-validate subscriber POST /validate for it already — a direct
+      // call beside it was a second, duplicate POST. Once the head is
+      // published, requestValidateAfterImport covers the case the subscriber
+      // skips (imported content equal to the previous head, verdict carried
+      // forward) with a forced queue entry, so the banner always reflects
+      // the post-import server verdict.
+      const importedSessionId = activeSessionId;
+      void selectSession(importedSessionId).then(() => {
+        requestValidateAfterImport(importedSessionId);
+      });
     } catch (err) {
       if (!isCurrent()) return;
       setError(describeImportError(err as ApiError));

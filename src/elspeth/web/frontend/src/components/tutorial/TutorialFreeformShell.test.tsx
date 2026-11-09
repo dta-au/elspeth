@@ -146,6 +146,27 @@ describe("TutorialFreeformShell", () => {
     expect(api.getTutorialReadiness).not.toHaveBeenCalled();
   });
 
+  it("does not advance while a review resolve is still in flight after its card left the pending map (#352)", async () => {
+    useSessionStore.setState({
+      activeSessionId: "session-1",
+      compositionStateLoaded: true,
+      compositionState: { id: "state-1" } as CompositionState,
+      messages: [userMessage],
+    });
+    // The resolve POST is outstanding (it holds the session's COMPOSE fence)
+    // while a post-commit refreshAll has already emptied the pending map.
+    useInterpretationEventsStore.setState({
+      pendingBySession: { "session-1": {} },
+      mutationRequests: new Map([[Symbol("resolve"), "session-1"]]),
+    });
+    render(<TutorialFreeformShell sessionId="session-1" onCompleted={vi.fn()} />);
+
+    const continueButton = await screen.findByRole("button", { name: "Continue to Run" });
+    expect(continueButton).toBeDisabled();
+    expect(continueButton).toHaveAccessibleDescription("Applying your decision…");
+    expect(api.getTutorialReadiness).not.toHaveBeenCalled();
+  });
+
   it.each([
     {
       blocker: "the Composer is still working",

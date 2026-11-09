@@ -784,7 +784,28 @@ def test_compute_snapshot_validates_already_read_state():
         session_id=UUID("11111111-1111-1111-1111-111111111111"),
         session_operation_context=_blob_read_context(),
         completion_gates=None,
+        fresh=False,
     )
+
+
+@pytest.mark.parametrize(("requested", "forwarded"), [({"fresh": True}, True), ({}, False)])
+def test_compute_snapshot_forwards_fresh_to_validate_state(requested, forwarded):
+    """The shareable-review mark asks for a fresh snapshot; the route's default stays on the memo."""
+    state = _state(transforms=(("t", "passthrough"),))
+    exec_svc = _ExecutionServiceDouble(_OK)
+    svc = _make_service_with_execution_service(state, exec_svc)
+
+    asyncio.run(
+        svc.compute_snapshot(
+            session_id=UUID("11111111-1111-1111-1111-111111111111"),
+            user_id="alice",
+            session_operation_context=_blob_read_context(),
+            **requested,
+        )
+    )
+
+    ((_args, kwargs),) = exec_svc.validate_state.calls
+    assert kwargs["fresh"] is forwarded
 
 
 def test_compute_snapshot_passes_persisted_completion_gates():

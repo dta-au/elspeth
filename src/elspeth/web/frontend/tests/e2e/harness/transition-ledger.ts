@@ -129,6 +129,12 @@ export function summarizeLlmAuditRows(messages: unknown): LlmAuditRow[] {
           latency_ms: null,
           phase: typeof attempt.phase === "string" ? attempt.phase : null,
         });
+      } else if (kind === "composer_visible_tool_event" || kind === "composer_visible_response_gap") {
+        // Server-emitted companions to the audit evidence (visible_tool_event.py):
+        // UI-facing tool-event and response-gap markers, not provider-call
+        // evidence. They carry no planner ordinal, so they contribute no row.
+        // Any other kind still fails closed below.
+        continue;
       } else {
         throw new Error(`${label}._kind has unknown value ${String(kind)}`);
       }

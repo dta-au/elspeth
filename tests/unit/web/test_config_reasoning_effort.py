@@ -32,9 +32,20 @@ def test_reasoning_effort_rejects_unknown_values() -> None:
         _settings(composer_discovery_reasoning_effort="extreme")
 
 
-def test_none_is_a_valid_opt_out() -> None:
-    settings = _settings(composer_candidate_reasoning_effort="none")
-    assert settings.composer_candidate_reasoning_effort == "none"
+@pytest.mark.parametrize(
+    "field",
+    [
+        "composer_discovery_reasoning_effort",
+        "composer_candidate_reasoning_effort",
+        "composer_advisor_reasoning_effort",
+    ],
+)
+def test_none_is_refused_because_composer_and_advisor_must_be_reasoning_models(field: str) -> None:
+    """There is no unhinted opt-out: a deployment whose composer or advisor
+    model cannot take a reasoning hint is misconfigured and must fail at
+    settings load, not run silently unhinted."""
+    with pytest.raises(ValidationError, match=field):
+        _settings(**{field: "none"})
 
 
 def test_advisor_completion_budget_default_fits_thinking() -> None:

@@ -106,7 +106,9 @@ class _ReadinessServiceFake:
         session_id: UUID,
         user_id: str,
         session_operation_context: SessionOperationContext,
+        fresh: bool = False,
     ) -> AuditReadinessSnapshot:
+        assert fresh is True
         assert str(session_id) == self.readiness.session_id
         assert user_id
         assert session_operation_context.fence.session_id == str(session_id)

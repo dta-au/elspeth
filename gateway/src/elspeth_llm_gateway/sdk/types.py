@@ -24,6 +24,7 @@ class Capability(StrEnum):
     JSON_SCHEMA = "json_schema"
     SEED = "seed"
     USAGE = "usage"
+    REASONING = "reasoning"
 
 
 class FinishReason(StrEnum):
@@ -100,6 +101,7 @@ class CanonicalRequest(BaseModel):
     tool_choice: str | None = None
     tool_choice_function: str | None = None
     response_format: ResponseFormatSpec | None = None
+    reasoning_effort: Literal["low", "medium", "high"] | None = None
 
 
 class CanonicalUsage(BaseModel):

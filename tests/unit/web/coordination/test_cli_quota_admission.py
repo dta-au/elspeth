@@ -20,6 +20,11 @@ from elspeth.web.secrets.wiring_policy import EMPTY_SECRET_WIRING_POLICY
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import identities_table, quota_policies_table
 
+# ``--no-dotenv`` below must not inherit the checkout's ``.env`` through
+# pytest-dotenv, or the CLI reaches whatever sessions store that file names
+# (GitHub issue #353).
+pytestmark = pytest.mark.usefixtures("dotenv_free_environment")
+
 
 @pytest.mark.parametrize("explicit_quota", [False, True])
 def test_cli_quota_policy_is_not_disabled_by_absent_issuance_defaults(tmp_path, explicit_quota):

@@ -181,6 +181,7 @@ class _FakeExecutionService:
     validate_state_session_ids: list[UUID | None] = field(default_factory=list)
     validate_state_operation_contexts: list[SessionOperationContext] = field(default_factory=list)
     validate_state_completion_gates: list[Any] = field(default_factory=list)
+    validate_state_fresh: list[bool] = field(default_factory=list)
 
     async def validate(self, session_id: UUID, *, user_id: str | None = None) -> ValidationResult:
         self.validate_await_count += 1
@@ -194,11 +195,13 @@ class _FakeExecutionService:
         session_id: UUID | None = None,
         session_operation_context: SessionOperationContext,
         completion_gates: Any = None,
+        fresh: bool = False,
     ) -> ValidationResult:
         self.validate_state_await_count += 1
         self.validate_state_session_ids.append(session_id)
         self.validate_state_operation_contexts.append(session_operation_context)
         self.validate_state_completion_gates.append(completion_gates)
+        self.validate_state_fresh.append(fresh)
         return self.validation
 
 
@@ -207,6 +210,7 @@ class _FakeReadinessService:
     snapshot: AuditReadinessSnapshot
     compute_snapshot_await_count: int = 0
     session_operation_contexts: list[SessionOperationContext] = field(default_factory=list)
+    fresh: list[bool] = field(default_factory=list)
 
     async def compute_snapshot(
         self,
@@ -214,9 +218,11 @@ class _FakeReadinessService:
         session_id: UUID,
         user_id: str,
         session_operation_context: SessionOperationContext,
+        fresh: bool = False,
     ) -> AuditReadinessSnapshot:
         self.compute_snapshot_await_count += 1
         self.session_operation_contexts.append(session_operation_context)
+        self.fresh.append(fresh)
         return self.snapshot
 
     def reset_counts(self) -> None:
@@ -676,6 +682,8 @@ async def test_mark_ready_for_review_passes_validation_authority_and_completion_
     )
     assert execution_service.validate_state_session_ids == [session_record.id]
     assert execution_service.validate_state_operation_contexts == [session_operation_context]
+    # The mark's verdict lands in a durable review record: never from the memo.
+    assert execution_service.validate_state_fresh == [True]
     assert execution_service.validate_state_completion_gates == [
         CompletionGateFacts(
             advisor_signoff=AdvisorSignoffGateFact(
@@ -688,6 +696,8 @@ async def test_mark_ready_for_review_passes_validation_authority_and_completion_
         )
     ]
     assert readiness_service.session_operation_contexts == [session_operation_context]
+    # The readiness snapshot is also written into the review blob: fresh too.
+    assert readiness_service.fresh == [True]
 
 
 @pytest.mark.asyncio

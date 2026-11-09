@@ -21,6 +21,10 @@ import { OPEN_IMPORT_YAML_MODAL_EVENT } from "@/lib/composer-events";
 import { expectNoIdentifiersInDefaultDom } from "@/test/defaultDomPins";
 import { useSessionStore } from "@/stores/sessionStore";
 import { useExecutionStore } from "@/stores/executionStore";
+import {
+  _resetSubscriptionsForTesting,
+  initStoreSubscriptions,
+} from "@/stores/subscriptions";
 import * as api from "@/api/client";
 import type { BlobMetadata } from "@/types/api";
 import type { CompositionState } from "@/types/index";
@@ -224,6 +228,10 @@ describe("ImportYamlModal", () => {
   const onClose = vi.fn();
 
   beforeEach(() => {
+    // The post-import validation runs through the real auto-validation
+    // queue; reset its module-level bookkeeping so no test inherits another's
+    // in-flight or landed version.
+    _resetSubscriptionsForTesting();
     onClose.mockReset();
     vi.mocked(api.importCompositionYaml).mockReset();
     vi.mocked(api.listBlobs).mockReset();
@@ -975,9 +983,162 @@ describe("ImportYamlModal", () => {
     expect(useSessionStore.getState().selectSession).toHaveBeenCalledWith(
       "sess-1",
     );
-    expect(useExecutionStore.getState().validate).toHaveBeenCalledWith(
-      "sess-1",
-    );
+    // The stubbed selectSession publishes nothing, so the empty head stays
+    // and the queue's empty-composition guard holds: no direct validate()
+    // beside the refetch any more (Fix 2B). The queue path itself is pinned
+    // in the "post-import validation" describe below.
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(useExecutionStore.getState().validate).not.toHaveBeenCalled();
+  });
+
+  // ── Post-import validation runs through the queue (Fix 2B) ───────────────
+
+  describe("post-import validation", () => {
+    /** The head the import mints: same session, version 2. `sameContent`
+     *  keeps the authored content of nonEmptyState() (a content-equal
+     *  import); otherwise the source changes, as an ordinary import does. */
+    function importedHead(sameContent: boolean): CompositionState {
+      const base = nonEmptyState();
+      return {
+        ...base,
+        id: "state-2",
+        version: 2,
+        sources: sameContent
+          ? base.sources
+          : { source: { plugin: "csv", options: { path: "imported.csv" } } },
+      };
+    }
+
+    /** selectSession as the real one publishes: null head, then the
+     *  refetched (imported) head. */
+    function selectSessionPublishing(head: CompositionState) {
+      return vi.fn(async () => {
+        useSessionStore.setState({ compositionState: null } as never);
+        await Promise.resolve();
+        useSessionStore.setState({ compositionState: head } as never);
+      });
+    }
+
+    async function importReplacingCurrent(): Promise<void> {
+      render(<ImportYamlModal onClose={onClose} />);
+      typeYaml();
+      await clickImport();
+      await clickConfirmReplace();
+      await waitFor(() =>
+        expect(
+          screen.getByText(buildImportSuccessMessage(2)),
+        ).toBeInTheDocument(),
+      );
+      await act(async () => {
+        for (let i = 0; i < 6; i += 1) await Promise.resolve();
+      });
+    }
+
+    beforeEach(() => {
+      vi.mocked(api.importCompositionYaml).mockResolvedValue({
+        id: "state-2",
+        version: 2,
+        is_valid: true,
+        validation_errors: null,
+      });
+      useExecutionStore.setState({
+        rehydrateActiveRun: vi.fn().mockResolvedValue(undefined),
+        isExecuting: false,
+        progress: null,
+      } as never);
+    });
+
+    /** Seed: version 1 published and its verdict landed through the queue. */
+    async function seedValidatedHead(): Promise<void> {
+      initStoreSubscriptions();
+      useSessionStore.setState({ compositionState: nonEmptyState() } as never);
+      await act(async () => {
+        await Promise.resolve();
+      });
+      expect(useExecutionStore.getState().validate).toHaveBeenCalledTimes(1);
+      vi.mocked(useExecutionStore.getState().validate).mockClear();
+    }
+
+    it("an ordinary import issues exactly ONE validate, for the imported version", async () => {
+      await seedValidatedHead();
+      useSessionStore.setState({
+        selectSession: selectSessionPublishing(importedHead(false)),
+      } as never);
+
+      await importReplacingCurrent();
+
+      const validate = vi.mocked(useExecutionStore.getState().validate);
+      expect(validate).toHaveBeenCalledTimes(1);
+      expect(validate).toHaveBeenCalledWith("sess-1", { expectedVersion: 2 });
+    });
+
+    it("covers an import whose validate is still in flight when the refetch settles", async () => {
+      await seedValidatedHead();
+      let release!: (value: boolean) => void;
+      vi.mocked(useExecutionStore.getState().validate).mockReturnValueOnce(
+        new Promise<boolean>((resolve) => {
+          release = resolve;
+        }),
+      );
+      useSessionStore.setState({
+        selectSession: selectSessionPublishing(importedHead(false)),
+      } as never);
+
+      await importReplacingCurrent();
+      await act(async () => {
+        release(true);
+        for (let i = 0; i < 6; i += 1) await Promise.resolve();
+      });
+
+      expect(useExecutionStore.getState().validate).toHaveBeenCalledTimes(1);
+    });
+
+    it("a content-equal import (verdict carried, no auto POST) still validates exactly ONCE", async () => {
+      await seedValidatedHead();
+      useSessionStore.setState({
+        selectSession: selectSessionPublishing(importedHead(true)),
+      } as never);
+
+      await importReplacingCurrent();
+
+      const validate = vi.mocked(useExecutionStore.getState().validate);
+      expect(validate).toHaveBeenCalledTimes(1);
+      expect(validate).toHaveBeenCalledWith("sess-1", { expectedVersion: 2 });
+    });
+
+    it("negative control: the pre-fix direct validate() beside the refetch costs TWO", async () => {
+      // Replays the old doImport tail by hand against the same queue, so the
+      // ONE-validate assertions above cannot pass vacuously.
+      await seedValidatedHead();
+      const selectSession = selectSessionPublishing(importedHead(false));
+      void selectSession();
+      void useExecutionStore.getState().validate("sess-1");
+      await act(async () => {
+        for (let i = 0; i < 6; i += 1) await Promise.resolve();
+      });
+
+      expect(useExecutionStore.getState().validate).toHaveBeenCalledTimes(2);
+    });
+
+    it("does not validate for a session the user left before the refetch settled", async () => {
+      await seedValidatedHead();
+      useSessionStore.setState({
+        selectSession: vi.fn(async () => {
+          useSessionStore.setState({
+            activeSessionId: "sess-2",
+            compositionState: { ...importedHead(false), id: "state-other" },
+          } as never);
+        }),
+      } as never);
+
+      await importReplacingCurrent();
+
+      const validate = vi.mocked(useExecutionStore.getState().validate);
+      expect(validate).not.toHaveBeenCalledWith("sess-1", expect.anything());
+      expect(validate).not.toHaveBeenCalledWith("sess-1");
+    });
   });
 
   it("confirms before importing when composition state is not yet loaded (unknown != empty)", () => {

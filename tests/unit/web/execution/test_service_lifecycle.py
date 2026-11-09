@@ -44,6 +44,7 @@ from elspeth.web.execution.protocol import FrozenRunSettings
 from elspeth.web.execution.schemas import ValidationError, ValidationReadiness, ValidationReadinessBlocker, ValidationResult
 from elspeth.web.execution.service import _LOSS_WATCHER_ESCALATE_AFTER_FAILURES, ExecutionServiceImpl, close_execute_lease_before_transfer
 from elspeth.web.execution.validation import validate_pipeline as _real_validate_pipeline
+from elspeth.web.execution.validation_memo import BlobReadLog
 from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY, prompt_review_anchor_hash_from_options
 from elspeth.web.plugin_policy.models import PluginAvailability, PluginAvailabilitySnapshot, PluginId, PluginUnavailableReason
 from elspeth.web.sessions.converters import state_from_record
@@ -861,11 +862,14 @@ class TestExecutionFlow:
         preflight_sync.assert_called_once()
         assert preflight_sync.call_args.args == (state,)
         forwarded = preflight_sync.call_args.kwargs
-        assert set(forwarded) == {"plugin_snapshot", "user_id", "session_id", "session_operation_context"}
+        assert set(forwarded) == {"plugin_snapshot", "user_id", "session_id", "session_operation_context", "blob_reads"}
         assert forwarded["user_id"] == "alice"
         assert forwarded["session_id"] == session_id
         assert forwarded["session_operation_context"] is context
         assert forwarded["plugin_snapshot"] is not None
+        # Advisory validate_state goes through the short-lived memo, which
+        # hands the worker a log of the blob rows it consults.
+        assert type(forwarded["blob_reads"]) is BlobReadLog
 
     @pytest.mark.asyncio
     async def test_validate_state_merges_persisted_completion_gate(

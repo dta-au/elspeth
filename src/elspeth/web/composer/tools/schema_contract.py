@@ -7,9 +7,13 @@ dispatch registry's private lookup tables.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping, MutableMapping, Sequence
 from copy import deepcopy
+from functools import cache
 from typing import Any, Final, cast
+
+from jsonschema import Draft202012Validator
 
 from elspeth.web.composer.tools._dispatch import get_tool_definitions
 from elspeth.web.composer.tools._naming_disclosure import (
@@ -400,19 +404,46 @@ def _disclose_runtime_naming_constraints(schema: MutableMapping[str, Any]) -> No
     _disclose_sink_name_constraints(output_properties["on_write_failure"])
 
 
+@cache
+def _canonical_set_pipeline_schema_text() -> str:
+    """Build, verify and encode the augmented schema once per process.
+
+    Every input is static for the process: the registered declaration is
+    ``deep_thaw``ed from the deeply immutable module-level registry, the
+    naming disclosures are module constants from core/config.py, and the
+    compatibility walk compares against the owned pydantic model. A failed
+    build raises and is not cached, so the next call rebuilds and re-raises.
+    The verified schema is retained as JSON text so no caller can reach, and
+    therefore mutate, the retained value.
+    """
+    registered = _registered_tool_schema("set_pipeline")
+    augmented: dict[str, Any] = deepcopy(cast(dict[str, Any], registered))
+    _disclose_runtime_naming_constraints(augmented)
+    assert_set_pipeline_schema_compatible(advertised_schema=augmented)
+    return json.dumps(augmented, ensure_ascii=False, allow_nan=False)
+
+
 def canonical_set_pipeline_schema() -> dict[str, Any]:
     """Return an isolated, runtime-compatible registered schema copy.
 
     The copy also discloses the runtime node/connection/sink naming rules
     (charset, length, reserved edge labels, sink lowercasing) that
     core/config.py enforces at settings_load — see
-    `_disclose_runtime_naming_constraints`.
+    `_disclose_runtime_naming_constraints`. The schema is built and verified
+    once per process; each call decodes a fresh, independent copy.
     """
-    registered = _registered_tool_schema("set_pipeline")
-    augmented: dict[str, Any] = deepcopy(cast(dict[str, Any], registered))
-    _disclose_runtime_naming_constraints(augmented)
-    assert_set_pipeline_schema_compatible(advertised_schema=augmented)
-    return augmented
+    return cast(dict[str, Any], json.loads(_canonical_set_pipeline_schema_text()))
+
+
+@cache
+def canonical_set_pipeline_validator() -> Draft202012Validator:
+    """Return the process-wide compiled validator for the canonical schema.
+
+    The validator owns a private copy of the schema. Its errors reference
+    that copy (``error.schema`` / ``error.validator_value``), so callers must
+    treat them as read-only.
+    """
+    return Draft202012Validator(canonical_set_pipeline_schema())
 
 
 # --------------------------------------------------------------------------- #
@@ -589,10 +620,10 @@ def assert_upsert_node_schema_compatible(*, advertised_schema: Mapping[str, Any]
     is enforced in CI, when its test module is collected.
 
     The distinction is not static-vs-runtime, it is WHO CONSTRUCTS THE VALUE
-    production hands out. `canonical_set_pipeline_schema` BUILDS a new object
-    on every call — deepcopy plus `_disclose_runtime_naming_constraints` — and
-    gives it to the planner, so the artifact does not exist until run time and
-    must verify its own construction. `upsert_node`'s advertised schema is not
+    production hands out. `canonical_set_pipeline_schema` BUILDS its schema at
+    run time — deepcopy plus `_disclose_runtime_naming_constraints`, once per
+    process — and gives copies of it to the planner, so the artifact does not
+    exist until run time and must verify its own construction. `upsert_node`'s advertised schema is not
     built per call in any meaningful sense: `get_tool_definitions` `deep_thaw`s
     every entry from a deeply immutable module-level registry, so each call
     yields a fresh mutable copy of identical content and no production path can
@@ -623,4 +654,5 @@ __all__ = [
     "assert_set_pipeline_schema_compatible",
     "assert_upsert_node_schema_compatible",
     "canonical_set_pipeline_schema",
+    "canonical_set_pipeline_validator",
 ]

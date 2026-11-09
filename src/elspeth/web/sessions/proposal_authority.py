@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import copy
 import json
 from collections.abc import Mapping, Sequence
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, TypedDict, cast
 from uuid import UUID
 
@@ -324,32 +326,97 @@ def _pipeline_rejected_payload(
     }
 
 
-def _persisted_pipeline_dispatch_content_hashes(
-    conn: Connection,
-    *,
-    session_id: str,
-    dispatch: PipelineDispatchAuditBinding,
-) -> tuple[str, ...]:
-    """Return content hashes from exact durable redacted dispatch envelopes."""
+def _load_pipeline_dispatch_envelope_groups(conn: Connection, *, session_id: str) -> Mapping[str, tuple[object, ...]]:
+    """Read the session's ``tool_calls`` once and group envelopes by invocation call id.
+
+    The grouping is an exact partition for dispatch custody, not a filter:
+    :func:`_pipeline_dispatch_recovery_from_envelope` returns ``None`` before
+    any validation for a non-dict envelope, a non-dict ``invocation``, or an
+    ``invocation.tool_call_id`` unequal to the expected (exact ``str``) call
+    id, and a JSON-decoded non-string can never equal a string. Every other
+    envelope is kept, in row and list order, duplicates included, so the
+    duplicate and mismatch verdicts are the same as a scan of every row.
+    """
     rows = conn.execute(select(chat_messages_table.c.tool_calls).where(chat_messages_table.c.session_id == session_id)).fetchall()
-    matches: list[str] = []
+    groups: dict[str, list[object]] = {}
     for row in rows:
         tool_calls = row.tool_calls
         if type(tool_calls) is not list:
             continue
         for envelope in tool_calls:
-            try:
-                recovery = _pipeline_dispatch_recovery_from_envelope(
-                    envelope,
-                    expected_tool_call_id=dispatch.tool_call_id,
-                )
-            except AuditIntegrityError as exc:
-                raise AuditIntegrityError("pipeline dispatch audit evidence is malformed") from exc
-            if recovery is None:
+            if type(envelope) is not dict:
                 continue
-            if recovery.binding != dispatch:
-                raise AuditIntegrityError("pipeline successful dispatch evidence does not match the terminal binding")
-            matches.append(recovery.executor_content_hash)
+            invocation = envelope["invocation"] if "invocation" in envelope else None
+            if type(invocation) is not dict:
+                continue
+            tool_call_id = invocation["tool_call_id"] if "tool_call_id" in invocation else None
+            if type(tool_call_id) is not str:
+                continue
+            if tool_call_id not in groups:
+                groups[tool_call_id] = []
+            groups[tool_call_id].append(envelope)
+    return MappingProxyType({tool_call_id: tuple(envelopes) for tool_call_id, envelopes in groups.items()})
+
+
+class PipelineDispatchEnvelopeIndex:
+    """One transaction's dispatch envelopes, grouped by invocation ``tool_call_id``.
+
+    Listing proposals verifies dispatch custody for every committed and
+    dispatch-bearing rejected proposal; sharing one index across that loop
+    reads the session's ``chat_messages.tool_calls`` history once instead of
+    once per proposal. The history is read lazily, on first use, so a list
+    with no dispatch-bearing proposal still reads nothing. The index is bound
+    to the connection and session it was built for and refuses any other, so
+    it cannot carry rows across a transaction. Each lookup returns fresh deep
+    copies, so a consumer sees exactly what a per-call decode gave it.
+    """
+
+    __slots__ = ("_conn", "_groups", "_session_id")
+
+    def __init__(self, conn: Connection, *, session_id: str) -> None:
+        self._conn = conn
+        self._session_id = session_id
+        self._groups: Mapping[str, tuple[object, ...]] | None = None
+
+    def envelopes_for(self, conn: Connection, *, session_id: str, tool_call_id: str) -> tuple[object, ...]:
+        """Return every envelope whose ``invocation.tool_call_id`` equals ``tool_call_id``."""
+        if conn is not self._conn or session_id != self._session_id:
+            raise AuditIntegrityError("pipeline dispatch envelope index was used outside its transaction")
+        if self._groups is None:
+            self._groups = _load_pipeline_dispatch_envelope_groups(conn, session_id=session_id)
+        envelopes = self._groups[tool_call_id] if tool_call_id in self._groups else ()
+        return tuple(copy.deepcopy(envelope) for envelope in envelopes)
+
+
+def _persisted_pipeline_dispatch_content_hashes(
+    conn: Connection,
+    *,
+    session_id: str,
+    dispatch: PipelineDispatchAuditBinding,
+    dispatch_index: PipelineDispatchEnvelopeIndex | None = None,
+) -> tuple[str, ...]:
+    """Return content hashes from exact durable redacted dispatch envelopes.
+
+    ``dispatch_index`` lets a caller verifying several proposals in one
+    transaction share one history read; without it this call reads the
+    session's history itself, once, as a single-proposal check always has.
+    """
+    if dispatch_index is None:
+        dispatch_index = PipelineDispatchEnvelopeIndex(conn, session_id=session_id)
+    matches: list[str] = []
+    for envelope in dispatch_index.envelopes_for(conn, session_id=session_id, tool_call_id=dispatch.tool_call_id):
+        try:
+            recovery = _pipeline_dispatch_recovery_from_envelope(
+                envelope,
+                expected_tool_call_id=dispatch.tool_call_id,
+            )
+        except AuditIntegrityError as exc:
+            raise AuditIntegrityError("pipeline dispatch audit evidence is malformed") from exc
+        if recovery is None:
+            continue
+        if recovery.binding != dispatch:
+            raise AuditIntegrityError("pipeline successful dispatch evidence does not match the terminal binding")
+        matches.append(recovery.executor_content_hash)
     return tuple(matches)
 
 
@@ -576,6 +643,7 @@ def _verify_committed_pipeline_authority(
     *,
     service: SessionServiceImpl,
     authority: AuthoritativePipelineProposal,
+    dispatch_index: PipelineDispatchEnvelopeIndex | None = None,
 ) -> None:
     """Verify the complete already-committed outcome used by HTTP retries."""
     sid = str(authority.row.session_id)
@@ -647,7 +715,7 @@ def _verify_committed_pipeline_authority(
             raise AuditIntegrityError("committed pipeline proposal creation operation mismatch")
     if compared_payload != expected:
         raise AuditIntegrityError("committed pipeline proposal exact retry binding mismatch")
-    if _persisted_pipeline_dispatch_content_hashes(conn, session_id=sid, dispatch=dispatch) != (state_hash,):
+    if _persisted_pipeline_dispatch_content_hashes(conn, session_id=sid, dispatch=dispatch, dispatch_index=dispatch_index) != (state_hash,):
         raise AuditIntegrityError("committed pipeline proposal dispatch audit is missing or duplicated")
 
 
@@ -655,6 +723,7 @@ def _verify_rejected_pipeline_authority(
     conn: Connection,
     *,
     authority: AuthoritativePipelineProposal,
+    dispatch_index: PipelineDispatchEnvelopeIndex | None = None,
 ) -> None:
     """Verify the closed terminal authority for a canonical rejection."""
     sid = str(authority.row.session_id)
@@ -702,7 +771,10 @@ def _verify_rejected_pipeline_authority(
     expected = _pipeline_rejected_payload(authority=authority, reason=reason, dispatch=dispatch)
     if payload != expected:
         raise AuditIntegrityError("rejected pipeline proposal exact terminal binding mismatch")
-    if dispatch is not None and len(_persisted_pipeline_dispatch_content_hashes(conn, session_id=sid, dispatch=dispatch)) != 1:
+    if (
+        dispatch is not None
+        and len(_persisted_pipeline_dispatch_content_hashes(conn, session_id=sid, dispatch=dispatch, dispatch_index=dispatch_index)) != 1
+    ):
         raise AuditIntegrityError("rejected pipeline proposal dispatch audit is missing or duplicated")
 
 
@@ -711,18 +783,19 @@ def _verify_pipeline_lifecycle_authority(
     *,
     service: SessionServiceImpl,
     authority: AuthoritativePipelineProposal,
+    dispatch_index: PipelineDispatchEnvelopeIndex | None = None,
 ) -> None:
     """Verify the complete canonical lifecycle before exposing or mutating it."""
     is_fork_transaction = type(conn) is _ForkCreationTransaction
     if authority.row.status == "committed":
         if is_fork_transaction:
             raise AuditIntegrityError("fork source proposal must remain pending")
-        _verify_committed_pipeline_authority(cast(Connection, conn), service=service, authority=authority)
+        _verify_committed_pipeline_authority(cast(Connection, conn), service=service, authority=authority, dispatch_index=dispatch_index)
         return
     if authority.row.status == "rejected":
         if is_fork_transaction:
             raise AuditIntegrityError("fork source proposal must remain pending")
-        _verify_rejected_pipeline_authority(cast(Connection, conn), authority=authority)
+        _verify_rejected_pipeline_authority(cast(Connection, conn), authority=authority, dispatch_index=dispatch_index)
         return
     if authority.row.status != "pending":
         raise AuditIntegrityError("pipeline proposal lifecycle status is malformed")

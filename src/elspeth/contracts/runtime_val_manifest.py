@@ -51,6 +51,7 @@ import sys
 import textwrap
 from collections.abc import Sequence
 from contextvars import ContextVar
+from functools import lru_cache
 from types import (
     BuiltinFunctionType,
     CodeType,
@@ -70,6 +71,7 @@ from elspeth.contracts.declaration_contracts import (
     declaration_registry_is_frozen,
     registered_declaration_contracts,
 )
+from elspeth.contracts.hashing import canonical_json
 from elspeth.contracts.tier_registry import (
     _TIER_1_ERRORS_VIEW,
     FrameworkBugError,
@@ -1746,6 +1748,36 @@ def runtime_val_registry_fingerprint() -> RuntimeValRegistryFingerprint:
     declarations = tuple((type(contract), contract.name) for contract in registered_declaration_contracts())
     tier_1 = tuple((cls, tier_1_reason(cls)) for cls in _TIER_1_ERRORS_VIEW)
     return (declarations, tier_1)
+
+
+@lru_cache(maxsize=4)
+def _cached_frozen_runtime_val_manifest_json(fingerprint: RuntimeValRegistryFingerprint) -> str:
+    """Serialize the frozen runtime-VAL registries once per registry state.
+
+    Building the manifest hashes source, bytecode, and transitive helper
+    dependencies (hundreds of milliseconds), so neither ``begin_run()`` nor
+    approval binding may pay it per call. The cache is keyed on
+    ``runtime_val_registry_fingerprint()`` rather than being process-wide:
+    a process whose registries change between runs must never write an
+    earlier registry's manifest into a later run header, nor bind an
+    approval to it (elspeth-68bc1e3d3a).
+    """
+    del fingerprint  # cache key only; the builder reads the live registries
+    return canonical_json(build_runtime_val_manifest())
+
+
+def cached_frozen_runtime_val_manifest_json() -> str:
+    """Return the canonical JSON of the frozen runtime-VAL manifest, cached per registry state.
+
+    The single shared source for every consumer that records or binds the
+    manifest a run starts under (the Landscape run header and the approval
+    binding hash), so both see byte-identical text. Callers that must see
+    the live tree regardless of the fingerprint -- the resume drift check and
+    probes that mutate code objects in place -- call
+    ``build_runtime_val_manifest()`` directly instead.
+    """
+    _assert_runtime_val_registries_frozen()
+    return _cached_frozen_runtime_val_manifest_json(runtime_val_registry_fingerprint())
 
 
 def build_runtime_val_manifest() -> dict[str, Any]:

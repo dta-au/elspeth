@@ -22,11 +22,10 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from functools import partial
-from typing import Any, Final, Literal, NotRequired, Protocol, TypedDict, cast, final
+from typing import Any, Final, Literal, NotRequired, Protocol, TypedDict, cast, final, get_args
 from uuid import UUID, uuid4
 
 import structlog
-from jsonschema import Draft202012Validator
 from pydantic import BaseModel, ConfigDict
 from pydantic import ValidationError as PydanticValidationError
 from sqlalchemy import Engine
@@ -147,7 +146,7 @@ from elspeth.web.composer.provider_quota import (
     quota_provider_calls,
     required_provider_audit_scope,
 )
-from elspeth.web.composer.reasoning import apply_reasoning_kwargs
+from elspeth.web.composer.reasoning import ReasoningEffort, apply_reasoning_kwargs
 from elspeth.web.composer.recovery_controls import parse_recovery_tool_call, recovery_context_message, recovery_tool_definitions
 from elspeth.web.composer.redaction import GetBlobContentArgumentsModel, ReadAttachmentArgumentsModel, SetPipelineArgumentsModel
 from elspeth.web.composer.response_contracts import AdmittedResponse
@@ -181,7 +180,7 @@ from elspeth.web.composer.tools.generation import (
     explain_validation_code,
     explain_withheld_validation_code,
 )
-from elspeth.web.composer.tools.schema_contract import canonical_set_pipeline_schema
+from elspeth.web.composer.tools.schema_contract import canonical_set_pipeline_schema, canonical_set_pipeline_validator
 from elspeth.web.composer.tools.sessions import build_set_pipeline_candidate, canonicalize_authored_node_review_requirements
 from elspeth.web.composer.tools.wire_projection import (
     _WIRE_TOOL_DEFS,
@@ -924,6 +923,14 @@ class PlannerModelConfig:
         ):
             if type(string_value) is not str or not string_value.strip():
                 raise ValueError(f"{string_field_name} must be a non-empty exact string")
+        # Composer and advisor must be reasoning models: refuse an unhinted
+        # or unknown effort here, before any provider turn could be built.
+        for effort_field_name, effort_value in (
+            ("discovery_reasoning_effort", self.discovery_reasoning_effort),
+            ("candidate_reasoning_effort", self.candidate_reasoning_effort),
+        ):
+            if effort_value not in get_args(ReasoningEffort):
+                raise ValueError(f"{effort_field_name} must be one of {get_args(ReasoningEffort)}; got {effort_value!r}")
         if self.escape_hatch_model is not None and (type(self.escape_hatch_model) is not str or not self.escape_hatch_model.strip()):
             raise ValueError("escape_hatch_model must be a non-empty exact string or None")
         if self.escape_hatch_provider is not None and (
@@ -4482,9 +4489,7 @@ async def _plan_pipeline_inner(
                     terminal_feedback = _canonical_schema_feedback()
                 else:
                     schema_errors = (
-                        []
-                        if payload.pipeline is None
-                        else list(Draft202012Validator(canonical_set_pipeline_schema()).iter_errors(payload.pipeline))
+                        [] if payload.pipeline is None else list(canonical_set_pipeline_validator().iter_errors(payload.pipeline))
                     )
                     if schema_errors:
                         # The structural pre-check runs ahead of Stage 1, so a

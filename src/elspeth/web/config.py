@@ -308,12 +308,13 @@ class WebSettings(BaseModel):
     # All composer roles run reasoning-capable models; these knobs bound the
     # thinking budget per call class instead of letting the model pick an
     # unhinted budget that grows with the transcript (measured 120s tails on
-    # the tutorial planner, journal 2026-07-27..08-05). "none" sends no hint
-    # — the pre-feature behaviour and the opt-out for non-reasoning
-    # deployments. openrouter/ models are hinted via OpenRouter's native
-    # reasoning object, everything else via LiteLLM's reasoning_effort
-    # (Bedrock -> Anthropic thinking budgets, Azure -> native effort); see
-    # elspeth.web.composer.reasoning for the carve-out rationale.
+    # the tutorial planner, journal 2026-07-27..08-05). Composer and advisor
+    # must be reasoning models: there is no "none" opt-out, and a value
+    # outside low/medium/high is refused at settings load. openrouter/
+    # models are hinted via OpenRouter's native reasoning object, everything
+    # else via LiteLLM's reasoning_effort (Bedrock -> Anthropic thinking
+    # budgets, Azure -> native effort, OpenAI-compatible gateways -> the
+    # chat-completions field); see elspeth.web.composer.reasoning.
     composer_discovery_reasoning_effort: ReasoningEffort = "low"
     composer_candidate_reasoning_effort: ReasoningEffort = "high"
     composer_advisor_reasoning_effort: ReasoningEffort = "medium"

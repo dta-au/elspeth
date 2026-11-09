@@ -15,7 +15,9 @@ from elspeth.contracts.enums import (
     BatchStatus,
     NodeStateStatus,
 )
+from elspeth.contracts.hashing import repr_hash
 from elspeth.contracts.schema_contract import SchemaContract
+from elspeth.core.canonical import stable_hash
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.engine.spans import SpanFactory
 from elspeth.testing import make_field, make_row
@@ -121,8 +123,23 @@ class _CallRecorder:
 def _make_factory() -> MagicMock:
     """Create a mock RecorderFactory with sensible defaults."""
     factory = MagicMock(spec=RecorderFactory)
-    state = SimpleNamespace(state_id="state_001")
+    state = SimpleNamespace(state_id="state_001", input_hash=None)
+
+    def begin_node_state_side_effect(*, input_data: Any, quarantined: bool = False, **_kwargs: Any) -> SimpleNamespace:
+        # Mirror NodeStateRepository.begin_node_state: the opened state carries
+        # the hash of the input it recorded, which the transform executor reads
+        # back instead of hashing the row a second time.
+        if quarantined:
+            try:
+                state.input_hash = stable_hash(input_data)
+            except (ValueError, TypeError):
+                state.input_hash = repr_hash(input_data)
+        else:
+            state.input_hash = stable_hash(input_data)
+        return state
+
     factory.execution.begin_node_state.return_value = state
+    factory.execution.begin_node_state.side_effect = begin_node_state_side_effect
     factory.execution.register_artifact.return_value = SimpleNamespace(artifact_id="art_001")
     factory.execution.begin_operation.return_value = SimpleNamespace(operation_id="op_001")
 
