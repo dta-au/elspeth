@@ -3798,8 +3798,9 @@ def test_prevalidation_rejected_result_states_the_unapplied_envelope_on_every_fi
     the one field that stays the candidate's — it is the rejection the model
     repairs from, and the skill says so.
 
-    Read from the AST because what is pinned is that the ``replace()`` passes
-    each of them at all; the resulting WIRE is pinned behaviourally by
+    Read from the AST because what is pinned is that the real unapplied
+    admission helper restates each field, and that the rejected candidate
+    actually goes through it with the refused disposition. The WIRE is pinned by
     ``tests/integration/web/composer/test_freeform_proposal_prevalidation.py::
     test_final_profile_rejection_is_unapplied_audited_and_repairable``, which
     needs a candidate whose version differs and only the harness builds one.
@@ -3812,10 +3813,30 @@ def test_prevalidation_rejected_result_states_the_unapplied_envelope_on_every_fi
         if isinstance(node, ast.Call) and _call_name(node) == "replace" and any(kw.arg == "data" for kw in node.keywords)
     ]
     assert len(replaces) == 1, "premise: run_tool_batch re-datas exactly one result"
-    restated = {kw.arg: kw.value for kw in replaces[0].keywords}
-    assert set(restated) == {"data", "updated_state", "prior_validation", "affected_nodes"}, (
-        "the rejected result must restate every envelope field that describes a change, and nothing else"
-    )
+    assert {kw.arg for kw in replaces[0].keywords} == {"data"}
+    admissions = [
+        node
+        for node in ast.walk(fn)
+        if isinstance(node, ast.Call) and _call_name(node) == "_unapplied_admission" and node.args[0] is replaces[0]
+    ]
+    assert len(admissions) == 1, "the rejection data must pass through unapplied admission"
+    assert isinstance(admissions[0].args[1], ast.Constant) and admissions[0].args[1].value == "refused"
+    state_argument = next(kw.value for kw in admissions[0].keywords if kw.arg == "state")
+    assert isinstance(state_argument, ast.Name) and state_argument.id == "state"
+
+    helper = _function(tree, "_unapplied_admission")
+    normalizations = [node for node in ast.walk(helper) if isinstance(node, ast.Call) and _call_name(node) == "replace"]
+    assert len(normalizations) == 1, "unapplied admission must normalize the actual result once"
+    restated = {kw.arg: kw.value for kw in normalizations[0].keywords}
+    assert set(restated) == {
+        "updated_state",
+        "validation",
+        "runtime_preflight",
+        "prior_validation",
+        "affected_nodes",
+        "applied_component",
+        "post_call_hints",
+    }, "unapplied admission must restate every change field and preserve standing observations"
     updated = restated["updated_state"]
     assert isinstance(updated, ast.Name) and updated.id == "state", "the envelope's version must be the unapplied state's"
     prior = restated["prior_validation"]
@@ -3824,6 +3845,28 @@ def test_prevalidation_rejected_result_states_the_unapplied_envelope_on_every_fi
     )
     affected = restated["affected_nodes"]
     assert isinstance(affected, ast.Tuple) and not affected.elts, "nothing was applied, so no component was touched"
+    echo = restated["applied_component"]
+    assert isinstance(echo, ast.Constant) and echo.value is None, "nothing was applied, so no applied component may be echoed"
+
+
+@pytest.mark.parametrize("field", ("updated_state", "prior_validation", "affected_nodes", "applied_component"))
+def test_unapplied_admission_gate_rejects_a_missing_change_field(monkeypatch: pytest.MonkeyPatch, field: str) -> None:
+    test_prevalidation_rejected_result_states_the_unapplied_envelope_on_every_field()
+    original = _parse
+
+    def omit_change_field(path: Path) -> ast.Module:
+        tree = original(path)
+        if path == TOOL_BATCH:
+            helper = _function(tree, "_unapplied_admission")
+            normalization = next(node for node in ast.walk(helper) if isinstance(node, ast.Call) and _call_name(node) == "replace")
+            normalization.keywords = [kw for kw in normalization.keywords if kw.arg != field]
+        return tree
+
+    monkeypatch.setitem(
+        test_prevalidation_rejected_result_states_the_unapplied_envelope_on_every_field.__globals__, "_parse", omit_change_field
+    )
+    with pytest.raises(AssertionError, match="unapplied admission must restate every change field"):
+        test_prevalidation_rejected_result_states_the_unapplied_envelope_on_every_field()
 
 
 def test_is_taught_requires_the_quoted_form() -> None:

@@ -6,7 +6,7 @@ import json
 from collections.abc import Iterator
 from contextlib import contextmanager
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -18,8 +18,10 @@ from sqlalchemy import Engine, func, insert, select
 from sqlalchemy.pool import StaticPool
 
 from elspeth.contracts.composer_audit import ComposerToolStatus
+from elspeth.contracts.composer_llm_audit import ToolContractDialect
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.prompt_guard import PromptGuardContentPart, PromptGuardToolArgumentParts
+from elspeth.contracts.secrets import ResolvedSecret, SecretInventoryItem, WebSecretResolver
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.web.blobs.protocol import BlobPendingProposalError
@@ -37,17 +39,20 @@ from elspeth.web.composer.diagnostic_evidence import (
     is_diagnostic_evidence_envelope,
 )
 from elspeth.web.composer.pipeline_custody import inline_custody_audit_projection
-from elspeth.web.composer.protocol import ComposerPluginCrashError
+from elspeth.web.composer.protocol import ComposerConvergenceError, ComposerPluginCrashError
 from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
 from elspeth.web.composer.service import ComposerAvailability, ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState, PipelineMetadata, SourceSpec, ValidationEntry, ValidationSummary
 from elspeth.web.composer.tools import ToolResult
+from elspeth.web.composer.tools import execute_tool as real_execute_tool
 from elspeth.web.composer.tools.sessions import build_set_pipeline_candidate as real_build_set_pipeline_candidate
+from elspeth.web.composer.tools.wire_projection import encode_semantic_arguments
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.plugin_policy.validation import ProfileAwareValidationResult
+from elspeth.web.secrets.wiring_policy import SecretWiringRuleSettings
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import (
     blobs_table,
@@ -174,7 +179,12 @@ def _incremental_base_state(tmp_path: Path) -> CompositionState:
     )
 
 
-def _harness(tmp_path: Path) -> _Harness:
+def _harness(
+    tmp_path: Path,
+    *,
+    secret_service: WebSecretResolver | None = None,
+    secret_rules: tuple[SecretWiringRuleSettings, ...] = (),
+) -> _Harness:
     engine = create_session_engine(
         "sqlite:///:memory:",
         connect_args={"check_same_thread": False},
@@ -224,9 +234,10 @@ def _harness(tmp_path: Path) -> _Harness:
     ):
         service = ComposerServiceImpl.for_trained_operator(
             catalog=catalog,
-            settings=_make_settings(tmp_path),
+            settings=_make_settings(tmp_path, secret_wiring_allowlist=secret_rules),
             sessions_service=sessions,
             session_engine=engine,
+            secret_service=secret_service,
         )
     service._advisor_checkpoint._run_advisor_checkpoint = _clean_advisor_checkpoint  # type: ignore[method-assign]
     return _Harness(
@@ -461,6 +472,10 @@ async def test_final_profile_rejection_is_unapplied_audited_and_repairable(tmp_p
     ]
     files_before = tuple(sorted(path.relative_to(tmp_path) for path in tmp_path.rglob("*") if path.is_file()))
     original_record_failure = AntiAnchorTracker.record_failure
+    progress_events = []
+
+    async def record_progress(event: Any) -> None:
+        progress_events.append(event)
 
     def _record_failure(tracker: AntiAnchorTracker, tool_name: str, arguments_hash: str) -> None:
         failures.append((tool_name, arguments_hash))
@@ -500,6 +515,7 @@ async def test_final_profile_rejection_is_unapplied_audited_and_repairable(tmp_p
             session_id=harness.session_id,
             user_id="proposal-prevalidation-user",
             user_message_id=harness.user_message_id,
+            progress=record_progress,
         )
 
     proposals = await harness.sessions.list_composition_proposals(UUID(harness.session_id))
@@ -508,6 +524,8 @@ async def test_final_profile_rejection_is_unapplied_audited_and_repairable(tmp_p
     assert result.state is state
     assert builder.call_count == 2
     assert [tool_name for tool_name, _hash in failures] == ["set_pipeline"]
+    assert any("visible blocker" in event.headline for event in progress_events)
+    assert not any("has updated the pipeline" in event.headline for event in progress_events)
 
     invalid_feedback = next(message for message in message_snapshots[1] if message.get("tool_call_id") == "call_final_invalid")
     invalid_payload = json.loads(invalid_feedback["content"])
@@ -1498,11 +1516,11 @@ async def test_candidate_prior_validation_base_exception_is_audited_once_and_pro
     ("arguments", "expected_proposals", "expected_error_class"),
     [
         ({"patch": {"name": "reviewed"}}, 1, None),
-        ({"patch": "not-an-object"}, 1, None),
+        ({"patch": "not-an-object"}, 0, "ToolArgumentError"),
     ],
     ids=("valid", "invalid"),
 )
-async def test_non_pipeline_explicit_approval_behavior_is_unchanged(
+async def test_incremental_explicit_approval_admits_only_valid_arguments(
     tmp_path: Path,
     arguments: dict[str, Any],
     expected_proposals: int,
@@ -1536,6 +1554,698 @@ async def test_non_pipeline_explicit_approval_behavior_is_unchanged(
     outcome = outcome_batches[0][0]
     assert outcome.error_class == expected_error_class
     assert outcome.post_version == state.version
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dialect", tuple(ToolContractDialect))
+@pytest.mark.parametrize(
+    ("tool_name", "arguments", "expected_success", "expected_error"),
+    [
+        ("set_metadata", {"patch": {}}, True, None),
+        ("set_metadata", {"patch": {"name": "Untitled Pipeline"}}, True, None),
+        ("set_metadata", {"patch": "invalid"}, None, "ToolArgumentError"),
+        ("patch_node_options", {"node_id": "absent", "patch": {}}, False, None),
+    ],
+    ids=("empty-noop", "same-value-noop", "argument-error", "handler-refusal"),
+)
+async def test_unapplied_incremental_feedback_then_repair_stages_once(
+    tmp_path: Path,
+    dialect: ToolContractDialect,
+    tool_name: str,
+    arguments: dict[str, Any],
+    expected_success: bool | None,
+    expected_error: str | None,
+) -> None:
+    harness = _harness(tmp_path)
+    harness.service._planner_dialect = dialect
+    state = _incremental_base_state(tmp_path)
+    repair = {"patch": {"name": "local-repair"}}
+    llm = _ScriptedLLM(
+        _tool_turn("call_unapplied", tool_name, encode_semantic_arguments(tool_name, dialect, arguments)),
+        _tool_turn("call_repair", "set_metadata", encode_semantic_arguments("set_metadata", dialect, repair)),
+        _fake_llm_response(content="The repair awaits approval."),
+    )
+    progress = []
+
+    async def record_progress(event: Any) -> None:
+        progress.append(event)
+
+    with (
+        patch.object(harness.service._provider_gateway, "_call_llm", new=llm),
+        _record_phase3_outcomes(harness.service) as batches,
+        patch("elspeth.web.composer.tool_batch.execute_tool", wraps=real_execute_tool) as execution,
+    ):
+        result = await harness.service.compose(
+            "Update the metadata.",
+            [],
+            state,
+            session_id=harness.session_id,
+            user_id="proposal-prevalidation-user",
+            user_message_id=harness.user_message_id,
+            progress=record_progress,
+        )
+    proposals = await harness.sessions.list_composition_proposals(UUID(harness.session_id))
+    assert [proposal.tool_call_id for proposal in proposals] == ["call_repair"]
+    assert result.state is state
+    assert len(result.tool_invocations) == 2
+    assert execution.call_count == 2
+    assert len(batches[0]) == 1
+    outcome = batches[0][0]
+    assert outcome.post_version == state.version
+    assert outcome.error_class == expected_error
+    feedback = [m for m in llm.message_snapshots[1] if m.get("role") == "tool" and m["tool_call_id"] == "call_unapplied"]
+    assert len(feedback) == 1
+    payload = json.loads(feedback[0]["content"])
+    if expected_success is not None:
+        assert payload["success"] is expected_success
+        assert payload["version"] == state.version
+        assert payload["affected_nodes"] == []
+        assert "validation_delta" not in payload
+        assert "applied_component" not in payload
+        assert "PREVALIDATION_REJECTED" not in feedback[0]["content"]
+    if expected_success:
+        assert payload["validation"]["is_valid"] is False
+        assert payload["validation"]["errors"]
+        assert any("unchanged" in event.headline.lower() for event in progress)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("call_kind", ("noop", "refusal", "argument", "at-cap-noop", "at-cap-refusal", "change", "inline"))
+async def test_proposal_cap_counts_only_admitted_changes(tmp_path: Path, call_kind: str) -> None:
+    harness = _harness(tmp_path)
+    state = _incremental_base_state(tmp_path)
+    at_cap = call_kind.startswith("at-cap") or call_kind in {"change", "inline"}
+    calls = [
+        {"id": f"call_change_{i}", "name": "set_metadata", "arguments": {"patch": {"name": f"change-{i}"}}}
+        for i in range(10 if at_cap else 0)
+    ]
+    tool_name, arguments = (
+        ("patch_node_options", {"node_id": "absent", "patch": {}}) if "refusal" in call_kind else ("set_metadata", {"patch": {}})
+    )
+    if call_kind == "change":
+        tool_name, arguments = "set_metadata", {"patch": {"name": "excess"}}
+    if call_kind == "argument":
+        tool_name, arguments = "set_metadata", {"patch": "invalid"}
+    if call_kind == "inline":
+        tool_name, arguments = "set_pipeline", _inline_pipeline_args(tmp_path)
+    calls.extend({"id": f"call_tail_{i}", "name": tool_name, "arguments": arguments} for i in range(1 if at_cap else 11))
+    llm = _ScriptedLLM(_fake_llm_response(tool_calls=tuple(calls)), _fake_llm_response(content="Done."))
+    with patch.object(harness.service._provider_gateway, "_call_llm", new=llm):
+        if call_kind in {"change", "inline"}:
+            with pytest.raises(ComposerConvergenceError) as raised:
+                await harness.service.compose(
+                    "Review these edits.",
+                    [],
+                    state,
+                    session_id=harness.session_id,
+                    user_id="proposal-prevalidation-user",
+                    user_message_id=harness.user_message_id,
+                )
+            assert dict(raised.value.evidence) == {"observed": 11, "cap": 10, "cap_kind": "pending_proposals"}
+            assert len(raised.value.tool_invocations) == 10
+        else:
+            result = await harness.service.compose(
+                "Review these edits.",
+                [],
+                state,
+                session_id=harness.session_id,
+                user_id="proposal-prevalidation-user",
+                user_message_id=harness.user_message_id,
+            )
+            assert len(result.tool_invocations) == len(calls)
+            assert result.state is state
+    proposals = await harness.sessions.list_composition_proposals(UUID(harness.session_id))
+    assert len(proposals) == (10 if at_cap else 0)
+    assert _count_rows(harness.engine, blobs_table) == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("named_sources", (False, True), ids=("singleton-source", "named-source"))
+async def test_identical_canonical_candidate_returns_unchanged_without_proposal(tmp_path: Path, named_sources: bool) -> None:
+    harness = _harness(tmp_path)
+    arguments = _valid_pipeline_args(tmp_path)
+    if named_sources:
+        arguments["sources"] = {"orders": arguments.pop("source")}
+    state = CompositionState.from_dict(
+        {
+            **arguments,
+            "version": 7,
+            "metadata": {"description": "", **arguments["metadata"]},
+            "outputs": [{"name": output["sink_name"], **output} for output in arguments["outputs"]],
+        }
+    )
+    llm = _ScriptedLLM(
+        _tool_turn("call_identical", "set_pipeline", arguments),
+        _fake_llm_response(content="The pipeline is unchanged."),
+    )
+    with (
+        patch.object(harness.service._provider_gateway, "_call_llm", new=llm),
+        _record_phase3_outcomes(harness.service) as batches,
+    ):
+        result = await harness.service.compose(
+            "Keep the current pipeline.",
+            [],
+            state,
+            session_id=harness.session_id,
+            user_id="proposal-prevalidation-user",
+            user_message_id=harness.user_message_id,
+        )
+    assert await harness.sessions.list_composition_proposals(UUID(harness.session_id)) == []
+    assert result.state is state
+    assert len(result.tool_invocations) == 1
+    outcome = batches[0][0]
+    assert outcome.response.success is True
+    assert outcome.response.updated_state is state
+    assert outcome.response.affected_nodes == ()
+    assert outcome.response.prior_validation is None
+    assert "PREVALIDATION_REJECTED" not in canonical_json(outcome.response.to_dict())
+    assert _count_rows(harness.engine, blobs_table) == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("family", "changed", "patch_kind"),
+    [(family, changed, "empty") for family in ("metadata", "source", "node", "output", "edge", "replacement") for changed in (False, True)]
+    + [(family, False, patch_kind) for family in ("source", "node", "output") for patch_kind in ("same-value", "absent-null")],
+)
+async def test_semantic_admission_across_incremental_mutation_families(
+    tmp_path: Path,
+    family: str,
+    changed: bool,
+    patch_kind: str,
+) -> None:
+    harness = _harness(tmp_path)
+    pipeline = _valid_pipeline_args(tmp_path)
+    pipeline["source"]["on_success"] = "rows"
+    pipeline["nodes"] = [
+        {
+            "id": "map",
+            "node_type": "transform",
+            "plugin": "field_mapper",
+            "input": "rows",
+            "on_success": "main",
+            "on_error": "discard",
+            "options": {"schema": {"mode": "observed"}, "mapping": {}},
+        }
+    ]
+    pipeline["edges"] = [{"id": "incoming", "from_node": "source", "to_node": "map", "edge_type": "on_success", "label": None}]
+    state = CompositionState.from_dict(
+        {
+            **pipeline,
+            "version": 7,
+            "metadata": {"description": "", **pipeline["metadata"]},
+            "outputs": [{"name": output["sink_name"], **output} for output in pipeline["outputs"]],
+        }
+    )
+    cases = {
+        "metadata": ("set_metadata", {"patch": {"name": "changed" if changed else "proposal-valid"}}),
+        "source": ("patch_source_options", {"patch": {"delimiter": ";"} if changed else {}}),
+        "node": ("patch_node_options", {"node_id": "map", "patch": {"select_only": True} if changed else {}}),
+        "output": ("patch_output_options", {"sink_name": "main", "patch": {"format": "json"} if changed else {}}),
+        "edge": ("upsert_edge", {**pipeline["edges"][0], "label": "changed" if changed else None}),
+        "replacement": ("set_pipeline", {**pipeline, "metadata": {"name": "changed" if changed else "proposal-valid"}}),
+    }
+    tool_name, arguments = cases[family]
+    if patch_kind == "same-value":
+        arguments["patch"] = {"source": {"schema": {"mode": "observed"}}, "node": {"mapping": {}}, "output": {"format": "jsonl"}}[family]
+    elif patch_kind == "absent-null":
+        arguments["patch"] = {"not_present": None}
+    llm = _ScriptedLLM(_tool_turn("call_family", tool_name, arguments), _fake_llm_response(content="Done."))
+    with (
+        patch.object(harness.service._provider_gateway, "_call_llm", new=llm),
+        _record_phase3_outcomes(harness.service) as batches,
+    ):
+        result = await harness.service.compose(
+            "Review this pipeline edit.",
+            [],
+            state,
+            session_id=harness.session_id,
+            user_id="proposal-prevalidation-user",
+            user_message_id=harness.user_message_id,
+        )
+    proposals = await harness.sessions.list_composition_proposals(UUID(harness.session_id))
+    assert len(proposals) == int(changed)
+    assert result.state is state
+    assert len(result.tool_invocations) == 1
+    outcome = batches[0][0]
+    assert outcome.error_class is None
+    assert outcome.response.success is True
+    assert outcome.post_version == state.version
+    if not changed:
+        payload = outcome.response.to_dict()
+        assert payload["affected_nodes"] == []
+        assert "validation_delta" not in payload
+        assert "applied_component" not in payload
+        assert any("unchanged" in hint for hint in payload["post_call_hints"])
+
+
+@pytest.mark.asyncio
+async def test_noop_between_failures_neither_clears_nor_increments_anti_anchor(tmp_path: Path) -> None:
+    harness = _harness(tmp_path)
+    state = _incremental_base_state(tmp_path)
+    refusal = {"node_id": "absent", "patch": {}}
+    llm = _ScriptedLLM(
+        _tool_turn("call_failure_1", "patch_node_options", refusal),
+        _tool_turn("call_noop", "set_metadata", {"patch": {}}),
+        _tool_turn("call_failure_2", "patch_node_options", refusal),
+        _tool_turn("call_failure_3", "patch_node_options", refusal),
+        _fake_llm_response(content="A target must be configured."),
+    )
+    with patch.object(harness.service._provider_gateway, "_call_llm", new=llm):
+        result = await harness.service.compose(
+            "Update an existing node.",
+            [],
+            state,
+            session_id=harness.session_id,
+            user_id="proposal-prevalidation-user",
+            user_message_id=harness.user_message_id,
+        )
+    assert await harness.sessions.list_composition_proposals(UUID(harness.session_id)) == []
+    assert len(result.tool_invocations) == 4
+    hints = [
+        message for message in llm.message_snapshots[-1] if message.get("role") == "user" and "[ELSPETH-SYSTEM-HINT]" in message["content"]
+    ]
+    assert len(hints) == 1
+    assert "last 3 calls to `patch_node_options`" in hints[0]["content"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changed", (False, True), ids=("version-incrementing-noop", "change"))
+async def test_immediate_auto_metadata_retains_existing_version_behavior(tmp_path: Path, changed: bool) -> None:
+    harness = _harness(tmp_path)
+    await harness.sessions.update_composer_preferences(
+        UUID(harness.session_id),
+        trust_mode="auto_commit",
+        density_default="high",
+        actor="user:proposal-prevalidation-user",
+    )
+    state = _incremental_base_state(tmp_path)
+    llm = _ScriptedLLM(
+        _tool_turn("call_auto_metadata", "set_metadata", {"patch": {"name": "changed"} if changed else {}}),
+        _fake_llm_response(content="Done."),
+    )
+    with patch.object(harness.service._provider_gateway, "_call_llm", new=llm):
+        result = await harness.service.compose(
+            "Update metadata.",
+            [],
+            state,
+            session_id=harness.session_id,
+            user_id="proposal-prevalidation-user",
+            user_message_id=harness.user_message_id,
+        )
+    assert result.state.version == state.version + 1
+    assert result.state.metadata.name == ("changed" if changed else state.metadata.name)
+    assert await harness.sessions.list_composition_proposals(UUID(harness.session_id)) == []
+
+
+class _AdmissionSecretInventory:
+    def list_refs(self, user_id: str) -> list[SecretInventoryItem]:
+        assert user_id == "proposal-prevalidation-user"
+        return [SecretInventoryItem(name="PIPELINE_API_KEY", scope="user", available=True, source_kind="stored")]
+
+    def has_ref(self, user_id: str, name: str) -> bool:
+        assert user_id == "proposal-prevalidation-user"
+        return name == "PIPELINE_API_KEY"
+
+    def resolve(self, user_id: str, name: str) -> ResolvedSecret | None:
+        raise AssertionError("Admission must never resolve secret values")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("policy_match", (True, False), ids=("exact-allowlist", "near-match-denied"))
+@pytest.mark.parametrize("already_wired", (False, True), ids=("unwired", "same-marker"))
+async def test_secret_marker_admission_uses_policy_once_without_resolving_values(
+    tmp_path: Path,
+    policy_match: bool,
+    already_wired: bool,
+) -> None:
+    from elspeth.web.composer.tools import secrets
+
+    rules = (
+        SecretWiringRuleSettings(
+            secret="PIPELINE_API_KEY",
+            component_type="source",
+            plugin="csv" if policy_match else "csv_near_match",
+            option_key="api_key",
+        ),
+    )
+    harness = _harness(tmp_path, secret_service=_AdmissionSecretInventory(), secret_rules=rules)
+    state = _incremental_base_state(tmp_path)
+    if already_wired:
+        source = state.sources["source"]
+        state = state.with_source(replace(source, options={**deep_thaw(source.options), "api_key": {"secret_ref": "PIPELINE_API_KEY"}}))
+    llm = _ScriptedLLM(
+        _tool_turn("call_secret", "wire_secret_ref", {"name": "PIPELINE_API_KEY", "target": "source", "option_key": "api_key"}),
+        _fake_llm_response(content="Done."),
+    )
+    with (
+        patch.object(harness.service._provider_gateway, "_call_llm", new=llm),
+        patch.object(secrets, "_reconciled_secret_wire_result", wraps=secrets._reconciled_secret_wire_result) as reconciliation,
+        _record_phase3_outcomes(harness.service) as batches,
+    ):
+        result = await harness.service.compose(
+            "Use the available secret reference.",
+            [],
+            state,
+            session_id=harness.session_id,
+            user_id="proposal-prevalidation-user",
+            user_message_id=harness.user_message_id,
+        )
+    proposals = await harness.sessions.list_composition_proposals(UUID(harness.session_id))
+    assert len(proposals) == int(policy_match and not already_wired)
+    assert result.state is state
+    assert len(result.tool_invocations) == 1
+    assert reconciliation.call_count == int(policy_match)
+    assert batches[0][0].response.success is policy_match
+    if not policy_match:
+        assert any(entry.error_code == "unauthorized_secret_ref" for entry in batches[0][0].response.validation.errors)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blob_kind", ("user", "same-marker", "not-ready", "missing", "llm"))
+async def test_blob_marker_admission_checks_real_metadata_and_modality(tmp_path: Path, blob_kind: str) -> None:
+    from elspeth.web.composer.tools import blobs
+    from tests.helpers.session_fences import fenced_operation_context
+    from tests.unit.web.composer.test_blob_inline_tools import _inline_ref_state
+
+    harness = _harness(tmp_path)
+    state = _inline_ref_state()
+    blob_id = uuid4()
+    if blob_kind in {"user", "same-marker", "not-ready"}:
+        with fenced_operation_context(harness.engine, harness.session_id, operation_kind=SessionOperationKind.CREATE) as operation:
+            blob = await BlobServiceImpl(harness.engine, tmp_path).create_blob(
+                UUID(harness.session_id),
+                "prompt.txt",
+                b"A user supplied prompt",
+                "text/plain",
+                session_operation_context=operation,
+            )
+        blob_id = blob.id
+        if blob_kind == "not-ready":
+            from tests.unit.web.composer.test_blob_inline_tools import _mark_blob_pending
+
+            _mark_blob_pending({"engine": harness.engine}, str(blob_id))
+    elif blob_kind == "llm":
+        snapshot = PluginAvailabilitySnapshot.for_trained_operator(harness.catalog)
+        view = PolicyCatalogView.for_trained_operator(harness.catalog, snapshot)
+        with fenced_operation_context(harness.engine, harness.session_id, operation_kind=SessionOperationKind.COMPOSE) as operation:
+            created = real_execute_tool(
+                "create_blob",
+                {"filename": "prompt.txt", "mime_type": "text/plain", "content": "Generated prompt content"},
+                state,
+                view,
+                plugin_snapshot=snapshot,
+                data_dir=str(tmp_path),
+                session_engine=harness.engine,
+                session_id=harness.session_id,
+                session_operation_context=operation,
+                session_operation_authority=harness.sessions.session_operation_authority,
+                user_message_id=harness.user_message_id,
+                user_message_content="Generate a prompt.",
+                composer_model_identifier="test-model",
+                composer_model_version="test-v1",
+                composer_provider="test",
+                composer_skill_hash="a" * 64,
+                tool_arguments_hash="b" * 64,
+            )
+        assert created.success is True
+        blob_id = UUID(created.data["blob_id"])
+        with harness.engine.connect() as conn:
+            assert (
+                conn.execute(select(blobs_table.c.creation_modality).where(blobs_table.c.id == str(blob_id))).scalar_one()
+                == "llm_generated"
+            )
+    if blob_kind == "same-marker":
+        snapshot = PluginAvailabilitySnapshot.for_trained_operator(harness.catalog)
+        view = PolicyCatalogView.for_trained_operator(harness.catalog, snapshot)
+        wired = real_execute_tool(
+            "wire_blob_inline_ref",
+            {"field_path": "node:classify.options.prompt_template", "blob_id": str(blob_id)},
+            state,
+            view,
+            plugin_snapshot=snapshot,
+            session_engine=harness.engine,
+            session_id=harness.session_id,
+        )
+        assert wired.success is True
+        state = wired.updated_state
+    llm = _ScriptedLLM(
+        _tool_turn(
+            "call_blob_marker", "wire_blob_inline_ref", {"field_path": "node:classify.options.prompt_template", "blob_id": str(blob_id)}
+        ),
+        _fake_llm_response(content="Done."),
+    )
+    with (
+        patch.object(harness.service._provider_gateway, "_call_llm", new=llm),
+        patch.object(blobs, "_sync_get_blob", wraps=blobs._sync_get_blob) as metadata_lookup,
+        _record_phase3_outcomes(harness.service) as batches,
+    ):
+        result = await harness.service.compose(
+            "Use the supplied prompt artifact.",
+            [],
+            state,
+            session_id=harness.session_id,
+            user_id="proposal-prevalidation-user",
+            user_message_id=harness.user_message_id,
+        )
+    assert result.state is state
+    assert len(result.tool_invocations) == 1
+    proposals = await harness.sessions.list_composition_proposals(UUID(harness.session_id))
+    assert len(proposals) == int(blob_kind == "user")
+    assert metadata_lookup.call_count == 1
+    assert batches[0][0].response.success is (blob_kind in {"user", "same-marker"})
+    assert _count_rows(harness.engine, blobs_table) == int(blob_kind != "missing")
+
+
+@pytest.mark.asyncio
+async def test_successful_noop_preserves_standing_invalid_validation_and_preflight(tmp_path: Path) -> None:
+    harness = _harness(tmp_path)
+    state = _incremental_base_state(tmp_path)
+    llm = _ScriptedLLM(
+        _tool_turn("call_preview", "preview_pipeline", {}),
+        _tool_turn("call_noop", "set_metadata", {"patch": {}}),
+        _fake_llm_response(content="The current draft still needs an output."),
+    )
+    dispatches = []
+    dispatch = harness.service._dispatch_tool_batch
+
+    async def record_dispatch(**kwargs: Any) -> Any:
+        dispatched = await dispatch(**kwargs)
+        dispatches.append(dispatched[0])
+        return dispatched
+
+    with (
+        patch.object(harness.service._provider_gateway, "_call_llm", new=llm),
+        patch.object(harness.service, "_dispatch_tool_batch", new=record_dispatch),
+    ):
+        result = await harness.service.compose(
+            "Inspect the draft and keep its metadata.",
+            [],
+            state,
+            session_id=harness.session_id,
+            user_id="proposal-prevalidation-user",
+            user_message_id=harness.user_message_id,
+        )
+    assert len(dispatches) == 2
+    preview, noop = dispatches
+    assert preview.last_validation.is_valid is False
+    assert preview.last_runtime_preflight is not None
+    assert noop.last_validation is preview.last_validation
+    assert noop.last_runtime_preflight is preview.last_runtime_preflight
+    assert noop.state is state
+    assert noop.mutation_success_observed is False
+    response = noop.tool_outcomes[0].response
+    assert response.success is True
+    assert response.validation is preview.last_validation
+    assert response.runtime_preflight is preview.last_runtime_preflight
+    assert response.to_dict()["affected_nodes"] == []
+    assert "validation_delta" not in response.to_dict()
+    assert result.state is state
+    assert await harness.sessions.list_composition_proposals(UUID(harness.session_id)) == []
+
+
+@pytest.mark.asyncio
+async def test_equal_incremental_edit_stages_required_controls_before_hash_comparison(tmp_path: Path) -> None:
+    from elspeth.web.composer.tools import execute_tool
+    from tests.integration.web.composer.test_freeform_required_controls import _incremental_textract_state, _required_textract_policy
+
+    harness = _harness(tmp_path)
+    view, snapshot = _required_textract_policy(tmp_path)
+    incomplete, output = await _incremental_textract_state(tmp_path, harness=harness, view=view, snapshot=snapshot)
+    completed = execute_tool(
+        "set_output",
+        output,
+        incomplete,
+        view,
+        plugin_snapshot=snapshot,
+        data_dir=str(tmp_path),
+        session_engine=harness.engine,
+        session_id=harness.session_id,
+        user_id="proposal-prevalidation-user",
+        validate_arguments=True,
+        require_data_dir_for_paths=True,
+        raise_schema_argument_errors=True,
+    )
+    assert completed.success is True
+    assert completed.validation.is_valid is True
+    state = completed.updated_state
+    assert not any(node.plugin.startswith("aws_bedrock_") for node in state.nodes)
+    llm = _ScriptedLLM(
+        _tool_turn("call_controls", "set_metadata", {"patch": {}}),
+        _fake_llm_response(content="Required controls await approval."),
+    )
+    with (
+        patch.object(harness.service._policy_context, "build", return_value=(snapshot, view)),
+        patch.object(harness.service._provider_gateway, "_call_llm", new=llm),
+    ):
+        result = await harness.service.compose(
+            "Keep metadata and prepare required controls.",
+            [],
+            state,
+            session_id=harness.session_id,
+            user_id="proposal-prevalidation-user",
+            user_message_id=harness.user_message_id,
+        )
+    assert result.state is state
+    proposals = await harness.sessions.list_composition_proposals(UUID(harness.session_id))
+    assert len(proposals) == 1
+    assert proposals[0].tool_name == "set_pipeline"
+    authority = deep_thaw(proposals[0].arguments_json)
+    assert authority["authority_kind"] == "owned_composition_state.v1"
+    assert {node["plugin"] for node in authority["nodes"]} >= {"aws_bedrock_prompt_shield", "aws_bedrock_content_safety"}
+    assert any(INTERPRETATION_REQUIREMENTS_KEY in node["options"] for node in authority["nodes"])
+
+
+@pytest.mark.asyncio
+async def test_canonical_source_order_change_remains_stageable(tmp_path: Path) -> None:
+    harness = _harness(tmp_path)
+    arguments = _valid_pipeline_args(tmp_path)
+    source = arguments.pop("source")
+    arguments["sources"] = {"orders": source, "refunds": {**source, "on_success": "refunds_out"}}
+    arguments["outputs"].append(
+        {
+            **arguments["outputs"][0],
+            "sink_name": "refunds_out",
+            "options": {**arguments["outputs"][0]["options"], "path": str(tmp_path / "outputs" / harness.session_id / "refunds.jsonl")},
+        }
+    )
+    state = CompositionState.from_dict(
+        {
+            **arguments,
+            "version": 4,
+            "metadata": {"description": "", **arguments["metadata"]},
+            "outputs": [{"name": output["sink_name"], **output} for output in arguments["outputs"]],
+        }
+    )
+    arguments["sources"] = dict(reversed(tuple(arguments["sources"].items())))
+    llm = _ScriptedLLM(_tool_turn("call_reorder", "set_pipeline", arguments), _fake_llm_response(content="Order change awaits approval."))
+    with patch.object(harness.service._provider_gateway, "_call_llm", new=llm):
+        result = await harness.service.compose(
+            "Change the source order.",
+            [],
+            state,
+            session_id=harness.session_id,
+            user_id="proposal-prevalidation-user",
+            user_message_id=harness.user_message_id,
+        )
+    assert result.state is state
+    proposals = await harness.sessions.list_composition_proposals(UUID(harness.session_id))
+    assert len(proposals) == 1
+    assert tuple(proposals[0].arguments_json["sources"]) == ("refunds", "orders")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", ("update_blob", "delete_blob"))
+async def test_durable_blob_mutations_are_staged_without_executing_preview(tmp_path: Path, tool_name: str) -> None:
+    from tests.helpers.session_fences import fenced_operation_context
+
+    harness = _harness(tmp_path)
+    state = _incremental_base_state(tmp_path)
+    with fenced_operation_context(harness.engine, harness.session_id, operation_kind=SessionOperationKind.CREATE) as operation:
+        blob = await BlobServiceImpl(harness.engine, tmp_path).create_blob(
+            UUID(harness.session_id),
+            "retained.txt",
+            b"original bytes",
+            "text/plain",
+            session_operation_context=operation,
+        )
+    arguments = {"blob_id": str(blob.id)}
+    if tool_name == "update_blob":
+        arguments["content"] = "replacement bytes"
+    llm = _ScriptedLLM(_tool_turn("call_durable", tool_name, arguments), _fake_llm_response(content="The blob change awaits approval."))
+    with (
+        patch.object(harness.service._provider_gateway, "_call_llm", new=llm),
+        patch("elspeth.web.composer.tool_batch.execute_tool", side_effect=AssertionError("Durable tool must never be previewed")),
+    ):
+        result = await harness.service.compose(
+            "Review this blob change.",
+            [],
+            state,
+            session_id=harness.session_id,
+            user_id="proposal-prevalidation-user",
+            user_message_id=harness.user_message_id,
+        )
+    assert result.state is state
+    assert len(result.tool_invocations) == 1
+    assert Path(blob.storage_path).read_bytes() == b"original bytes"
+    proposals = await harness.sessions.list_composition_proposals(UUID(harness.session_id))
+    assert [proposal.tool_name for proposal in proposals] == [tool_name]
+    assert _count_rows(harness.engine, blobs_table) == 1
+
+
+@pytest.mark.asyncio
+async def test_inline_same_text_with_new_blob_authority_is_a_real_change(tmp_path: Path) -> None:
+    harness = _harness(tmp_path)
+    state = _incremental_base_state(tmp_path)
+    arguments = _inline_pipeline_args(tmp_path)
+    candidates = []
+
+    def record_candidate(*args: Any, **kwargs: Any) -> Any:
+        candidate = real_build_set_pipeline_candidate(*args, **kwargs)
+        candidates.append(candidate)
+        return candidate
+
+    first_llm = _ScriptedLLM(_tool_turn("call_first_inline", "set_pipeline", arguments), _fake_llm_response(content="Ready for review."))
+    with (
+        patch.object(harness.service._provider_gateway, "_call_llm", new=first_llm),
+        patch("elspeth.web.composer.tool_batch.build_set_pipeline_candidate", side_effect=record_candidate),
+    ):
+        await harness.service.compose(
+            "Prepare inline data.",
+            [],
+            state,
+            session_id=harness.session_id,
+            user_id="proposal-prevalidation-user",
+            user_message_id=harness.user_message_id,
+        )
+    current = candidates[-1].result.updated_state
+    assert candidates[-1].acceptable
+    first_proposals = await harness.sessions.list_composition_proposals(UUID(harness.session_id))
+    assert len(first_proposals) == 1
+    original_blob_id = first_proposals[0].arguments_json["source"]["blob_id"]
+    arguments["source"]["inline_blob"]["filename"] = "new-authority.csv"
+    second_llm = _ScriptedLLM(
+        _tool_turn("call_new_inline_authority", "set_pipeline", arguments), _fake_llm_response(content="Ready for review.")
+    )
+    with patch.object(harness.service._provider_gateway, "_call_llm", new=second_llm):
+        result = await harness.service.compose(
+            "Prepare another inline artifact with identical content.",
+            [],
+            current,
+            session_id=harness.session_id,
+            user_id="proposal-prevalidation-user",
+            user_message_id=harness.user_message_id,
+        )
+    proposals = await harness.sessions.list_composition_proposals(UUID(harness.session_id))
+    assert len(proposals) == 2
+    second = next(proposal for proposal in proposals if proposal.tool_call_id == "call_new_inline_authority")
+    assert second.arguments_json["source"]["blob_id"] != original_blob_id
+    assert result.state is current
+    with harness.engine.connect() as conn:
+        rows = conn.execute(select(blobs_table.c.content_hash, blobs_table.c.storage_path)).all()
+    assert len(rows) == 2
+    assert rows[0].content_hash == rows[1].content_hash
+    assert Path(rows[0].storage_path).read_bytes() == Path(rows[1].storage_path).read_bytes()
 
 
 @pytest.mark.asyncio
