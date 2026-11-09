@@ -720,7 +720,7 @@ def _finalize_staged_blob_deletion(stage: _StagedBlobDeletion) -> None:
     _remove_blob_temp_artifacts(stage.storage)
 
 
-def _atomic_blob_deletion_stage(
+def _validated_atomic_blob_deletion_paths(
     obligation: BlobAtomicDeletionObligation,
     *,
     data_dir: Path,
@@ -742,9 +742,18 @@ def _atomic_blob_deletion_stage(
             or _LOWERCASE_UUID_HEX.fullmatch(tombstone_suffix) is None
         ):
             raise AuditIntegrityError(f"Blob deletion cleanup tombstone path escapes blob custody: {tombstone}")
-    if storage.exists() or storage.is_symlink():
-        raise AuditIntegrityError("committed atomic deletion unexpectedly retained canonical bytes")
     return _StagedBlobDeletion(storage=storage, tombstone=tombstone)
+
+
+def _atomic_blob_deletion_stage(
+    obligation: BlobAtomicDeletionObligation,
+    *,
+    data_dir: Path,
+) -> _StagedBlobDeletion:
+    stage = _validated_atomic_blob_deletion_paths(obligation, data_dir=data_dir)
+    if stage.storage.exists() or stage.storage.is_symlink():
+        raise AuditIntegrityError("committed atomic deletion unexpectedly retained canonical bytes")
+    return stage
 
 
 def _registered_blob_deletion_stage(
@@ -2892,10 +2901,100 @@ class BlobServiceImpl:
         return storage, tombstone, temp
 
     @staticmethod
-    def _require_exact_deletion_bytes(path: Path, plan: BlobDeletionPlan) -> None:
-        if not _regular_custody_file_exists(path):
-            raise AuditIntegrityError(f"blob deletion expected exact bytes at {path}")
-        data = path.read_bytes()
+    def _read_deletion_content(path: Path, *, directory_fd: int) -> bytes | None:
+        if not _regular_custody_file_exists(path, directory_fd=directory_fd):
+            return None
+        descriptor = os.open(path.name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory_fd)
+        with os.fdopen(descriptor, "rb") as source:
+            if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                raise AuditIntegrityError("blob deletion artifact changed to a nonregular file")
+            return source.read()
+
+    def _observe_blob_deletion_content(self, record: BlobRecord) -> tuple[bool, int | None, str | None]:
+        """Observe the direct driver's deliberate absent-file evidence safely."""
+        storage = Path(record.storage_path)
+        if storage != self._storage_path(str(record.session_id), str(record.id), record.filename):
+            raise AuditIntegrityError("blob deletion storage escaped exact custody")
+        with _inline_custody_directory_fds(storage, session_id=str(record.session_id), create=False) as descriptors:
+            data = None if descriptors is None else self._read_deletion_content(storage, directory_fd=descriptors[1])
+            if descriptors is not None:
+                self._require_stable_deletion_directory(storage, descriptors)
+        if data is None:
+            return False, None, None
+        digest = content_hash(data)
+        if record.size_bytes != len(data):
+            raise AuditIntegrityError("blob deletion bytes disagree with recorded size")
+        if record.content_hash is not None and not hmac.compare_digest(record.content_hash, digest):
+            raise BlobIntegrityError(str(record.id), expected=record.content_hash, actual=digest)
+        return True, len(data), digest
+
+    @staticmethod
+    def _require_stable_deletion_directory(storage: Path, descriptors: tuple[int, int]) -> None:
+        _require_stable_custody_root(storage.parent.parent, descriptors[0])
+        _require_stable_custody_session(
+            descriptors[0], session_name=storage.parent.name, descriptor=descriptors[1], session_dir=storage.parent
+        )
+
+    def _require_blob_deletion_recovery_content(self, plan: BlobDeletionPlan | BlobAtomicDeletionObligation) -> None:
+        """Validate interrupted evidence without staging, restoring or purging."""
+        paths: tuple[Path, ...]
+        if isinstance(plan, BlobAtomicDeletionObligation):
+            stage = _validated_atomic_blob_deletion_paths(plan, data_dir=self._data_dir)
+            storage, tombstone = stage.storage, stage.tombstone
+            paths = (storage,) if tombstone is None else (storage, tombstone)
+        else:
+            storage, tombstone, temporary = self._validated_blob_deletion_paths(plan)
+            paths = (storage, tombstone, temporary, storage.with_name(f".{storage.name}.custody.tmp"))
+        with _inline_custody_directory_fds(storage, session_id=str(plan.session_id), create=False) as descriptors:
+            observed = tuple(
+                False if descriptors is None else _regular_custody_file_exists(path, directory_fd=descriptors[1]) for path in paths
+            )
+            canonical_present = observed[0]
+            tombstone_present = tombstone is not None and len(observed) > 1 and observed[1]
+            if isinstance(plan, BlobAtomicDeletionObligation):
+                if canonical_present:
+                    raise AuditIntegrityError("committed atomic deletion unexpectedly retained canonical bytes")
+                if descriptors is not None:
+                    self._require_stable_deletion_directory(storage, descriptors)
+                return
+            if plan.phase == "purge_pending":
+                if canonical_present:
+                    raise AuditIntegrityError("committed blob deletion unexpectedly retained canonical bytes")
+            else:
+                self._require_uncommitted_deletion_presence(plan, canonical_present=canonical_present, tombstone_present=tombstone_present)
+            if descriptors is not None:
+                for path, present in ((storage, canonical_present), (tombstone, tombstone_present)):
+                    if path is not None and present:
+                        data = self._read_deletion_content(path, directory_fd=descriptors[1])
+                        if data is None:
+                            raise AuditIntegrityError(f"blob deletion expected exact bytes at {path}")
+                        self._require_deletion_content_evidence(data, plan)
+                self._require_stable_deletion_directory(storage, descriptors)
+
+    @staticmethod
+    def _require_uncommitted_deletion_presence(plan: BlobDeletionPlan, *, canonical_present: bool, tombstone_present: bool) -> None:
+        if plan.expected_file_present:
+            if canonical_present and tombstone_present:
+                raise AuditIntegrityError(
+                    "blob deletion found both canonical and tombstone bytes"
+                    if plan.phase == "intent"
+                    else "staged blob deletion has ambiguous filesystem state"
+                )
+            if not canonical_present and not tombstone_present:
+                raise AuditIntegrityError(
+                    "blob deletion lost both canonical and tombstone bytes"
+                    if plan.phase == "intent"
+                    else "staged blob deletion has ambiguous filesystem state"
+                )
+        elif canonical_present or tombstone_present:
+            raise AuditIntegrityError(
+                "blob deletion found bytes for an absent-file ledger"
+                if plan.phase == "intent"
+                else "staged absent-file deletion unexpectedly found bytes"
+            )
+
+    @staticmethod
+    def _require_deletion_content_evidence(data: bytes, plan: BlobDeletionPlan) -> None:
         actual_hash = content_hash(data)
         if (
             plan.expected_file_size is None
@@ -2903,11 +3002,14 @@ class BlobServiceImpl:
             or len(data) != plan.expected_file_size
             or not hmac.compare_digest(actual_hash, plan.expected_file_hash)
         ):
-            raise BlobIntegrityError(
-                str(plan.blob_id),
-                expected=plan.expected_file_hash or "<absent>",
-                actual=actual_hash,
-            )
+            raise BlobIntegrityError(str(plan.blob_id), expected=plan.expected_file_hash or "<absent>", actual=actual_hash)
+
+    @staticmethod
+    def _require_exact_deletion_bytes(path: Path, plan: BlobDeletionPlan) -> None:
+        if not _regular_custody_file_exists(path):
+            raise AuditIntegrityError(f"blob deletion expected exact bytes at {path}")
+        data = path.read_bytes()
+        BlobServiceImpl._require_deletion_content_evidence(data, plan)
 
     def _read_blob_deletion_plan(
         self,
@@ -2942,9 +3044,8 @@ class BlobServiceImpl:
         storage, tombstone, _temp = self._validated_blob_deletion_paths(plan)
         self._session_operation_authority.compare_and_swap(context)
         try:
+            self._require_uncommitted_deletion_presence(plan, canonical_present=storage.exists(), tombstone_present=tombstone.exists())
             if plan.expected_file_present:
-                if storage.exists() and tombstone.exists():
-                    raise AuditIntegrityError("blob deletion found both canonical and tombstone bytes")
                 if storage.exists():
                     self._require_exact_deletion_bytes(storage, plan)
                     self._session_operation_authority.compare_and_swap(context)
@@ -2952,10 +3053,6 @@ class BlobServiceImpl:
                     _fsync_parent_directory(storage.parent)
                 elif tombstone.exists():
                     self._require_exact_deletion_bytes(tombstone, plan)
-                else:
-                    raise AuditIntegrityError("blob deletion lost both canonical and tombstone bytes")
-            elif storage.exists() or tombstone.exists():
-                raise AuditIntegrityError("blob deletion found bytes for an absent-file ledger")
             self._session_operation_authority.compare_and_swap(context)
         except Exception as exc:
             self._restore_and_abort_blob_deletion(
@@ -3030,17 +3127,14 @@ class BlobServiceImpl:
     ) -> BlobDeletionPlan:
         storage, tombstone, _temp = self._validated_blob_deletion_paths(plan)
         self._session_operation_authority.compare_and_swap(context)
+        self._require_uncommitted_deletion_presence(plan, canonical_present=storage.exists(), tombstone_present=tombstone.exists())
         if plan.expected_file_present:
             if storage.exists() and not tombstone.exists():
                 self._require_exact_deletion_bytes(storage, plan)
                 self._session_operation_authority.compare_and_swap(context)
                 os.replace(storage, tombstone)
                 _fsync_parent_directory(storage.parent)
-            elif storage.exists() or not tombstone.exists():
-                raise AuditIntegrityError("staged blob deletion has ambiguous filesystem state")
             self._require_exact_deletion_bytes(tombstone, plan)
-        elif storage.exists() or tombstone.exists():
-            raise AuditIntegrityError("staged absent-file deletion unexpectedly found bytes")
         self._session_operation_authority.compare_and_swap(context)
         try:
             return self._session_operation_authority.mutate(
@@ -3174,21 +3268,8 @@ class BlobServiceImpl:
                 raise BlobNotFoundError(str(blob_id)) from None
             if str(record.session_id) != context.fence.session_id:
                 raise AuditIntegrityError("fenced blob delete lost session custody")
+            expected_file_present, expected_file_size, expected_file_hash = self._observe_blob_deletion_content(record)
             storage = Path(record.storage_path)
-            expected_storage = self._storage_path(str(record.session_id), str(record.id), record.filename)
-            if storage != expected_storage:
-                raise AuditIntegrityError("blob deletion storage escaped exact custody")
-            expected_file_present = storage.exists()
-            expected_file_size: int | None = None
-            expected_file_hash: str | None = None
-            if expected_file_present:
-                data = storage.read_bytes()
-                expected_file_size = len(data)
-                expected_file_hash = content_hash(data)
-                if record.size_bytes != expected_file_size:
-                    raise AuditIntegrityError("blob deletion bytes disagree with recorded size")
-                if record.content_hash is not None and not hmac.compare_digest(record.content_hash, expected_file_hash):
-                    raise BlobIntegrityError(str(blob_id), expected=record.content_hash, actual=expected_file_hash)
             operation_token = _blob_operation_path_token(
                 operation_id=context.fence.operation_id,
                 operation_epoch=context.fence.operation_epoch,

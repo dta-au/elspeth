@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -22,6 +23,7 @@ from elspeth.web.auth.models import UserIdentity
 from elspeth.web.blobs.protocol import BlobRecord
 from elspeth.web.blobs.service import BlobServiceImpl
 from elspeth.web.composer.progress import ComposerProgressRegistry
+from elspeth.web.composer.tools.blobs import admit_blob_mutation
 from elspeth.web.config import WebSettings
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.middleware.rate_limit import ComposerRateLimiter
@@ -43,6 +45,7 @@ from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.identities import ensure_test_identity, wire_test_pipeline_user_authority
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
+from tests.unit.web.blobs.test_mutation_admission import _context, _empty_state, _resources
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 
@@ -196,7 +199,32 @@ async def _save_composition_state(
         await service._run_sync(service.session_operation_authority.release, context)
 
 
-def test_accept_update_blob_proposal_commits_without_composition_state_delta(tmp_path: Path) -> None:
+def _admit_test_blob_effect(service, blob_service, session_id, tmp_path, tool_name, arguments, user_message_id=None):
+    operation = service.session_operation_authority.acquire(
+        session_id=session_id,
+        operation_kind=SessionOperationKind.COMPOSE,
+        owner_instance_id=service.session_operation_owner_instance_id,
+        lease_seconds=120,
+    )
+    try:
+        context = replace(
+            _context(blob_service, service._engine, operation, tmp_path),
+            user_message_id=str(user_message_id) if user_message_id else None,
+            composer_model_identifier="openai/gpt-5-mini",
+            composer_model_version="gpt-5-mini-2026-05-01",
+            composer_provider="openai",
+            composer_skill_hash=fake_sha256("composer-skill"),
+            tool_arguments_hash=stable_hash(arguments),
+        )
+        before = _resources(service._engine, tmp_path / "blobs")
+        assert admit_blob_mutation(tool_name, arguments, _empty_state(), context) is None
+        assert _resources(service._engine, tmp_path / "blobs") == before
+    finally:
+        service.session_operation_authority.release(operation)
+
+
+@pytest.mark.parametrize("content", ["approved content", "original content"])
+def test_accept_update_blob_proposal_commits_without_composition_state_delta(tmp_path: Path, content: str) -> None:
     app, service = _make_app(tmp_path)
     blob_service = BlobServiceImpl(
         service._engine,
@@ -230,7 +258,8 @@ def test_accept_update_blob_proposal_commits_without_composition_state_delta(tmp
             content=b"original content",
         )
     )
-    arguments = {"blob_id": str(blob.id), "content": "approved content"}
+    arguments = {"blob_id": str(blob.id), "content": content}
+    _admit_test_blob_effect(service, blob_service, session_id, tmp_path, "update_blob", arguments, user_message.id)
     proposal = asyncio.run(
         _create_test_proposal(
             service,
@@ -259,10 +288,13 @@ def test_accept_update_blob_proposal_commits_without_composition_state_delta(tmp
     body = response.json()
     assert body["status"] == "committed"
     assert body["committed_state_id"] == str(state_record.id)
-    assert Path(blob.storage_path).read_text(encoding="utf-8") == "approved content"
+    assert Path(blob.storage_path).read_text(encoding="utf-8") == content
     persisted = asyncio.run(service.get_current_state(session_id))
     assert persisted is not None
     assert persisted.id == state_record.id
+    assert client.post(f"/api/sessions/{session_id}/proposals/{proposal.id}/accept").status_code == 200
+    with service._engine.connect() as connection:
+        assert len(connection.execute(select(proposal_blob_effect_receipts_table)).all()) == 1
 
 
 def test_accept_update_blob_proposal_remains_blocked_by_second_pending_reference(tmp_path: Path) -> None:
@@ -364,6 +396,7 @@ def test_accept_delete_blob_proposal_commits_without_composition_state_delta(tmp
         )
     )
     arguments = {"blob_id": str(blob.id)}
+    _admit_test_blob_effect(service, blob_service, session_id, tmp_path, "delete_blob", arguments)
     proposal = asyncio.run(
         _create_test_proposal(
             service,

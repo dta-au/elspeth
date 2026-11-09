@@ -174,6 +174,7 @@ from elspeth.web.composer.tools import (
 )
 from elspeth.web.composer.tools._common import _candidate_rejection_result, _saved_graph_rejection_result
 from elspeth.web.composer.tools._registry import resolve_tool_effects, response_contract_for
+from elspeth.web.composer.tools.blobs import admit_blob_mutation
 from elspeth.web.composer.tools.declarations import EffectDomain
 from elspeth.web.composer.tools.generation import MalformedSourceProofClaim, _admit_source_proof_claims
 from elspeth.web.composer.tools.sessions import ADVISOR_TRIGGER_CANNOT_COMPLETE, RequestAdvisorHintArgumentsModel
@@ -2088,6 +2089,46 @@ async def run_tool_batch(
                             redacted_arguments = None
 
             proposal_redacted_arguments = redacted_arguments
+            if redacted_arguments is not None and tool_name in {"update_blob", "delete_blob"}:
+                try:
+                    blob_admission = await run_sync_in_worker(
+                        admit_blob_mutation,
+                        tool_name,
+                        arguments,
+                        state,
+                        ToolContext(
+                            catalog=ctx.policy_catalog,
+                            plugin_snapshot=ctx.plugin_snapshot,
+                            data_dir=ctx.custody.data_dir,
+                            require_data_dir_for_paths=True,
+                            session_engine=ctx.custody.session_engine,
+                            session_id=session_id,
+                            session_operation_context=ctx.session_operation_context,
+                            session_operation_authority=ctx.session_operation_authority,
+                            max_blob_storage_per_session_bytes=ctx.custody.max_blob_storage_per_session_bytes,
+                            user_message_id=user_message_id,
+                            user_message_content=user_message_content,
+                            composer_model_identifier=ctx.provenance.model_identifier,
+                            composer_model_version=provider_model_version,
+                            composer_provider=ctx.provenance.provider or "unknown",
+                            composer_skill_hash=ctx.provenance.skill_hash,
+                            tool_arguments_hash=audit.binding_arguments_hash,
+                        ),
+                    )
+                    if blob_admission is not None:
+                        unapplied_admission = _unapplied_admission(
+                            blob_admission,
+                            "refused",
+                            state=state,
+                            validation=last_validation
+                            if last_validation is not None
+                            else ctx.policy_catalog.validate_composition_state(state).validation,
+                            runtime_preflight=last_runtime_preflight,
+                        )
+                        proposal_redacted_arguments = None
+                except BaseException as exc:
+                    preproposal_exception = exc
+                    proposal_redacted_arguments = None
             if (
                 redacted_arguments is not None
                 and tool_name != "set_pipeline"

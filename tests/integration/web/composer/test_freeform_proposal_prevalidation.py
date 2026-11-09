@@ -1630,7 +1630,9 @@ async def test_unapplied_incremental_feedback_then_repair_stages_once(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("call_kind", ("noop", "refusal", "argument", "at-cap-noop", "at-cap-refusal", "change", "inline"))
+@pytest.mark.parametrize(
+    "call_kind", ("noop", "refusal", "argument", "at-cap-noop", "at-cap-refusal", "at-cap-blob-refusal", "change", "inline")
+)
 async def test_proposal_cap_counts_only_admitted_changes(tmp_path: Path, call_kind: str) -> None:
     harness = _harness(tmp_path)
     state = _incremental_base_state(tmp_path)
@@ -1648,6 +1650,8 @@ async def test_proposal_cap_counts_only_admitted_changes(tmp_path: Path, call_ki
         tool_name, arguments = "set_metadata", {"patch": "invalid"}
     if call_kind == "inline":
         tool_name, arguments = "set_pipeline", _inline_pipeline_args(tmp_path)
+    if call_kind == "at-cap-blob-refusal":
+        tool_name, arguments = "delete_blob", {"blob_id": str(uuid4())}
     calls.extend({"id": f"call_tail_{i}", "name": tool_name, "arguments": arguments} for i in range(1 if at_cap else 11))
     llm = _ScriptedLLM(_fake_llm_response(tool_calls=tuple(calls)), _fake_llm_response(content="Done."))
     with patch.object(harness.service._provider_gateway, "_call_llm", new=llm):
@@ -2156,7 +2160,10 @@ async def test_canonical_source_order_change_remains_stageable(tmp_path: Path) -
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("tool_name", ("update_blob", "delete_blob"))
-async def test_durable_blob_mutations_are_staged_without_executing_preview(tmp_path: Path, tool_name: str) -> None:
+@pytest.mark.parametrize("content", ("replacement bytes", "original bytes"))
+async def test_durable_blob_mutations_admit_and_stage_without_executing_effect_handler(
+    tmp_path: Path, tool_name: str, content: str
+) -> None:
     from tests.helpers.session_fences import fenced_operation_context
 
     harness = _harness(tmp_path)
@@ -2171,7 +2178,7 @@ async def test_durable_blob_mutations_are_staged_without_executing_preview(tmp_p
         )
     arguments = {"blob_id": str(blob.id)}
     if tool_name == "update_blob":
-        arguments["content"] = "replacement bytes"
+        arguments["content"] = content
     llm = _ScriptedLLM(_tool_turn("call_durable", tool_name, arguments), _fake_llm_response(content="The blob change awaits approval."))
     with (
         patch.object(harness.service._provider_gateway, "_call_llm", new=llm),
@@ -2191,6 +2198,64 @@ async def test_durable_blob_mutations_are_staged_without_executing_preview(tmp_p
     proposals = await harness.sessions.list_composition_proposals(UUID(harness.session_id))
     assert [proposal.tool_name for proposal in proposals] == [tool_name]
     assert _count_rows(harness.engine, blobs_table) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tool_name,refusal",
+    [(tool, refusal) for tool in ("update_blob", "delete_blob") for refusal in ("nonready", "bound", "missing")]
+    + [("update_blob", "quota")],
+)
+async def test_blob_admission_refuses_known_ineligible_effect_once_without_proposal(tmp_path: Path, tool_name: str, refusal: str) -> None:
+    from sqlalchemy import update
+
+    from tests.helpers.session_fences import fenced_operation_context
+
+    harness = _harness(tmp_path)
+    state = _incremental_base_state(tmp_path)
+    with fenced_operation_context(harness.engine, harness.session_id, operation_kind=SessionOperationKind.CREATE) as operation:
+        blob = await BlobServiceImpl(harness.engine, tmp_path).create_blob(
+            UUID(harness.session_id), "retained.txt", b"original bytes", "text/plain", session_operation_context=operation
+        )
+    if refusal == "nonready":
+        with harness.engine.begin() as connection:
+            connection.execute(update(blobs_table).where(blobs_table.c.id == str(blob.id)).values(status="pending"))
+    elif refusal == "bound":
+        state = replace(
+            state,
+            sources={
+                name: replace(source, options={**source.options, "path": blob.storage_path}) for name, source in state.sources.items()
+            },
+        )
+    elif refusal == "quota":
+        harness.service._settings = harness.service._settings.model_copy(update={"max_blob_storage_per_session_bytes": 15})
+    arguments = {"blob_id": str(uuid4()) if refusal == "missing" else str(blob.id)}
+    if tool_name == "update_blob":
+        arguments["content"] = "replacement bytes"
+    llm = _ScriptedLLM(
+        _tool_turn("call_refused_blob", tool_name, arguments),
+        _tool_turn("call_repair", "set_metadata", {"patch": {"name": "repaired draft"}}),
+        _fake_llm_response(content="The repair awaits approval."),
+    )
+    with patch.object(harness.service._provider_gateway, "_call_llm", new=llm), _record_phase3_outcomes(harness.service) as batches:
+        result = await harness.service.compose(
+            "Review this blob change.",
+            [],
+            state,
+            session_id=harness.session_id,
+            user_id="proposal-prevalidation-user",
+            user_message_id=harness.user_message_id,
+        )
+    proposals = await harness.sessions.list_composition_proposals(UUID(harness.session_id))
+    assert [proposal.tool_call_id for proposal in proposals] == ["call_repair"]
+    feedback = [message for message in llm.message_snapshots[1] if message.get("tool_call_id") == "call_refused_blob"]
+    assert len(feedback) == 1
+    assert json.loads(feedback[0]["content"])["success"] is False
+    outcomes = [outcome for batch in batches for outcome in batch if outcome.call.function.name == tool_name]
+    assert len(outcomes) == 1
+    assert outcomes[0].pre_version == outcomes[0].post_version == state.version
+    assert result.state is state
+    assert Path(blob.storage_path).read_bytes() == b"original bytes"
 
 
 @pytest.mark.asyncio

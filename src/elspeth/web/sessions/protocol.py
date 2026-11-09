@@ -25,6 +25,7 @@ from elspeth.contracts.blobs import (
     BlobCreationObligation,
     BlobDeletionPlan,
     BlobForkPlanEntry,
+    BlobMutationObservation,
     BlobRecord,
     BlobReplacementPlan,
     BlobRunLinkDirection,
@@ -2168,6 +2169,22 @@ class SessionOperationBlobMutations(Protocol):
     """Blob/run-custody mutations available inside one exact operation fence."""
 
     def read_blob(self, *, blob_id: UUID) -> BlobRecord: ...
+
+    def inspect_blob_mutation(self, *, blob_id: UUID, tool_name: Literal["update_blob", "delete_blob"]) -> BlobMutationObservation: ...
+
+    def admit_blob_replacement(
+        self, *, expected: BlobRecord, replacement: BlobRecord, max_storage_per_session: int, accepting_proposal_id: UUID | None
+    ) -> None: ...
+
+    def admit_blob_deletion(
+        self,
+        *,
+        expected: BlobRecord,
+        expected_file_present: bool,
+        expected_file_size: int | None,
+        expected_file_hash: str | None,
+        accepting_proposal_id: UUID | None,
+    ) -> None: ...
 
     def prepare_blob_replacement(
         self,
