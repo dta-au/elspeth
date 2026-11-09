@@ -1792,3 +1792,56 @@ class TestPublicProjectionRemovesNodeBlobMarkers:
         assert f"{PUBLIC_EXPORT_REDACTED_NODE_MARKER_PREFIX}lookup stripped=blob-linkage" in header
         assert _NODE_MARKER_BLOB_ID not in header
         assert _NODE_MARKER_SHA256 not in header
+
+
+_BLOB_ROWS_BLOB_ID = "33333333-3333-4333-8333-333333333333"
+_BLOB_ROWS_PAYLOAD_REF = "ef" * 32
+
+
+class TestPublicProjectionRemovesBlobRowsEntries:
+    """A ``blob_rows`` source's file entries leave the public projection whole.
+
+    Each entry carries the file's ``payload_ref`` (its sha256), filename, MIME
+    type and size. Dropping only ``blob_id`` leaked all of that and reported
+    nothing.
+    """
+
+    @staticmethod
+    def _state() -> CompositionState:
+        return CompositionState(
+            source=SourceSpec(
+                plugin="blob_rows",
+                on_success="out",
+                options={
+                    "blobs": [
+                        {
+                            "blob_id": _BLOB_ROWS_BLOB_ID,
+                            "payload_ref": _BLOB_ROWS_PAYLOAD_REF,
+                            "filename": "a.csv",
+                            "mime_type": "text/csv",
+                            "size_bytes": 10,
+                        }
+                    ]
+                },
+                on_validation_failure="discard",
+            ),
+            nodes=(),
+            edges=(),
+            outputs=(OutputSpec(name="out", plugin="json", options={}, on_write_failure="discard"),),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+    def test_blob_rows_entries_are_removed_whole(self) -> None:
+        public = generate_public_composition_dict(self._state())
+
+        assert public["sources"]["source"]["options"] == {}
+
+    def test_no_payload_ref_reaches_public_yaml(self) -> None:
+        rendered = generate_public_yaml(self._state())
+
+        assert _BLOB_ROWS_PAYLOAD_REF not in rendered
+        assert "a.csv" not in rendered
+
+    def test_redaction_reports_blobs_for_the_source(self) -> None:
+        assert public_export_redaction(self._state())["sources"] == {"source": ["blobs"]}

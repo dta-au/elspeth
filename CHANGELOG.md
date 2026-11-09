@@ -110,6 +110,12 @@ establish qualification, a published tag or an image.
   refuses a leftover fragment with guidance to re-attach the file. Re-importing
   such an export reports the missing option; attaching files to transforms on
   import is not yet supported.
+- **Shared, published and exported graphs no longer carry a `blob_rows`
+  source's file entries.** The public projection previously dropped only each
+  entry's `blob_id`, leaving the file's digest (`payload_ref`), filename, MIME
+  type and size, and reported nothing. The whole `blobs` list is now removed
+  and the redaction account names it (`blobs`, labelled `blob-linkage` in the
+  export header); such sources also count as reading uploaded files.
 
 ### LLM gateway
 

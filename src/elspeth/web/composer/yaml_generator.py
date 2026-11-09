@@ -513,6 +513,8 @@ def _recursive_public_option_projection(
                 continue
             if strip_bind_source_mode and key == "mode" and nested == "bind_source":
                 continue
+            if strip_bind_source_mode and key in _PUBLIC_SOURCE_BLOB_ENTRY_KEYS:
+                continue
             child_path = f"{path}.{key}" if path else str(key)
             if isinstance(nested, Mapping) and "blob_ref" in nested:
                 if removed_blob_markers is not None:
@@ -640,7 +642,12 @@ PUBLIC_EXPORT_NODE_REBIND_GUIDANCE = (
     "attach it to the named option again after import."
 )
 
-_PUBLIC_SOURCE_LINKAGE_KEYS = frozenset({"blob_ref", "blob_id"})
+# Source top level only (the ``strip_bind_source_mode`` call): a ``blob_rows``
+# source's ``blobs`` list holds file entries (payload_ref digest, filename,
+# MIME type, size). Deliberately NOT in ``_PUBLIC_RECURSIVE_FORBIDDEN_OPTION_KEYS``,
+# which would also strip unrelated plugin keys named ``blobs`` at any depth.
+_PUBLIC_SOURCE_BLOB_ENTRY_KEYS = frozenset({"blobs"})
+_PUBLIC_SOURCE_LINKAGE_KEYS = frozenset({"blob_ref", "blob_id"}) | _PUBLIC_SOURCE_BLOB_ENTRY_KEYS
 
 
 def public_export_redaction(state: CompositionState) -> PublicExportRedaction:
@@ -699,6 +706,7 @@ _MARKER_LABELS = {
     "persist_directory": "persist-directory",
     "blob_ref": "blob-linkage",
     "blob_id": "blob-linkage",
+    "blobs": "blob-linkage",
 }
 
 
