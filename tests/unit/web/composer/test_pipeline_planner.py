@@ -729,8 +729,8 @@ def _model(completion: _ScriptedCompletion, **overrides: object) -> PlannerModel
         "max_tool_calls_per_turn": 3,
         "max_api_attempts": 1,
         "api_retry_base_seconds": 0.0,
-        "discovery_reasoning_effort": "none",
-        "candidate_reasoning_effort": "none",
+        "discovery_reasoning_effort": "low",
+        "candidate_reasoning_effort": "high",
         "tool_contract_dialect": ToolContractDialect.NONE,
         "escape_hatch_tool_contract_dialect": ToolContractDialect.NONE,
     }
@@ -10409,8 +10409,18 @@ async def test_openrouter_models_get_the_native_reasoning_object(
     assert "reasoning_effort" not in sent
 
 
+@pytest.mark.parametrize("field_name", ["discovery_reasoning_effort", "candidate_reasoning_effort"])
+@pytest.mark.parametrize("effort", ["none", "", "extreme"])
+def test_planner_model_config_refuses_an_unhinted_or_unknown_reasoning_effort(field_name: str, effort: str) -> None:
+    """Composer and advisor must be reasoning models: a planner config that
+    would send an unhinted or mis-hinted call is refused at construction,
+    before any provider turn."""
+    with pytest.raises(ValueError, match=field_name):
+        _model(_ScriptedCompletion(), **{field_name: effort})
+
+
 @pytest.mark.asyncio
-async def test_none_reasoning_effort_leaves_planner_kwargs_unhinted(
+async def test_every_planner_request_carries_a_reasoning_hint(
     tmp_path: Path,
     tool_context: ToolContext,
 ) -> None:
@@ -10419,8 +10429,7 @@ async def test_none_reasoning_effort_leaves_planner_kwargs_unhinted(
     await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion)
 
     (sent,) = completion.requests
-    assert "reasoning" not in sent
-    assert "reasoning_effort" not in sent
+    assert sent["reasoning_effort"] == "low"
 
 
 def test_explain_tool_advertisement_is_dropped_once_every_code_is_enriched() -> None:

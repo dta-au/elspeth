@@ -741,3 +741,31 @@ def test_bounds_forbids_extra():
             max_schema_depth=5,
             extra_field=1,
         )
+
+
+# --- ChatRequest: reasoning_effort ------------------------------------------
+
+
+@pytest.mark.parametrize("effort", ["low", "medium", "high"])
+def test_chat_request_accepts_reasoning_effort(effort):
+    """ELSPETH's composer and advisor must be reasoning models and send the
+    chat-completions ``reasoning_effort`` hint on every call."""
+    request = ChatRequest(model="m", messages=[{"role": "user", "content": "hi"}], reasoning_effort=effort)
+    assert request.reasoning_effort == effort
+
+
+def test_chat_request_reasoning_effort_defaults_to_absent():
+    request = ChatRequest(model="m", messages=[{"role": "user", "content": "hi"}])
+    assert request.reasoning_effort is None
+
+
+@pytest.mark.parametrize("effort", ["none", "minimal", "extreme", "", 1])
+def test_chat_request_rejects_reasoning_effort_outside_the_closed_vocabulary(effort):
+    with pytest.raises(ValidationError):
+        ChatRequest(model="m", messages=[{"role": "user", "content": "hi"}], reasoning_effort=effort)
+
+
+def test_chat_request_still_rejects_the_openrouter_reasoning_object():
+    """Only the chat-completions spelling is accepted; one spelling per hint."""
+    with pytest.raises(ValidationError):
+        ChatRequest(model="m", messages=[{"role": "user", "content": "hi"}], reasoning={"effort": "high"})

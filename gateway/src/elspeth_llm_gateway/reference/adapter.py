@@ -25,7 +25,8 @@ Request body POSTed to ``v1/invoke``::
             "target": "<model_target['target']>",
             "temperature": <float>?,
             "seed": <int>?,
-            "max_output": <int>?
+            "max_output": <int>?,
+            "deliberation": "low" | "medium" | "high"?
         },
         "directives": [
             {"operation": "<name>", "about": "<description>", "payload_schema": {...}}
@@ -170,6 +171,7 @@ class ReferenceV1InvokeAdapter:
                     Capability.JSON_SCHEMA,
                     Capability.SEED,
                     Capability.USAGE,
+                    Capability.REASONING,
                 }
             ),
         )
@@ -221,6 +223,12 @@ class ReferenceV1InvokeAdapter:
             generation["seed"] = request.seed
         if request.max_tokens is not None:
             generation["max_output"] = request.max_tokens
+        if request.reasoning_effort is not None:
+            # TRANSLATION POINT: a real agency's reasoning control will differ
+            # from this fictional deliberation level -- an effort enum, a
+            # thinking-token budget, or a model variant. An upstream with no
+            # such control must not declare Capability.REASONING.
+            generation["deliberation"] = request.reasoning_effort
 
         body: dict = {"conversation": conversation, "generation": generation}
 

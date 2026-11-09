@@ -58,9 +58,18 @@ putting this gateway, or any other, into a deployment.
 
 The inbound body is a strict *subset* of Chat Completions: `model`,
 `messages`, `temperature`, `seed`, `max_tokens`, `tools`, `tool_choice`,
-and `response_format`. Anything else — `stream`, `n`, `logprobs`, any
-other unsupported OpenAI field, at any nesting level — is a hard
-`invalid_request` (400), not a silently ignored extra.
+`response_format`, and `reasoning_effort` (`low`, `medium` or `high`).
+Anything else — `stream`, `n`, `logprobs`, any other unsupported OpenAI
+field, at any nesting level — is a hard `invalid_request` (400), not a
+silently ignored extra.
+
+ELSPETH's composer and advisor must be reasoning models and send
+`reasoning_effort` on every request. An adapter declares the `reasoning`
+capability only when its upstream can honour the hint; against an adapter
+that does not declare it, a request carrying the hint is refused with
+`capability_unsupported` rather than forwarded with the hint dropped. A
+derived adapter that does not declare `reasoning` therefore cannot serve
+ELSPETH's composer.
 
 One alias exists: **`max_completion_tokens`**, OpenAI's current spelling of
 `max_tokens`, is accepted and folded into `max_tokens`. This is not

@@ -371,16 +371,9 @@ def test_pinned_thinking_budget_matches_the_installed_litellm() -> None:
 def test_thinking_route_flag_follows_the_sent_request(settings_factory: Any, model: str, loop_unproven: bool) -> None:
     settings = settings_factory(composer_model=model, composer_discovery_reasoning_effort="low")
 
-    assert ("reasoning_effort" in _request(settings, "loop_tools").kwargs) is not model.startswith(("openrouter/", "gpt-"))
+    assert ("reasoning_effort" in _request(settings, "loop_tools").kwargs) is not model.startswith("openrouter/")
     assert _request(settings, "loop_tools").thinking_route_unproven is loop_unproven
     assert _request(settings, "planner_tools").thinking_route_unproven is False
-
-
-def test_thinking_route_flag_is_off_when_reasoning_is_off(settings_factory: Any) -> None:
-    settings = settings_factory(composer_model="anthropic/claude-sonnet-4-6", composer_discovery_reasoning_effort="none")
-
-    assert "reasoning_effort" not in _request(settings, "loop_tools").kwargs
-    assert _request(settings, "loop_tools").thinking_route_unproven is False
 
 
 # --- sessionless qualification --------------------------------------------------

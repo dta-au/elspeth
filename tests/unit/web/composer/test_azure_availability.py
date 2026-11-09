@@ -39,8 +39,6 @@ def test_azure_readiness_uses_provider_credentials(
         shareable_link_signing_key=b"\x00" * 32,
         composer_model=f"{provider}/deployment" if role == "primary" else "openai/gpt-4o",
         composer_advisor_model=f"{provider}/deployment" if role == "advisor" else "openai/gpt-4o",
-        composer_discovery_reasoning_effort="none",
-        composer_advisor_reasoning_effort="none",
     )
     service = ComposerServiceImpl.for_trained_operator(catalog=MagicMock(spec=CatalogService), settings=settings)
     result = compute_availability(

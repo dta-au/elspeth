@@ -64,7 +64,7 @@ LABEL org.opencontainers.image.revision="${GATEWAY_REVISION}" \
     io.elspeth.llm-gateway.adapter-name="reference_v1_invoke" \
     io.elspeth.llm-gateway.adapter-version="0.1.0" \
     io.elspeth.llm-gateway.adapter-api-major="1" \
-    io.elspeth.llm-gateway.adapter-fingerprint="2b195149cd2056ef51bab6cbd19f3da7c629a95eda614614f385e04933846c83"
+    io.elspeth.llm-gateway.adapter-fingerprint="2e0a427f9387a94f732821f28571deb426dd6372adb3a09fa99c01d6270a8b2d"
 
 # PYTHONDONTWRITEBYTECODE: this image runs read-only (no writes outside
 # /tmp); the interpreter must never attempt to write .pyc files next to the

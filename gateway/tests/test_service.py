@@ -597,3 +597,32 @@ async def test_response_hash_is_stable_across_different_request_ids_and_created(
     hashes = [record["response_hash"] for record in records if record.get("status") == "success"]
     assert len(hashes) == 2
     assert hashes[0] == hashes[1]
+
+
+# --- reasoning_effort ------------------------------------------------------------
+
+
+def test_to_canonical_request_carries_reasoning_effort():
+    canonical = to_canonical_request(_chat_request(reasoning_effort="high"), {"target": "backend-a"})
+    assert canonical.reasoning_effort == "high"
+
+
+def test_to_canonical_request_leaves_reasoning_effort_absent_when_unset():
+    canonical = to_canonical_request(_chat_request(), {"target": "backend-a"})
+    assert canonical.reasoning_effort is None
+
+
+@respx.mock
+async def test_reasoning_effort_without_capability_raises_capability_unsupported_before_upstream_call(client):
+    """An adapter that cannot honour a reasoning hint refuses the request
+    loudly; the gateway never forwards the call with the hint dropped."""
+    adapter = FakeAdapter(capabilities=frozenset({Capability.TEXT}))
+    config = _config()
+    service = _service(config, adapter, client)
+    upstream = respx.post(UPSTREAM_URL)
+
+    with pytest.raises(GatewayError) as exc_info:
+        await service.complete(_chat_request(reasoning_effort="medium"), "req-cap-reasoning")
+
+    assert exc_info.value.code == GatewayErrorCode.CAPABILITY_UNSUPPORTED
+    assert not upstream.called

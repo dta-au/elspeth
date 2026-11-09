@@ -473,11 +473,27 @@ def test_openai_prefix_with_an_openrouter_host_resolves_forwarding() -> None:
 # ---------------------------------------------------------------------------
 # OpenAI-compatible chat on a custom base (resolver row 8): ``openai/`` and
 # bare model names. Forwards the stamps; known negative: drops an ECMA-only
-# ``pattern`` that OpenRouter keeps.
+# ``pattern`` that OpenRouter keeps. Composer models must be reasoning models
+# and every call carries ``reasoning_effort``, so the chat rows use GPT-5.1,
+# which LiteLLM keeps on Chat Completions with tools and an explicit effort.
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("model", ["openai/gpt-4.1", "gpt-5.5"])
+@pytest.mark.parametrize("model", ["openai/gpt-5.5", "gpt-5.5"])
+def test_gpt_5_4_plus_name_on_a_custom_base_is_bridged_to_responses(loopback: _Loopback, model: str) -> None:
+    """Characterization: a GPT-5.4+ name on a custom base, with tools and the
+    mandatory reasoning hint, is bridged to ``/v1/responses``. A
+    chat-completions-only endpoint (ELSPETH's own gateway) does not serve it,
+    so the call fails loudly instead of running unhinted."""
+    request = _loop_request(_route_settings(model, f"{loopback.base}/v1", "preferred"))
+    assert request.kwargs["reasoning_effort"] == "low"
+
+    recorded = _send_loopback(loopback, request.kwargs)
+
+    assert recorded.path == "/v1/responses"
+
+
+@pytest.mark.parametrize("model", ["openai/gpt-5.1", "gpt-5.1"])
 def test_openai_compatible_custom_base_forwards_the_stamps(loopback: _Loopback, model: str) -> None:
     """Characterization, row 8 under ``forward_to_endpoint``: 35 ``true`` and 10 ``false`` reach the wire."""
     request = _loop_request(_route_settings(model, f"{loopback.base}/v1", "forward_to_endpoint"))
@@ -491,7 +507,7 @@ def test_openai_compatible_custom_base_forwards_the_stamps(loopback: _Loopback, 
     _assert_openai_strict_stamps(flags)
 
 
-@pytest.mark.parametrize("model", ["openai/gpt-4.1", "gpt-5.5"])
+@pytest.mark.parametrize("model", ["openai/gpt-5.1", "gpt-5.1"])
 def test_openai_compatible_custom_base_preferred_control_sends_no_strict_key(loopback: _Loopback, model: str) -> None:
     """Characterization, row 8 under ``preferred``: a custom endpoint resolves to ``none``; no tool carries ``strict``."""
     request = _loop_request(_route_settings(model, f"{loopback.base}/v1", "preferred"))
@@ -502,7 +518,7 @@ def test_openai_compatible_custom_base_preferred_control_sends_no_strict_key(loo
     _assert_no_strict_key(_strict_flags(_chat_functions(recorded.body)), tool_count=45)
 
 
-@pytest.mark.parametrize("model", ["openai/gpt-4.1", "gpt-5.5"])
+@pytest.mark.parametrize("model", ["openai/gpt-5.1", "gpt-5.1"])
 def test_openai_compatible_chat_drops_an_ecma_only_pattern(loopback: _Loopback, model: str) -> None:
     """Characterization, known negative: the ECMA-only ``pattern`` is removed on the wire.
 
@@ -520,7 +536,7 @@ def test_openai_compatible_chat_drops_an_ecma_only_pattern(loopback: _Loopback, 
     assert parameters["properties"]["x"] == {"type": "string"}
 
 
-@pytest.mark.parametrize("model", ["openai/gpt-4.1", "gpt-5.5"])
+@pytest.mark.parametrize("model", ["openai/gpt-5.1", "gpt-5.1"])
 def test_openai_compatible_chat_keeps_a_plain_pattern(loopback: _Loopback, model: str) -> None:
     """Characterization, the known negative's control: with the ECMA-only escape removed, the pattern is kept."""
     request = _loop_request(_route_settings(model, f"{loopback.base}/v1", "preferred"), extra_tools=(_pattern_tool(_PLAIN_PATTERN),))
@@ -533,7 +549,7 @@ def test_openai_compatible_chat_keeps_a_plain_pattern(loopback: _Loopback, model
 
 # ---------------------------------------------------------------------------
 # Hosted OpenAI (resolver row 7), intercepted with respx: Chat Completions
-# for ``gpt-4.1``, the Responses bridge for ``gpt-5.5`` with tools.
+# for ``gpt-5.1``, the Responses bridge for ``gpt-5.5`` with tools.
 # ---------------------------------------------------------------------------
 
 
@@ -543,7 +559,7 @@ def test_hosted_openai_chat_forwards_the_stamps() -> None:
     The same adapter family as the custom-base chat rows: the synthetic
     ECMA-only ``pattern`` is dropped here too, which OpenRouter keeps.
     """
-    request = _loop_request(_route_settings("gpt-4.1", None, "forward_to_endpoint"), extra_tools=(_pattern_tool(_ECMA_PATTERN),))
+    request = _loop_request(_route_settings("gpt-5.1", None, "forward_to_endpoint"), extra_tools=(_pattern_tool(_ECMA_PATTERN),))
     assert request.transport is StrictTransport.ENFORCING
 
     body = _send_hosted(request.kwargs, _HOSTED_CHAT_URL)
@@ -557,7 +573,7 @@ def test_hosted_openai_chat_forwards_the_stamps() -> None:
 
 def test_hosted_openai_chat_preferred_control_sends_no_strict_key() -> None:
     """Characterization, row 7 under ``preferred`` (ruling 7): ``none``; no tool carries ``strict``."""
-    request = _loop_request(_route_settings("gpt-4.1", None, "preferred"))
+    request = _loop_request(_route_settings("gpt-5.1", None, "preferred"))
     assert request.transport is StrictTransport.NONE
 
     body = _send_hosted(request.kwargs, _HOSTED_CHAT_URL)
@@ -601,29 +617,27 @@ def test_hosted_responses_bridge_writes_strict_null_for_an_unstamped_list(settin
 
 # ---------------------------------------------------------------------------
 # Azure OpenAI (resolver row 9) on a loopback api_base, AZURE_API_VERSION
-# unset: Chat Completions for ``azure/gpt-4.1``, the Responses bridge for
+# unset: Chat Completions for ``azure/gpt-5.1``, the Responses bridge for
 # ``azure/gpt-5.5``. Known negative: Azure chat flattens a root ``oneOf``.
 # ---------------------------------------------------------------------------
 
 
 def _azure_settings(model: str, base: str, setting: str) -> WebSettings:
-    # LiteLLM rejects ``reasoning_effort`` for ``azure/gpt-4.1`` before
-    # sending, and ``apply_reasoning_kwargs`` adds it for any ``azure/``
-    # model at the default discovery effort, so the chat rows use the
-    # operator's opt-out. The bridge rows keep the default.
-    overrides: dict[str, Any] = {"composer_discovery_reasoning_effort": "none"} if model == "azure/gpt-4.1" else {}
-    return _route_settings(model, base, setting, **overrides)
+    # Every composer call carries ``reasoning_effort`` (composer models must
+    # be reasoning models), so the chat rows use ``azure/gpt-5.1``, which
+    # LiteLLM keeps on Chat Completions with tools and an explicit effort.
+    return _route_settings(model, base, setting)
 
 
 def test_azure_chat_forwards_the_stamps(loopback: _Loopback, monkeypatch: pytest.MonkeyPatch) -> None:
     """Characterization, row 9 under ``forward_to_endpoint`` (``ENFORCING``): the stamps reach the deployment's chat path."""
     monkeypatch.delenv("AZURE_API_VERSION", raising=False)
-    request = _loop_request(_azure_settings("azure/gpt-4.1", loopback.base, "forward_to_endpoint"))
+    request = _loop_request(_azure_settings("azure/gpt-5.1", loopback.base, "forward_to_endpoint"))
     assert request.transport is StrictTransport.ENFORCING
 
     recorded = _send_loopback(loopback, request.kwargs)
 
-    assert recorded.path == "/openai/deployments/gpt-4.1/chat/completions"
+    assert recorded.path == "/openai/deployments/gpt-5.1/chat/completions"
     assert recorded.query == {"api-version": ["2025-02-01-preview"]}
     flags = _strict_flags(_chat_functions(recorded.body))
     assert flags == _sent_flags(request.sent_tools)
@@ -633,7 +647,7 @@ def test_azure_chat_forwards_the_stamps(loopback: _Loopback, monkeypatch: pytest
 def test_azure_chat_preferred_control_sends_no_strict_key(loopback: _Loopback, monkeypatch: pytest.MonkeyPatch) -> None:
     """Characterization, row 9 under ``preferred`` (ruling 7): ``none``; no tool carries ``strict``."""
     monkeypatch.delenv("AZURE_API_VERSION", raising=False)
-    request = _loop_request(_azure_settings("azure/gpt-4.1", loopback.base, "preferred"))
+    request = _loop_request(_azure_settings("azure/gpt-5.1", loopback.base, "preferred"))
     assert request.transport is StrictTransport.NONE
 
     recorded = _send_loopback(loopback, request.kwargs)
@@ -651,7 +665,7 @@ def test_azure_chat_flattens_a_root_one_of(loopback: _Loopback, monkeypatch: pyt
     strict tool.
     """
     monkeypatch.delenv("AZURE_API_VERSION", raising=False)
-    request = _loop_request(_azure_settings("azure/gpt-4.1", loopback.base, "preferred"), extra_tools=(_root_one_of_tool(),))
+    request = _loop_request(_azure_settings("azure/gpt-5.1", loopback.base, "preferred"), extra_tools=(_root_one_of_tool(),))
 
     recorded = _send_loopback(loopback, request.kwargs)
 
@@ -662,7 +676,7 @@ def test_azure_chat_flattens_a_root_one_of(loopback: _Loopback, monkeypatch: pyt
 def test_azure_chat_keeps_a_plain_object_root(loopback: _Loopback, monkeypatch: pytest.MonkeyPatch) -> None:
     """Characterization, the known negative's control: without the root ``oneOf`` the parameters are sent unchanged."""
     monkeypatch.delenv("AZURE_API_VERSION", raising=False)
-    request = _loop_request(_azure_settings("azure/gpt-4.1", loopback.base, "preferred"), extra_tools=(_plain_object_tool(),))
+    request = _loop_request(_azure_settings("azure/gpt-5.1", loopback.base, "preferred"), extra_tools=(_plain_object_tool(),))
 
     recorded = _send_loopback(loopback, request.kwargs)
 

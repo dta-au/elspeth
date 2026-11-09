@@ -77,12 +77,13 @@ async def test_text_call_carries_the_discovery_knob(monkeypatch: pytest.MonkeyPa
 
 
 @pytest.mark.asyncio
-async def test_none_opt_out_leaves_calls_unhinted(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+@pytest.mark.parametrize("model", ["openai/gw-alias", "gw-alias"], ids=["openai-prefixed", "bare"])
+async def test_gateway_alias_primary_model_is_hinted(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, model: str) -> None:
+    """An OpenAI-compatible gateway alias carries the hint; the composer no
+    longer drops it for bare or ``openai/`` models (elspeth-9a46553771)."""
     captured = _capture(monkeypatch)
-    await _service(
-        tmp_path, composer_model="anthropic/claude-sonnet-5", composer_discovery_reasoning_effort="none"
-    )._provider_gateway._call_llm([{"role": "user", "content": "hi"}], tools=[])
-    assert "reasoning_effort" not in captured
+    await _service(tmp_path, composer_model=model)._provider_gateway._call_llm([{"role": "user", "content": "hi"}], tools=[])
+    assert captured["reasoning_effort"] == "low"
     assert "reasoning" not in captured
 
 
@@ -126,12 +127,10 @@ async def test_advisor_call_carries_the_advisor_knob(
 
 
 @pytest.mark.asyncio
-async def test_bare_openai_surface_models_stay_unhinted(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """litellm bridges GPT-5.4+ chat calls with tools + reasoning_effort to
-    /v1/responses, which chat-completions-only gateways (including ELSPETH's
-    own, extra="forbid") do not serve — so OpenAI-surface models go unhinted
-    until the gateway contract carries the field (elspeth-9a46553771)."""
+async def test_default_bare_openai_model_is_hinted(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """The default bare ``gpt-5.5`` composer model carries the discovery hint;
+    composer and advisor must be reasoning models (elspeth-9a46553771)."""
     captured = _capture(monkeypatch)
     await _service(tmp_path)._provider_gateway._call_llm([{"role": "user", "content": "hi"}], tools=[])
-    assert "reasoning_effort" not in captured
+    assert captured["reasoning_effort"] == "low"
     assert "reasoning" not in captured

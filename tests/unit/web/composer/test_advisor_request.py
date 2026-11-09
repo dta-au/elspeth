@@ -14,7 +14,7 @@ def test_checkpoint_options_disable_inner_provider_retries(structured_output: bo
         temperature=None,
         seed=None,
         max_tokens=128,
-        reasoning_effort=None,
+        reasoning_effort="medium",
         api_base="https://gateway.example.test/v1",
         api_key="test-token",
         structured_output=structured_output,

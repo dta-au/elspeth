@@ -110,6 +110,7 @@ def to_canonical_request(request: ChatRequest, model_target: dict) -> CanonicalR
         tool_choice=tool_choice,
         tool_choice_function=tool_choice_function,
         response_format=_canonicalize_response_format(request.response_format),
+        reasoning_effort=request.reasoning_effort,
     )
 
 
@@ -131,6 +132,9 @@ def _check_capabilities(request: ChatRequest, capabilities: frozenset[Capability
             raise GatewayError(GatewayErrorCode.CAPABILITY_UNSUPPORTED)
 
     if request.seed is not None and Capability.SEED not in capabilities:
+        raise GatewayError(GatewayErrorCode.CAPABILITY_UNSUPPORTED)
+
+    if request.reasoning_effort is not None and Capability.REASONING not in capabilities:
         raise GatewayError(GatewayErrorCode.CAPABILITY_UNSUPPORTED)
 
 
