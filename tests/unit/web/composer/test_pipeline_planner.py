@@ -9273,7 +9273,10 @@ async def test_aid_supplied_reads_in_one_turn_deliver_results_without_hatch(
     assert completion.requests[1]["model"] == "anthropic/claude-planner"
     tool_results = [json.loads(message["content"]) for message in completion.requests[1]["messages"] if message["role"] == "tool"]
     assert [result["success"] for result in tool_results] == [True, True]
-    assert [invocation.tool_name for invocation in recorder.invocations] == ["list_models", "get_expression_grammar"]
+    # Same-turn discovery calls run as concurrent tasks and each records its
+    # invocation when it finishes, so the recorder holds completion order,
+    # not call order (observed flipped 1 run in 11 locally).
+    assert sorted(invocation.tool_name for invocation in recorder.invocations) == ["get_expression_grammar", "list_models"]
 
 
 @pytest.mark.asyncio
