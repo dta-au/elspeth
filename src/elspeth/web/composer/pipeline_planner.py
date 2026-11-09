@@ -26,7 +26,6 @@ from typing import Any, Final, Literal, NotRequired, Protocol, TypedDict, cast, 
 from uuid import UUID, uuid4
 
 import structlog
-from jsonschema import Draft202012Validator
 from pydantic import BaseModel, ConfigDict
 from pydantic import ValidationError as PydanticValidationError
 from sqlalchemy import Engine
@@ -181,7 +180,7 @@ from elspeth.web.composer.tools.generation import (
     explain_validation_code,
     explain_withheld_validation_code,
 )
-from elspeth.web.composer.tools.schema_contract import canonical_set_pipeline_schema
+from elspeth.web.composer.tools.schema_contract import canonical_set_pipeline_schema, canonical_set_pipeline_validator
 from elspeth.web.composer.tools.sessions import build_set_pipeline_candidate, canonicalize_authored_node_review_requirements
 from elspeth.web.composer.tools.wire_projection import (
     _WIRE_TOOL_DEFS,
@@ -4482,9 +4481,7 @@ async def _plan_pipeline_inner(
                     terminal_feedback = _canonical_schema_feedback()
                 else:
                     schema_errors = (
-                        []
-                        if payload.pipeline is None
-                        else list(Draft202012Validator(canonical_set_pipeline_schema()).iter_errors(payload.pipeline))
+                        [] if payload.pipeline is None else list(canonical_set_pipeline_validator().iter_errors(payload.pipeline))
                     )
                     if schema_errors:
                         # The structural pre-check runs ahead of Stage 1, so a
