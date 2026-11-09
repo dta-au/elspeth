@@ -64,7 +64,12 @@ Success means:
 
 ### 1. Sharing (Tom)
 
-**Dialog.** The "Save for review" dialog gains:
+**Dialog.** Today opening the dialog mints the link immediately
+(`shareableReviewStore.openAndMark`). It becomes two steps: **configure**, then
+**create link**. The configure step reads the file list from a new
+owner-only route, `GET /api/sessions/{session_id}/shareable-files`, which
+returns the current state's referenced files (name, size, binding sites; no
+blob ids or storage paths). The dialog gains:
 
 1. **"Let recipients import a copy"**, off by default. When ticked it lists the
    files that will travel: name, size, and which component and option uses each.
@@ -128,32 +133,34 @@ with it. View-only and older links show no button; the server refuses them
 regardless.
 
 **Endpoint.** `POST /api/sessions/shared/{token}/import`, authenticated, strict
-rate-limit bucket (as the inspect route), with a client-supplied idempotency key
-per click. Order of operations:
+rate-limit bucket (as the inspect route). Library-fork parity (decided
+2026-11-09): no staged session and no server-side idempotency, because both
+would need a sessions-schema change. Order of operations:
 
-1. **Verify the token:** valid and unexpired (else 401), `import_allowed` (else
-   403), snapshot and files present in the payload store (else 404 "ask the
-   sender for a fresh link").
-2. **Check Chris's storage quota** against the total file size before creating
-   anything; refuse clearly if it does not fit.
-3. **Create a staged session** for Chris, archived and invisible, titled
-   "Copy of ‹pipeline name›".
-4. **Copy each frozen file** from the payload store into Chris's staged session as
-   an ordinary blob, re-verifying sha256 on read and assigning deterministic
-   target blob ids so a retry does not duplicate files.
-5. **Seed the graph** from the snapshot's public projection through the ordinary
-   YAML importer, attaching every manifest binding to Chris's copy: sources via
-   the existing `source_blob_ids`, nodes via a new `node_blob_bindings` that
-   rebuilds each widened marker in full (`blob_ref`, `mode`, `sha256`,
-   `encoding`) and checks the copy's hash against the manifest.
-6. **Re-author sink output locations** for Chris's session, as YAML import does
+1. **Verify the token and read everything first:** valid and unexpired (else
+   401), `import_allowed` (else 403), snapshot and every frozen file present in
+   the payload store with matching sha256 (else 404 "ask the sender for a fresh
+   link"). Nothing is created until all reads succeed.
+2. **Create Chris's session** (live), titled "Copy of ‹pipeline name›".
+3. **Copy each frozen file** into it as an ordinary blob (`create_blob`), which
+   enforces the session and user storage quotas. A quota refusal surfaces as the
+   existing quota error.
+4. **Seed the graph** from the snapshot's public projection through the ordinary
+   YAML importer (the library-fork seeder), attaching every manifest binding to
+   Chris's copy: sources via the existing `source_blob_ids`, nodes via a new
+   `node_blob_bindings` that rebuilds each widened marker in full (`blob_ref`,
+   `mode`, `sha256`, `encoding`) and checks the copy's hash against the
+   manifest.
+5. **Re-author sink output locations** for Chris's session, as YAML import does
    today; RAG `persist_directory` gets a fresh location.
-7. **Record provenance** on Chris's session as `shared_import`: snapshot digest,
-   Tom's user id and username, Tom's session and state ids, and the file hashes.
-8. **Publish the session** (un-archive) in one step and write the import audit
-   event. Respond with the new `session_id` and `state_id`.
+6. **Record provenance** in the seeded state's `composer_meta` as
+   `shared_import` (see §4). Respond with the new `session_id` and `state_id`.
+7. **On any error after step 2**, archive the new session, as library fork does.
 
-Chris lands in the new session with a banner naming Tom as the source.
+Chris lands in the new session with a banner naming Tom as the source. The
+shared view lives outside the session router, so the frontend sets
+`window.location.hash` to the new session after reloading the session list.
+The Import button is disabled while its request is in flight.
 
 **Secrets.** The existing credential check
 (`require_no_credential_material_in_state`) refuses any secret value. Secret
@@ -169,18 +176,17 @@ library fork.
 | When | Situation | Result |
 |---|---|---|
 | Share | Referenced file missing, not ready, or hash/size mismatch | 409 naming the file; no token |
-| Share | Payload-store write fails part-way | No token; stray bytes are reaped |
+| Share | Payload-store write fails part-way | No token; stray bytes remain (dta-au/elspeth#356) |
 | Share | Lifespan above the server maximum | 422 |
 | Import | Token tampered or expired | 401 |
 | Import | Link is view-only | 403 |
-| Import | Snapshot or files reaped | 404, "ask the sender for a fresh link" |
-| Import | Files exceed Chris's quota | Refused before any session exists |
-| Import | Frozen file hash mismatch on read | Integrity error; staged session and copies cleaned up |
-| Import | Process dies part-way | Only an archived staged session remains; existing fork cleanup handles it |
-| Import | Double click / retry with the same idempotency key | Returns the same session |
-
-The staged-publish sequence replaces the library fork's create-live-then-archive
-pattern for this endpoint so that a crash cannot leave a visible empty session.
+| Import | Snapshot or a frozen file missing | 404, "ask the sender for a fresh link"; no session created |
+| Import | Frozen file hash mismatch on read | Integrity error; no session created |
+| Import | Files exceed Chris's quota | Existing quota error; the new session is archived |
+| Import | Seeding fails | Error; the new session is archived |
+| Import | Process dies part-way | **Accepted gap:** a visible, half-built "Copy of …" session can remain; Chris can delete it (same as library fork) |
+| Import | Double click | Button disabled while in flight |
+| Import | Deliberate retry after a network failure | **Accepted gap:** may create a second copy (no server-side idempotency) |
 
 ### 4. Audit
 
@@ -193,13 +199,14 @@ no migration pathway; a new column or event type would bump
   file manifest live inside the content-addressed snapshot, so the row's digest
   binds them. Accepted gap: if the snapshot is ever reclaimed (dta-au/elspeth#356),
   the row still identifies what was shared but the manifest detail is gone.
-- **Each import:** recorded on **Chris's** session as an `audit`-role session
-  message (the mechanism the session fork uses for its blob plan) carrying the
-  snapshot digest, Tom's user id, Tom's session and state ids, the file hashes,
-  and the new session id. "Who imported this share" is answered by a server-side
-  query on the digest. Accepted gap: nothing is written on Tom's side, and there
-  is no user-facing notification.
-- **Chris's session:** `shared_import` provenance in composer metadata.
+- **Each import:** recorded as `shared_import` provenance in the `composer_meta`
+  of Chris's seeded composition state (an immutable, audited row — the
+  mechanism `library_fork` uses): snapshot digest, Tom's user id and username,
+  Tom's session and state ids, and each file's sha256 with its new blob id.
+  "Who imported this share" is answered by a server-side query on the digest.
+  A chat `audit` message is not used: its `writer_principal` vocabulary is a
+  closed CHECK with no import value. Accepted gap: nothing is written on Tom's
+  side, and there is no user-facing notification.
 
 ### 5. Composer invariants
 
@@ -212,13 +219,13 @@ so both non-negotiable composer invariants hold.
 1. **Unit:** manifest construction (source `blob_ref`, `blob_rows` source
    `options.blobs[].blob_id`, and nested node markers); token flag and expiry
    cap; re-mint preserving the chosen lifespan; old 7-key snapshots reading as
-   view-only; `node_blob_bindings` in the importer; quota pre-check;
-   staged-publish failure paths. Each test is watched failing before the
-   implementation.
+   view-only; `node_blob_bindings` in the importer; all-reads-before-create;
+   archive-on-failure. Each test is watched failing before the implementation.
 2. **Integration:** Tom shares a graph with a source file and a `reference_join`
    inline file; Chris imports; files arrive with identical hashes and every
    binding points at Chris's copy. Refusal paths: view-only, expired, tampered,
-   reaped, over quota, simulated crash mid-import.
+   missing frozen file (no session created), over quota and seeding failure
+   (session archived).
 3. **PostgreSQL:** this touches session and blob persistence, so
    `pytest tests/ -m testcontainer -n 0` must run (Docker required).
 4. **Frontend:** component tests for the dialog (checkbox, file list, expiry
