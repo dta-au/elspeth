@@ -56,7 +56,7 @@ verifying path), not by the type of the container.
 | 2A | Route interpretation-resolve validation through the queue | Low | Low | Vitest | open |
 | 3-T1 | Stream read consolidation (no semantic change) | Low–Med | Medium | **Testcontainer**, ADR-047 | landed (change 2 reverted); testcontainer suites owed |
 | 2B | Share validation result with readiness | Medium | Medium | Vitest + readiness unit | 2B frontend landed (readiness skip stopped); 2C backend memo landed |
-| 4A | Per-component prompt token accounting | Low | Low | None | open |
+| 4A | Per-component prompt token accounting | Low | Low | None | landed (bytes only; no tokenizer for the OpenRouter models) |
 | 4B | Reasoning-effort tuning | Medium (quality) | Low | — | open — applies on OpenRouter test models |
 | 3-T2 | Snapshot-bound per-send stream authorization | High (semantic) | Low code | Developer ruling | not started — ruling needed |
 | 5 | Allocation profiling | — | — | — | after 1 and 2A |
@@ -608,7 +608,41 @@ behaviour change. Admit the new field in any closed export shape.
 **Acceptance.** A planner call's ledger row shows the split; the sum
 reconciles with the provider's `prompt_tokens` within tokenizer tolerance.
 
-**Evidence.** _(fill in)_
+**Evidence (landed; lane report `.claude/lanes/perf-eval/fix4a-implementation.md`).** New closed L0 carrier
+`ComposerLLMRequestByteSplit(message_bytes: tuple[int, ...], tools_bytes:
+int | None, total_bytes: int)` on `ComposerLLMCall.request_byte_split`,
+derived in `build_llm_call_record` (the sole construction site), so every
+composer call row carries it, not only the planner's; `pipeline_planner.py`
+is not edited. `message_bytes` is in send order (planner: rendered skill,
+catalog reference block, provider request, then continuation; a test pins
+that order). A `str` content counts its UTF-8 bytes; any other message (an
+assistant tool-call turn) counts its canonical encoding as hashed.
+`tools_bytes` is the canonical tool array the `tools_spec_hash` covers.
+`total_bytes` is the plain sum of the components (no wire framing); the
+contract refuses a non-summing split and one whose `tools_bytes` and
+`tools_spec_hash` disagree on whether tools were sent. The hashes and sizes
+come from one serialization: each message is canonicalised once and
+`messages_hash` is SHA-256 over the bracketed comma join (pinned equal to
+`stable_hash` of the whole list), so nothing is serialised twice. Admitted in
+`_LLM_CALL_PUBLIC_AUDIT_FIELDS`; the frontend ledger decoders read named
+fields only and need no change. **Exposure:** the session-visible audit
+sidecar now shows the sizes, never the content, of the hidden system prompt
+and reference block. **Bytes only:** no tokenizer for the routed OpenRouter
+models is available in-process (the installed `tiktoken` is an OpenAI
+vocabulary and would fabricate counts), so the ledger carries bytes only and
+the reconciliation with `prompt_tokens` still needs a live run. Planner test
+(stub catalog, `litellm.acompletion` instrumented): call 1 `[33442, 64896,
+1499]` + tools 35911, call 2 adds continuation `[136, 43828, 101]`; each
+component equals the content bytes the SDK stub received. Capture cost, new
+work over the HEAD hashing (median of 200, same captured requests): first
+draft 2.0–3.8 ms per call; final −0.02–0.19 ms (≈0, within noise) at 135 KB
+and 180 KB. 25 new tests; three mutation controls (characters for bytes;
+sum check removed; hash join without brackets) go red. Orchestrator
+confirmation: 2,000 randomised message lists (mixed `str` and structured
+content, tool-call turns, non-ASCII, floats) gave 0 mismatches between the
+joined hash and `stable_hash`; composer audit/ledger suites 928 passed,
+exit 0; ruff, format, mypy, `check_contracts` clean. Architecture suite and
+lint corpus deferred to the batch 2 gate.
 
 ### 4B — Reasoning effort
 

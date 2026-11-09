@@ -465,6 +465,7 @@ _LLM_CALL_PUBLIC_AUDIT_FIELDS: Final[tuple[str, ...]] = (
     "provider_served",
     "tool_contract_dialect",
     "strict_tool_count",
+    "request_byte_split",
 )
 
 

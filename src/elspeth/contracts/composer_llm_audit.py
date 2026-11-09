@@ -86,6 +86,67 @@ class ToolContractDialect(StrEnum):
     NONE = "none"
 
 
+def _require_component_bytes(value: object, field_name: str) -> int:
+    if type(value) is not int:
+        raise TypeError(f"{field_name} must be int, got {type(value).__name__}: {value!r}")
+    if value < 0:
+        raise ValueError(f"{field_name} must be >= 0, got {value}")
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class ComposerLLMRequestByteSplit:
+    """Per-component UTF-8 byte sizes of one composer model call's request.
+
+    Measured at the capture point from the exact objects the call record
+    hashes (``messages_hash`` / ``tools_spec_hash``), which are the objects
+    handed to the provider client, without a second serialization:
+
+    - ``message_bytes``: one entry per sent message, in send order. A message
+      whose ``content`` is a string counts that content's UTF-8 bytes; any
+      other message (an assistant tool-call turn, structured content) counts
+      its canonical JSON encoding as hashed. For the pipeline planner the
+      first three are the rendered skill (system), the catalog reference block
+      (user 1: authoring aids and schema-contract evidence) and the provider
+      request (user 2); later entries are the accumulated continuation.
+    - ``tools_bytes``: the canonical JSON encoding of the whole tool-definition
+      array (the bytes ``tools_spec_hash`` covers), or ``None`` when the call
+      carried no tool list.
+    - ``total_bytes``: the sum of the components. Wire framing (roles, keys,
+      separators) is deliberately not accounted; a total that is not the sum
+      is refused.
+
+    Sizes are bytes, not tokens. No tokenizer for the routed models is
+    available in-process, so no per-component token count is recorded; the
+    provider's ``prompt_tokens`` on the call record is the only token total.
+    """
+
+    message_bytes: tuple[int, ...]
+    tools_bytes: int | None
+    total_bytes: int
+
+    def __post_init__(self) -> None:
+        if type(self.message_bytes) is not tuple:
+            raise TypeError(f"message_bytes must be tuple, got {type(self.message_bytes).__name__}")
+        for index, size in enumerate(self.message_bytes):
+            _require_component_bytes(size, f"message_bytes[{index}]")
+        if self.tools_bytes is not None:
+            _require_component_bytes(self.tools_bytes, "tools_bytes")
+        if type(self.total_bytes) is not int:
+            raise TypeError(f"total_bytes must be int, got {type(self.total_bytes).__name__}: {self.total_bytes!r}")
+        expected_total = sum(self.message_bytes) + (0 if self.tools_bytes is None else self.tools_bytes)
+        if self.total_bytes != expected_total:
+            raise ValueError(f"total_bytes {self.total_bytes} does not reconcile with the sum of its components ({expected_total})")
+
+    def to_dict(self) -> dict[str, list[int] | int | None]:
+        """JSON-friendly dict for sidecar serialization."""
+        return {
+            "message_bytes": list(self.message_bytes),
+            "tools_bytes": self.tools_bytes,
+            "total_bytes": self.total_bytes,
+        }
+
+
 def _require_non_empty_str(value: object, field_name: str, *, optional: bool = False) -> None:
     if optional and value is None:
         return
@@ -194,6 +255,12 @@ class ComposerLLMCall:
     both from the same ``tools`` list that ``tools_spec_hash`` covers. They are
     both ``None`` when the call carried no tools, and a ``none`` dialect always
     has a count of ``0``.
+
+    ``request_byte_split`` is the per-component size of what the call sent
+    (:class:`ComposerLLMRequestByteSplit`): each message's and the tool
+    list's UTF-8 byte length and their sum. It is derived at the capture point
+    from the same serialization the two hashes use, carries sizes only (never
+    content), and is ``None`` only on a record constructed without it.
     """
 
     model_requested: str
@@ -232,6 +299,7 @@ class ComposerLLMCall:
     provider_served: str | None = None
     tool_contract_dialect: ToolContractDialect | None = None
     strict_tool_count: int | None = None
+    request_byte_split: ComposerLLMRequestByteSplit | None = None
     private_failure: PrivateFailureFacts | None = field(default=None, repr=False)
     private_diagnostics: tuple[PrivateReceivedDiagnostic, ...] = field(default=(), repr=False)
     private_request: PrivateProviderContext | None = field(default=None, repr=False)
@@ -247,6 +315,10 @@ class ComposerLLMCall:
             raise TypeError("LLM private diagnostics must be an owned tuple")
         if type(self.status) is not ComposerLLMCallStatus:
             raise TypeError(f"status must be ComposerLLMCallStatus, got {type(self.status).__name__}: {self.status!r}")
+        if self.request_byte_split is not None and type(self.request_byte_split) is not ComposerLLMRequestByteSplit:
+            raise TypeError(f"request_byte_split must be ComposerLLMRequestByteSplit or None, got {type(self.request_byte_split).__name__}")
+        if self.request_byte_split is not None and (self.request_byte_split.tools_bytes is None) != (self.tools_spec_hash is None):
+            raise ValueError("request_byte_split.tools_bytes and tools_spec_hash must agree on whether tools were sent")
         if self.tool_contract_dialect is not None and type(self.tool_contract_dialect) is not ToolContractDialect:
             raise TypeError(f"tool_contract_dialect must be ToolContractDialect or None, got {type(self.tool_contract_dialect).__name__}")
         if self.strict_tool_count is not None:
@@ -356,6 +428,7 @@ class ComposerLLMCall:
         }
         raw["status"] = self.status.value
         raw["tool_contract_dialect"] = self.tool_contract_dialect.value if self.tool_contract_dialect is not None else None
+        raw["request_byte_split"] = self.request_byte_split.to_dict() if self.request_byte_split is not None else None
         raw["started_at"] = self.started_at.isoformat()
         raw["finished_at"] = self.finished_at.isoformat()
         return raw

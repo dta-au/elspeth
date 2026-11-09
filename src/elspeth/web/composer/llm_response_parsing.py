@@ -30,6 +30,7 @@ would create a cycle.
 
 from __future__ import annotations
 
+import hashlib
 import math
 import re
 import time
@@ -41,6 +42,7 @@ from elspeth.contracts.composer_llm_audit import (
     PROVIDER_SERVED_UNRECOGNISED,
     ComposerLLMCall,
     ComposerLLMCallStatus,
+    ComposerLLMRequestByteSplit,
     ToolContractDialect,
     is_provider_served_name,
 )
@@ -48,7 +50,7 @@ from elspeth.contracts.composer_provider_context import PrivateProviderContext
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.token_usage import TokenUsage
 from elspeth.contracts.trust_boundary import observation_boundary
-from elspeth.core.canonical import stable_hash
+from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.core.llm_pricing import (
     _merge_pydantic_extra,
     _provider_field,
@@ -666,6 +668,41 @@ def _safe_llm_error_message(error_message: str | None) -> str | None:
     return raw_message
 
 
+def _hash_and_measure_request(messages: list[Any], tools: list[Any] | None) -> tuple[str, str | None, ComposerLLMRequestByteSplit]:
+    """Hash the sent messages and tools and measure their components in one pass.
+
+    ``messages_hash`` / ``tools_spec_hash`` are ``stable_hash`` of the exact
+    lists: SHA-256 over their RFC 8785 canonical JSON. A canonical array is its
+    elements' canonical encodings joined by single commas inside brackets, so
+    each message is canonicalized once and both the hash and the sizes come
+    from that one serialization; nothing is serialized a second time.
+
+    A message whose ``content`` is a ``str`` is sized by that content's UTF-8
+    bytes (every planner message: the prompt text the provider tokenizes).
+    Any other message (an assistant tool-call turn, structured content parts)
+    is sized by its canonical encoding as hashed. The tool block is sized by
+    the canonical encoding its hash covers.
+    """
+    encoded_messages = [canonical_json(message).encode("utf-8") for message in messages]
+    messages_hash = hashlib.sha256(b"[" + b",".join(encoded_messages) + b"]").hexdigest()
+    message_bytes = tuple(
+        len(message["content"].encode("utf-8")) if "content" in message and type(message["content"]) is str else len(encoded)
+        for message, encoded in zip(messages, encoded_messages, strict=True)
+    )
+    tools_spec_hash: str | None = None
+    tools_bytes: int | None = None
+    if tools is not None:
+        encoded_tools = canonical_json(tools).encode("utf-8")
+        tools_spec_hash = hashlib.sha256(encoded_tools).hexdigest()
+        tools_bytes = len(encoded_tools)
+    split = ComposerLLMRequestByteSplit(
+        message_bytes=message_bytes,
+        tools_bytes=tools_bytes,
+        total_bytes=sum(message_bytes) + (tools_bytes if tools_bytes is not None else 0),
+    )
+    return messages_hash, tools_spec_hash, split
+
+
 def build_llm_call_record(
     *,
     model_requested: str,
@@ -743,6 +780,7 @@ def build_llm_call_record(
         else:
             raise AuditIntegrityError("sent tool list mixes strict-stamped and unstamped tools")
     elapsed_ns = time.monotonic_ns() - started_ns
+    messages_hash, tools_spec_hash, request_byte_split = _hash_and_measure_request(messages, tools)
     call = ComposerLLMCall(
         model_requested=model_requested,
         pricing_model=pricing_model if pricing_model is not None else model_requested,
@@ -763,8 +801,8 @@ def build_llm_call_record(
         provider_cost_source=provider_cost_source,
         latency_ms=elapsed_ns // 1_000_000,
         provider_request_id=provider_request_id,
-        messages_hash=stable_hash(messages),
-        tools_spec_hash=stable_hash(tools) if tools is not None else None,
+        messages_hash=messages_hash,
+        tools_spec_hash=tools_spec_hash,
         declared_tool_names=tuple(tool["function"]["name"] for tool in tools) if tools is not None else (),
         started_at=started_at,
         finished_at=started_at + timedelta(microseconds=elapsed_ns // 1_000),
@@ -780,6 +818,7 @@ def build_llm_call_record(
         provider_served=provider_served,
         tool_contract_dialect=tool_contract_dialect,
         strict_tool_count=strict_tool_count,
+        request_byte_split=request_byte_split,
     )
     return provider_custody.bind_call(call) if provider_custody is not None else bind_provider_attempt(call)
 
