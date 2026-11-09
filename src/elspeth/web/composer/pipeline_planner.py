@@ -1968,7 +1968,17 @@ PLANNER_TERMINAL_INSTRUCTION: Final[str] = (
     "After a rejection, repair and resubmit the complete proposal. At any stage, you may instead call "
     "handoff_to_user or restore_parked_graph alone with your message to end authoring and talk to the user. "
     "You may also reply in plain text to explain, ask a question, or decline. "
-    "Conversational exits need no discovery, candidate capture or validation."
+    "Conversational exits need no discovery, candidate capture or validation. "
+    "This is the proposal-only surface: your palette is read-only discovery, the two recovery tools and "
+    "emit_pipeline_proposal, and nothing is saved until a proposal is accepted. Where the shared rules name "
+    "set_pipeline, apply them to emit_pipeline_proposal. You have no mutation tool (set_source, upsert_node, "
+    "patch_node_options, create_blob), no request_interpretation_review, no request_advisor_hint and no "
+    "applied_component echo: skip any step that calls one, and do not look for it. Author vague_term and "
+    "registered pipeline_decision rows inside the proposal's node options; never author invented_source, "
+    "llm_prompt_template, llm_model_choice or source_data_contract rows, which the server stages. Review cards "
+    "are surfaced from the accepted proposal. A rejected proposal returns success false with validation.errors; "
+    "each entry names its component and error_code and may carry explanation, suggested_fix, detail and "
+    "plugin_contracts. Repair from those fields."
 )
 
 

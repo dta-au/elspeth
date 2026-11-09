@@ -265,6 +265,20 @@ _INFORMATION_BOUNDARY_DISCOVERY_CANONICAL_BYTES = 3840
 # The system message and tools are unchanged. Price only this measured 188 B,
 # preserving the finite tripwire and exact-boundary / +1-byte overflow control.
 _SEMANTIC_REVIEW_GUIDANCE_CANONICAL_BYTES = 188
+# Composer skill rework for 0.8.12 (2026-11-10), measured per commit with the
+# ceiling lowered to 1 in a throwaway plugin, same interpreter and catalog:
+# 135,274 B after the capability core lost its stale recipe / every-surface /
+# trust-boundary text and the interpretation-requirement schema note was
+# shortened (two commits, both under the 135,730 B pin). The planner surface
+# orientation appended to PLANNER_TERMINAL_INSTRUCTION then measures 136,235 B,
+# +961 B: the planner is told its surface, the tools the shared skill names
+# that it lacks, which review rows it authors and its own rejection shape.
+# Price only the 505 B excess over the prior pin, keeping zero new headroom
+# and the exact-boundary / +1-byte overflow control. NOT YET OPERATOR-RULED:
+# this allowance follows the 2026-10-18 direction on justified guidance
+# growth and is flagged for the maintainer in
+# docs/architecture/composer-remediation/reports/skill-rework-report.md.
+_SKILL_REWORK_0812_CANONICAL_BYTES = 505
 _FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES = (
     int(_FIXED_SCAFFOLDING_BASELINE_BYTES * 1.10)
     + _POWER_AUTOMATE_CATALOG_CANONICAL_BYTES
@@ -276,6 +290,7 @@ _FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES = (
     + _QUALIFICATION_SCAFFOLD_CANONICAL_BYTES
     + _INFORMATION_BOUNDARY_DISCOVERY_CANONICAL_BYTES
     + _SEMANTIC_REVIEW_GUIDANCE_CANONICAL_BYTES
+    + _SKILL_REWORK_0812_CANONICAL_BYTES
 )
 
 
