@@ -1089,7 +1089,8 @@ def test_validate_pipeline_public_signature_is_stable_through_boundary_decorator
         "secret_wiring_policy: 'SecretWiringPolicy | None' = None, user_id: 'str | None' = None, "
         "blob_get_metadata: 'Callable[[UUID], BlobRecord | None] | None' = None, "
         "blob_get_content: 'Callable[[UUID], tuple[BlobRecord, bytes]] | None' = None, "
-        "allow_pending_interpretation_placeholders: 'bool' = False, session_id: 'str | None' = None) -> 'ValidationResult'"
+        "allow_pending_interpretation_placeholders: 'bool' = False, session_id: 'str | None' = None, "
+        "mcp_root_authority: 'McpConfiguredRootAuthority | None' = None) -> 'ValidationResult'"
     )
 
     # The single literal comparison IS the whole guarantee: inspect.signature

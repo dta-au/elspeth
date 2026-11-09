@@ -6,12 +6,46 @@ from pathlib import Path
 
 import pytest
 
+from elspeth.web.composer.tools._common import (
+    _validate_sink_path,
+    _validate_source_path,
+    _validate_transform_provider_config_path,
+)
 from elspeth.web.paths import (
     allowed_sink_directories,
     allowed_source_directories,
     resolve_data_path,
     resolve_sink_data_path,
 )
+
+
+@pytest.mark.parametrize("kind", ["source", "sink", "provider"])
+@pytest.mark.parametrize("location", ["own", "foreign", "shared", "traversal", "symlink", "no-session"])
+def test_web_admission_retains_real_session_confinement(tmp_path: Path, kind: str, location: str) -> None:
+    """MCP root admission must not make deployment storage Web authority."""
+    own = tmp_path / "blobs" / "sess-a"
+    foreign = tmp_path / "blobs" / "sess-b"
+    own.mkdir(parents=True)
+    foreign.mkdir(parents=True)
+    (own / "link").symlink_to(foreign, target_is_directory=True)
+    path = {
+        "own": str(own / "data.csv"),
+        "foreign": str(foreign / "data.csv"),
+        "shared": str(tmp_path / "data.csv"),
+        "traversal": "blobs/sess-a/../sess-b/data.csv",
+        "symlink": str(own / "link" / "data.csv"),
+        "no-session": str(own / "data.csv"),
+    }[location]
+    session_id = None if location == "no-session" else "sess-a"
+    if kind == "source":
+        error = _validate_source_path({"path": path}, str(tmp_path), session_id=session_id)
+    elif kind == "sink":
+        error = _validate_sink_path({"path": path}, str(tmp_path), session_id=session_id)
+    else:
+        error = _validate_transform_provider_config_path(
+            {"provider_config": {"persist_directory": path}}, str(tmp_path), session_id=session_id
+        )
+    assert (error is None) is (location == "own")
 
 
 class TestResolveDataPath:

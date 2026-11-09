@@ -27,6 +27,7 @@ from elspeth.web.composer.tools._common import (
     _apply_merge_patch,
     _attach_post_call_hints,
     _mutation_result,
+    _path_policy_refusal_message,
     _plugin_selection_violation,
     _post_mutation_invariant_error,
     _prevalidate_sink,
@@ -178,12 +179,21 @@ def _execute_set_output(
     )
     if credential_error is not None:
         return credential_error
-    path_error = _validate_sink_path(sink_options, context.data_dir, session_id=context.session_id)
+    path_error = _validate_sink_path(
+        sink_options,
+        context.data_dir,
+        session_id=context.session_id,
+        require_data_dir=context.require_data_dir_for_paths,
+        mcp_root_authority=context.mcp_root_authority,
+    )
     if path_error is not None:
         return _saved_graph_rejection_result(
             state,
-            "Output path options (path, file or persist_directory) must use this session's permitted destinations. "
-            "Use an authorized session-local output path.",
+            _path_policy_refusal_message(
+                context,
+                "Output path options (path, file or persist_directory) must use this session's permitted destinations. "
+                "Use an authorized session-local output path.",
+            ),
             error_code="sink_path_policy_invalid",
             rejected_component=f"output:{validated.sink_name}",
         )
@@ -298,12 +308,21 @@ def _execute_patch_output_options(
         return credential_error
 
     # S2: Validate patched sink paths against allowlist
-    path_error = _validate_sink_path(new_options, context.data_dir, session_id=context.session_id)
+    path_error = _validate_sink_path(
+        new_options,
+        context.data_dir,
+        session_id=context.session_id,
+        require_data_dir=context.require_data_dir_for_paths,
+        mcp_root_authority=context.mcp_root_authority,
+    )
     if path_error is not None:
         return _saved_graph_rejection_result(
             state,
-            "Output path options (path, file or persist_directory) must use this session's permitted destinations. "
-            "Use an authorized session-local output path.",
+            _path_policy_refusal_message(
+                context,
+                "Output path options (path, file or persist_directory) must use this session's permitted destinations. "
+                "Use an authorized session-local output path.",
+            ),
             error_code="sink_path_policy_invalid",
             rejected_component=f"output:{sink_name}",
         )

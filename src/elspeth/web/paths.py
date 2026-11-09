@@ -10,6 +10,8 @@ from __future__ import annotations
 from pathlib import Path
 from uuid import UUID
 
+from elspeth.contracts.composer_paths import McpConfiguredRootAuthority
+
 SOURCE_LOCAL_PATH_OPTION_KEYS: tuple[str, ...] = ("path", "file")
 SINK_LOCAL_PATH_OPTION_KEYS: tuple[str, ...] = ("path", "file", "persist_directory")
 # Local filesystem keys to confine inside a transform's
@@ -17,6 +19,28 @@ SINK_LOCAL_PATH_OPTION_KEYS: tuple[str, ...] = ("path", "file", "persist_directo
 # Chroma persist_directory there). Confined like sink paths — persist_directory
 # is a local read/write target.
 NESTED_LOCAL_PATH_OPTION_KEYS: tuple[str, ...] = ("persist_directory",)
+
+
+def require_mcp_root_context(
+    authority: McpConfiguredRootAuthority | None,
+    *,
+    data_dir: str | Path | None,
+    session_id: str | None,
+) -> None:
+    """Reject contradictory owned configuration before reading user paths."""
+    if authority is None:
+        return
+    if not isinstance(authority, McpConfiguredRootAuthority):
+        raise TypeError("MCP path authority must be McpConfiguredRootAuthority")
+    if session_id is not None:
+        raise ValueError("MCP root authority cannot carry Web session custody")
+    if data_dir is not None and Path(data_dir).resolve() != authority.root:
+        raise ValueError("MCP configured root contradicts data_dir")
+
+
+def is_local_path_value(value: object) -> bool:
+    """Admit the lexical shape before passing an external value to Path."""
+    return type(value) is str and bool(value) and "\x00" not in value
 
 
 def resolve_data_path(value: str, data_dir: str) -> Path:

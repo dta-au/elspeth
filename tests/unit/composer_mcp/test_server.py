@@ -542,7 +542,7 @@ class TestDispatchTool:
         assert caught.value.surface == "composer_mcp_state"
         assert candidate not in repr(caught.value.to_payload())
 
-    def test_set_source_path_without_session_identity_fails_closed(self, scratch_dir: Path) -> None:
+    def test_set_source_path_without_configured_authority_fails_closed(self, scratch_dir: Path) -> None:
         # set_source is promoted to a type-driven manifest entry
         # (SetSourceArgumentsModel) with extra="forbid" — the LLM-supplied
         # argument set MUST include all four required fields.  Prior to
@@ -574,10 +574,8 @@ class TestDispatchTool:
             "source_path_policy_invalid",
             "source",
         )
-        assert entry["message"] == (
-            "Source file path options (path or file) must use this session's permitted source locations. "
-            "Use the session's blob binding or an authorized source path."
-        )
+        assert "configured data root" in entry["message"]
+        assert "blob" not in entry["message"]
         assert result["validation"]["errors"][1:] == [item.to_dict() for item in standing.errors]
         assert result["validation"]["warnings"] == [item.to_dict() for item in standing.warnings]
         assert result["validation"]["suggestions"] == [item.to_dict() for item in standing.suggestions]
@@ -603,6 +601,8 @@ class TestDispatchTool:
         assert result["state"] == _empty_state().to_dict()
 
     def test_set_output_accepts_explicit_collision_policy(self, scratch_dir: Path) -> None:
+        from elspeth.contracts.composer_paths import McpConfiguredRootAuthority
+
         result = _dispatch_tool(
             "set_output",
             {
@@ -619,6 +619,7 @@ class TestDispatchTool:
             _empty_state(),
             _mock_catalog(),
             scratch_dir,
+            mcp_root_authority=McpConfiguredRootAuthority(scratch_dir / "data"),
         )
 
         assert result["success"] is True
@@ -1398,32 +1399,30 @@ class TestStdioServerConstruction:
         [("traversal", "outputs/../../evil.csv"), ("absolute", "/etc/elspeth-evil.csv")],
     )
     @pytest.mark.asyncio
-    async def test_stdio_construction_publishes_runtime_rejection(
+    async def test_stdio_construction_refuses_escaping_output_at_admission(
         self,
         tmp_path: Path,
         data_dir: Path,
         label: str,
         sink_path: str,
     ) -> None:
-        """Escaping data_dir must flip the published verdict — the security-not-weakened pin.
+        """The shipped construction must refuse escaped paths before mutation."""
+        from elspeth.web.dependencies import create_catalog_service
 
-        The synthetic session id scopes paths; it must not admit them. Both
-        escape forms have to stay rejected under it.
-        """
-        # Stage 1 accepts these paths; only the runtime allowlist rejects them.
-        envelope = await self._preview_with_sink_path(tmp_path, data_dir, label, sink_path)
-
-        assert envelope["validation"]["is_valid"] is True
-        preflight = envelope.get("runtime_preflight")
-        assert preflight is not None
-        assert preflight["is_valid"] is False
-        # Named, because a sink path resolving outside data_dir is not
-        # automatically a rejection — ``resolve_sink_data_path`` adopts a
-        # non-UUID second segment under the caller's own outputs directory,
-        # so ``outputs/deadbeef1234/x.csv`` validates TRUE. A verdict-only
-        # assertion here would pass for the wrong reason.
-        assert "path_allowlist" in {check["name"] for check in preflight["checks"] if not check["passed"]}
-        assert envelope["data"]["preview_is_valid"] is False
+        scratch = tmp_path / f"scratch-{label}"
+        scratch.mkdir()
+        server = _build_stdio_server(create_catalog_service(), scratch, data_dir)
+        handlers = server.request_handlers
+        source = await _call_handler(handlers, "set_source", _STDIO_SOURCE_ARGS)
+        assert json.loads(source.root.content[0].text)["success"] is True
+        before = await _call_handler(handlers, "get_pipeline_state", {})
+        response = await _call_handler(handlers, "set_output", _stdio_output_args(sink_path))
+        envelope = json.loads(response.root.content[0].text)
+        assert envelope["success"] is False
+        assert envelope["validation"]["errors"][0]["error_code"] == "sink_path_policy_invalid"
+        assert envelope["affected_nodes"] == []
+        after = await _call_handler(handlers, "get_pipeline_state", {})
+        assert json.loads(after.root.content[0].text) == json.loads(before.root.content[0].text)
 
     def test_create_server_requires_an_explicit_runtime_preflight(self, tmp_path: Path) -> None:
         """Re-adding the silent default is itself the mutation being caught."""
