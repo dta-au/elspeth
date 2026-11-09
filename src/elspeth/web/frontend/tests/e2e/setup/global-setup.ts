@@ -8,10 +8,26 @@ import { request } from "@playwright/test";
 // which spins up a fresh ELSPETH_WEB__data_dir per test session. Not a
 // real password; the hook's credential scanner flags any high-entropy
 // quoted string here, so keep this short and obviously synthetic.
-const TEST_USER = {
+interface E2EUser {
+  username: string;
+  password: string;
+  display_name: string;
+}
+
+const TEST_USER: E2EUser = {
   username: "e2e-tester",
   password: "pw-placeholder", // secret-scan: allow-this-line
   display_name: "E2E Tester",
+};
+
+// A second, independent account for specs that need two users — the
+// shared-graph import spec has e2e-tester share a link that this user opens
+// and imports. Registered, granted the workload role and kept out of the
+// tutorial exactly as TEST_USER is.
+const RECIPIENT_USER: E2EUser = {
+  username: "e2e-recipient",
+  password: "pw-placeholder-recipient", // secret-scan: allow-this-line
+  display_name: "E2E Recipient",
 };
 
 const FRONTEND_PORT = process.env.PLAYWRIGHT_FRONTEND_PORT ?? "5173";
@@ -24,11 +40,11 @@ const TOKEN_KEY = "auth_token";
 const ROLE_ADMIN_USERNAME = process.env.PLAYWRIGHT_ROLE_ADMIN_USERNAME;
 const ROLE_ADMIN_PASSWORD = process.env.PLAYWRIGHT_ROLE_ADMIN_PASSWORD;
 
-async function obtainToken(apiBaseURL: string): Promise<string> {
+async function obtainToken(apiBaseURL: string, user: E2EUser): Promise<string> {
   const ctx = await request.newContext({ baseURL: apiBaseURL });
   try {
     const registerResp = await ctx.post("/api/auth/register", {
-      data: TEST_USER,
+      data: user,
     });
 
     if (registerResp.ok()) {
@@ -44,7 +60,7 @@ async function obtainToken(apiBaseURL: string): Promise<string> {
     }
 
     const loginResp = await ctx.post("/api/auth/login", {
-      data: { username: TEST_USER.username, password: TEST_USER.password },
+      data: { username: user.username, password: user.password },
     });
     if (!loginResp.ok()) {
       const detail = await loginResp.text();
@@ -175,9 +191,12 @@ function writeStorageState(path: string, token: string): void {
 // Playwright versions. import.meta.url is unambiguous.
 const HERE = dirname(fileURLToPath(import.meta.url));
 const STORAGE_STATE_PATH = resolve(HERE, "..", ".auth", "user.json");
+// Specs that act as the second user load this file into their own browser
+// context (browser.newContext({ storageState })).
+const RECIPIENT_STORAGE_STATE_PATH = resolve(HERE, "..", ".auth", "recipient.json");
 
-export default async function globalSetup(): Promise<void> {
-  const token = await obtainToken(BACKEND_BASE_URL);
+async function provisionUser(user: E2EUser, storageStatePath: string): Promise<void> {
+  const token = await obtainToken(BACKEND_BASE_URL, user);
   // Registration authenticates and activates the local identity, but the
   // workload boundary separately requires a live deployment-wide user role.
   // Exercise the same audited admin API an operator uses rather than weakening
@@ -187,9 +206,14 @@ export default async function globalSetup(): Promise<void> {
   // composer shell. Keep the baseline tester out of tutorial mode; specs that
   // exercise the tutorial explicitly reset the preference in their own setup.
   await markTutorialCompleted(BACKEND_BASE_URL, token);
-  writeStorageState(STORAGE_STATE_PATH, token);
+  writeStorageState(storageStatePath, token);
   // Confirm to the operator that globalSetup completed — otherwise a
   // mis-pathed write looks identical to "globalSetup never ran" in the
   // failure output.
-  console.log(`[globalSetup] wrote storageState to ${STORAGE_STATE_PATH}`);
+  console.log(`[globalSetup] wrote storageState for ${user.username} to ${storageStatePath}`);
+}
+
+export default async function globalSetup(): Promise<void> {
+  await provisionUser(TEST_USER, STORAGE_STATE_PATH);
+  await provisionUser(RECIPIENT_USER, RECIPIENT_STORAGE_STATE_PATH);
 }
