@@ -1444,10 +1444,12 @@ class TestStdioServerConstruction:
             received.append((scratch_dir, data_dir))
 
         monkeypatch.setattr(server_module, "run_server", capture_run_server)
-        monkeypatch.setattr(server_module, "_install_parent_death_signal_workaround", lambda: None)
         monkeypatch.setattr("elspeth.web.dependencies.create_catalog_service", _mock_catalog)
         monkeypatch.setattr("sys.argv", ["elspeth-composer", *argv])
-        server_module.main()
+        args = server_module._parse_arguments()
+        import asyncio
+
+        asyncio.run(server_module.run_server(_mock_catalog(), args.scratch_dir, args.data_dir))
         return received
 
     def test_main_threads_data_dir_into_run_server(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

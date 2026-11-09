@@ -209,6 +209,8 @@ class RequiredExecutorGenerationCustodian:
         recovery_callback: Callable[[RequiredGenerationDrainExpired], None],
         replacement_factory: Callable[[], ThreadPoolExecutor],
         install_replacement: Callable[[ThreadPoolExecutor], None],
+        retain_recovery: Callable[[RequiredExecutorGenerationCustodian], None] | None = None,
+        release_recovery: Callable[[RequiredExecutorGenerationCustodian], None] | None = None,
     ) -> None:
         self.executor = executor
         self.identity = generation_identity
@@ -219,6 +221,8 @@ class RequiredExecutorGenerationCustodian:
         self._budget = min(drain_seconds, 30.0)
         self._replacement_factory = replacement_factory
         self._install_replacement = install_replacement
+        self._retain_recovery = retain_recovery
+        self._release_recovery = release_recovery
         self.state = "active"
         self.reservations: dict[str, InvocationReservation] = {}
         self.deadline: float | None = None
@@ -262,6 +266,8 @@ class RequiredExecutorGenerationCustodian:
         self.state = "quarantined"
         self.generation_unavailable.set()
         self.deadline = time.monotonic() + self._budget
+        if self._retain_recovery is not None:
+            self._retain_recovery(self)
         self.drain_thread = threading.Thread(target=self._drain, name="required-generation-drain", daemon=True)
         self.drain_thread.start()
         self.observer = asyncio.create_task(self._observe(), name="required-generation-observer")
@@ -293,6 +299,9 @@ class RequiredExecutorGenerationCustodian:
             self.observer_error = asyncio.CancelledError()
         else:
             self.observer_error = task.exception()
+        if self.drain_thread is not None and not self.drain_thread.is_alive() and self._release_recovery is not None:
+            self.drain_thread.join()
+            self._release_recovery(self)
 
     async def _observe(self) -> None:
         try:
@@ -323,6 +332,12 @@ class RequiredExecutorGenerationCustodian:
                         )
                         return
                 await asyncio.sleep(0.01)
+            # recovery_finished is published by the worker thread just before
+            # its return. Observe actual thread exit before releasing custody.
+            assert self.drain_thread is not None
+            while self.drain_thread.is_alive():
+                await asyncio.sleep(0.01)
+            self.drain_thread.join()
         except BaseException as exc:
             self.observer_error = exc
             raise

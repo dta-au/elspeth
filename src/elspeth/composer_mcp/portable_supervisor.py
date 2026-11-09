@@ -1,9 +1,9 @@
 """Private, dedicated Popen lifetime owner. Requires IPv4 loopback binding.
 
-Execute this file directly to keep the supervisor stdlib-only. It must not be
-embedded in a host with competing child reapers. Stdio belongs directly to the
-runner; this owner never reads stdin or writes stdout. There is no public entry
-point until the Composer lifespan is integrated.
+Execute this file in a fresh console interpreter to keep it stdlib-only. It
+must not be embedded in a host with competing child reapers. Stdio belongs to the
+runner; this owner never reads stdin or writes stdout. The public launcher
+executes this file, which launches exactly one authenticated private runner.
 """
 
 from __future__ import annotations
@@ -51,10 +51,28 @@ class SupervisorFailure(RuntimeError):
     """The owned child could not be terminated/reaped truthfully."""
 
 
+def _install_controller_death_guard(expected_parent: int, *, linux: bool = sys.platform == "linux") -> bool:
+    """Preserve Linux controller-death protection without bypassing cleanup.
+
+    The recorded parent is an observation for detecting reparenting, never a
+    signal target. Other platforms retain the shared portable supervision path.
+    Only the dedicated console entry may install this process-wide kernel state.
+    """
+    if not linux:
+        return False
+    import ctypes
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(1, signal.SIGTERM, 0, 0, 0) != 0:  # PR_SET_PDEATHSIG
+        error = ctypes.get_errno()
+        raise OSError(error, f"Composer controller-death guard failed: {os.strerror(error)}")
+    return expected_parent == 1 or os.getppid() != expected_parent
+
+
 class _Supervisor:
     """Single-threaded owner. The clock seam is private subprocess-test support."""
 
-    def __init__(self, command: Sequence[str], *, _clock_ns: Callable[[], int] = time.monotonic_ns) -> None:
+    def __init__(self, command: Sequence[str], *, _clock_ns: Callable[[], int] = time.monotonic_ns, dedicated_cli: bool = False) -> None:
         self.command = command
         self.clock = _clock_ns
         self.child: subprocess.Popen[bytes] | None = None
@@ -63,6 +81,8 @@ class _Supervisor:
         self.deadline: int | None = None
         self.failed = False
         self.completed = False
+        self.dedicated_cli = dedicated_cli
+        self._controller_parent = os.getppid()
 
     def _stop(self, signum: int, frame: object) -> None:
         # No socket, signal or wait operations in a signal handler.
@@ -97,6 +117,8 @@ class _Supervisor:
         for sig in previous:
             signal.signal(sig, self._stop)
         try:
+            if self.dedicated_cli and _install_controller_death_guard(self._controller_parent):
+                self.stop_requested = True
             return self._run_owned()
         finally:
             for sig, handler in previous.items():
@@ -147,6 +169,17 @@ class _Supervisor:
                 selector.modify(control, selectors.EVENT_READ | selectors.EVENT_WRITE)
 
             try:
+                if self.dedicated_cli:
+                    # Popen already inherited the original handles. The owner
+                    # must not independently keep client input/output alive.
+                    # Flush/close wrappers before releasing the descriptors:
+                    # CPython's original standard streams use closefd=False.
+                    # os.close also releases their CRT-owned handles on Windows.
+                    # Stderr remains available for custody diagnostics.
+                    sys.stdin.close()
+                    sys.stdout.close()
+                    os.close(0)
+                    os.close(1)
                 while True:
                     status = self.child.poll()
                     if status is not None:
@@ -259,7 +292,7 @@ def main() -> int:
         sys.stderr.write("Private Composer supervisor requires an owned runner command\n")
         return 2
     try:
-        return _Supervisor(sys.argv[1:]).run()
+        return _Supervisor(sys.argv[1:], dedicated_cli=True).run()
     except (OSError, SupervisorFailure):
         sys.stderr.write("Private Composer supervisor startup or process custody failed\n")
         return 2
