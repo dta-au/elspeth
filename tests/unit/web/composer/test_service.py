@@ -3511,6 +3511,7 @@ class TestComposerConvergence:
         catalog = _mock_catalog()
         settings = _make_settings(
             composer_max_composition_turns=2,
+            composer_context_max_prompt_tokens=200_000,
             composer_max_discovery_turns=2,
         )
         service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
@@ -3555,6 +3556,7 @@ class TestFailedMutationBudgetClassification:
         catalog = _mock_catalog()
         settings = _make_settings(
             composer_max_composition_turns=1,
+            composer_context_max_prompt_tokens=200_000,
             composer_max_discovery_turns=10,
         )
         service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
@@ -3597,6 +3599,7 @@ class TestFailedMutationBudgetClassification:
         catalog = _mock_catalog()
         settings = _make_settings(
             composer_max_composition_turns=1,
+            composer_context_max_prompt_tokens=200_000,
             composer_max_discovery_turns=10,
         )
         service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
@@ -3636,6 +3639,7 @@ class TestFailedMutationBudgetClassification:
         catalog = _mock_catalog()
         settings = _make_settings(
             composer_max_composition_turns=1,
+            composer_context_max_prompt_tokens=200_000,
             composer_max_discovery_turns=1,
         )
         service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)

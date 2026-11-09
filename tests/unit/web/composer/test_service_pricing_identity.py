@@ -22,6 +22,7 @@ async def test_direct_service_call_uses_role_pricing_identity(tmp_path: Path, mo
     settings = WebSettings(
         data_dir=tmp_path,
         composer_max_composition_turns=15,
+        composer_context_max_prompt_tokens=200_000,
         composer_max_discovery_turns=10,
         composer_timeout_seconds=85.0,
         composer_rate_limit_per_minute=10,
@@ -81,6 +82,7 @@ async def test_malformed_completion_credential_metadata_is_refused_before_audit(
     settings = WebSettings(
         data_dir=tmp_path,
         composer_max_composition_turns=15,
+        composer_context_max_prompt_tokens=200_000,
         composer_max_discovery_turns=10,
         composer_timeout_seconds=85.0,
         composer_rate_limit_per_minute=10,
@@ -160,6 +162,7 @@ async def test_diagnostics_malformed_response_credential_metadata_is_refused_bef
     settings = WebSettings(
         data_dir=tmp_path,
         composer_max_composition_turns=15,
+        composer_context_max_prompt_tokens=200_000,
         composer_max_discovery_turns=10,
         composer_timeout_seconds=85.0,
         composer_rate_limit_per_minute=10,
@@ -207,6 +210,7 @@ async def test_diagnostics_malformed_response_preserves_ordinary_metadata(
     settings = WebSettings(
         data_dir=tmp_path,
         composer_max_composition_turns=15,
+        composer_context_max_prompt_tokens=200_000,
         composer_max_discovery_turns=10,
         composer_timeout_seconds=85.0,
         composer_rate_limit_per_minute=10,
@@ -248,6 +252,7 @@ async def test_advisor_missing_choices_metadata_keeps_terminal_audit_value_free(
     settings = WebSettings(
         data_dir=tmp_path,
         composer_max_composition_turns=15,
+        composer_context_max_prompt_tokens=200_000,
         composer_max_discovery_turns=10,
         composer_timeout_seconds=85.0,
         composer_rate_limit_per_minute=10,
