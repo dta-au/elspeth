@@ -34,7 +34,8 @@ Success means:
 | Early revocation | **Out of scope.** Tom chooses a short lifespan instead. |
 | RAG vector indexes (`persist_directory`) | **Not copied.** Chris's copy gets a fresh, empty index location and rebuilds it. |
 | Sink output locations | **Not copied.** Re-authored for Chris's session, as YAML import already does. |
-| Notify Tom on import | **No user-facing notification.** An audit record is written on Tom's share. |
+| Notify Tom on import | **No user-facing notification.** The import is audited on Chris's session, keyed by the share's snapshot digest. |
+| Sessions schema | **No change** (no migration pathway; an epoch bump would force a fresh store). |
 
 ## What already exists
 
@@ -87,8 +88,9 @@ Success means:
      "tables.t.reference_content", "mode": "inline_content", "encoding": ...}`.
 5. Sign a token whose payload covers the snapshot digest, the chosen expiry, and
    `import_allowed`.
-6. Extend the existing "ready for review" audit record with `import_allowed`,
-   expiry, and the file manifest (names, hashes, sizes).
+6. Write the existing "ready for review" audit row unchanged (it records the
+   snapshot digest and expiry; the digest binds `import_allowed` and the
+   manifest — see §4).
 
 The `files` manifest is private to the snapshot: the shared inspect response
 continues to expose only the public projection plus a recipient-safe file list
@@ -174,12 +176,22 @@ pattern for this endpoint so that a crash cannot leave a visible empty session.
 
 ### 4. Audit
 
-- **Tom's share:** the "ready for review" audit record carries `import_allowed`,
-  expiry and the file manifest.
-- **Each import:** a server-side audit record on Tom's share (importer identity,
-  time, resulting session id). No user-facing notification.
-- **Chris's session:** `shared_import` provenance in composer metadata plus an
-  audit event at publish.
+**No sessions-schema change** (decided 2026-11-09). The sessions database has
+no migration pathway; a new column or event type would bump
+`SESSION_SCHEMA_EPOCH` and force every deployment onto a fresh store.
+
+- **Tom's share:** the existing `mark_ready_for_review` completion-event row
+  already records `payload_digest` and `expires_at`. `import_allowed` and the
+  file manifest live inside the content-addressed snapshot, so the row's digest
+  binds them. Accepted gap: once payload retention reaps the snapshot, the row
+  still identifies what was shared but the manifest detail is gone.
+- **Each import:** recorded on **Chris's** session as an `audit`-role session
+  message (the mechanism the session fork uses for its blob plan) carrying the
+  snapshot digest, Tom's user id, Tom's session and state ids, the file hashes,
+  and the new session id. "Who imported this share" is answered by a server-side
+  query on the digest. Accepted gap: nothing is written on Tom's side, and there
+  is no user-facing notification.
+- **Chris's session:** `shared_import` provenance in composer metadata.
 
 ### 5. Composer invariants
 
