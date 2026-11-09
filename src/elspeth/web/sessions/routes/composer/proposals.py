@@ -25,6 +25,7 @@ from elspeth.web.required_work import (
     RequiredWorkCoordinator,
     RequiredWorkRole,
 )
+from elspeth.web.secrets.wiring_policy import runtime_secret_wiring_policy
 from elspeth.web.sessions.composer_app_services import composer_app_services
 from elspeth.web.sessions.pipeline_rejection import PipelineRejectionExpected
 from elspeth.web.sessions.pipeline_rejection_custody import (
@@ -502,6 +503,7 @@ async def accept_composition_proposal(
                     session_operation_context=lease.context,
                     session_operation_authority=service.session_operation_authority,
                     secret_service=request.app.state.scoped_secret_resolver,
+                    secret_wiring_policy=runtime_secret_wiring_policy(request.app.state.settings.secret_wiring_allowlist),
                     user_id=str(user.user_id),
                     user_message_id=str(proposal.user_message_id) if proposal.user_message_id is not None else None,
                     user_message_content=user_message_content,
