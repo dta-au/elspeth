@@ -2199,10 +2199,19 @@ def _execute_explain_validation_error(
             updated_state=state,
             validation=validation,
             affected_nodes=(),
-            data={"error_text": error_text, "explanation": explanation, "suggested_fix": fix},
+            data={"error_text": error_text, "error_code": error_text, "explanation": explanation, "suggested_fix": fix},
         )
-    for pattern, explanation, fix in _VALIDATION_ERROR_PATTERNS:
+    for record in _VALIDATION_ERROR_PATTERNS:
+        pattern, explanation, fix = record
         if re.search(pattern, error_text):
+            # A legacy regex owns only the codes bound to this exact record by
+            # the catalogue. Shared prose is not identity, and another code in
+            # the input must not override the first matching regex's diagnosis.
+            codes = [code for code, guidance in _VALIDATION_GUIDANCE_BY_CODE.items() if guidance is record]
+            matched_code = next(
+                (code for code in codes if code.lower() in error_text.lower()),
+                codes[0] if len(codes) == 1 else None,
+            )
             return ToolResult(
                 success=True,
                 updated_state=state,
@@ -2210,6 +2219,7 @@ def _execute_explain_validation_error(
                 affected_nodes=(),
                 data={
                     "error_text": error_text,
+                    **({"error_code": matched_code} if matched_code is not None else {}),
                     "explanation": explanation,
                     "suggested_fix": _augment_with_expected_hint(fix, error_text),
                 },

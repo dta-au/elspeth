@@ -216,9 +216,18 @@ def test_failed_diff_stays_validation_only():
         admit_discovery_result("diff_pipeline", replace(result, data={"error_code": "diff_baseline_unavailable"}))
 
 
-def test_successful_explanation_code_survives(producer_results):
-    wire = responses.EXPLAIN_VALIDATION_ERROR_RESPONSE_CONTRACT.admit(producer_results["explain_noisy"].data).to_wire()
-    assert wire["error_code"] == "quarantine_unknown_output"
+@pytest.mark.parametrize(
+    ("case", "code"),
+    [("explain_exact", "unknown_node_type"), ("explain_hint", "unknown_node_type"), ("explain_noisy", "quarantine_unknown_output")],
+)
+def test_successful_explanation_code_survives(producer_results, case, code):
+    wire = responses.EXPLAIN_VALIDATION_ERROR_RESPONSE_CONTRACT.admit(producer_results[case].data).to_wire()
+    assert wire["error_code"] == code
+
+
+def test_unknown_explanation_does_not_acquire_a_code(producer_results):
+    wire = responses.EXPLAIN_VALIDATION_ERROR_RESPONSE_CONTRACT.admit(producer_results["explain_none"].data).to_wire()
+    assert "error_code" not in wire
 
 
 def test_assistance_reuses_owned_examples_and_closes_json_leaves(producer_results):
