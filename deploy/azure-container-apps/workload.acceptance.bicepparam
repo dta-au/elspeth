@@ -22,6 +22,8 @@ param maxReplicas = 1
 param terminationGracePeriodSeconds = 60
 param composerTransportIdleCeilingSeconds = 210
 param composerMaxCompositionTurns = 50
+// Placeholder: set to your model gateway's prompt-token limit before deploying.
+param composerContextMaxPromptTokens = 200000
 param composerMaxDiscoveryTurns = 20
 param composerTimeoutSeconds = 180
 param composerRateLimitPerMinute = 10

@@ -91,6 +91,7 @@ def _assert_example_pricing(resolved: dict[str, Any]) -> None:
         patch.setenv("ELSPETH_WEB__SHAREABLE_LINK_SIGNING_KEY", base64.b64encode(b"synthetic-test-value-32-bytes-long").decode())
         for parameter, field in (
             ("composerMaxCompositionTurns", "COMPOSER_MAX_COMPOSITION_TURNS"),
+            ("composerContextMaxPromptTokens", "COMPOSER_CONTEXT_MAX_PROMPT_TOKENS"),
             ("composerMaxDiscoveryTurns", "COMPOSER_MAX_DISCOVERY_TURNS"),
             ("composerTimeoutSeconds", "COMPOSER_TIMEOUT_SECONDS"),
             ("composerRateLimitPerMinute", "COMPOSER_RATE_LIMIT_PER_MINUTE"),
@@ -687,6 +688,7 @@ def test_parameter_validator_rejects_unresolved_configuration(tmp_path: Path, pa
         "revisionSuffix": "r" + "d" * 12,
         "composerTransportIdleCeilingSeconds": 210,
         "composerMaxCompositionTurns": 15,
+        "composerContextMaxPromptTokens": 200000,
         "composerMaxDiscoveryTurns": 10,
         "composerTimeoutSeconds": 180,
         "composerRateLimitPerMinute": 10,
@@ -837,6 +839,7 @@ else:
         json.dumps(
             {
                 "composerMaxCompositionTurns": 15,
+                "composerContextMaxPromptTokens": 200000,
                 "composerMaxDiscoveryTurns": 10,
                 "composerTimeoutSeconds": 180,
                 "composerRateLimitPerMinute": 10,
