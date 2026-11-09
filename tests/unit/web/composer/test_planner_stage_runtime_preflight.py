@@ -29,7 +29,7 @@ so the UI reads the findings structurally rather than from prose.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import UUID, uuid4
@@ -40,7 +40,7 @@ from elspeth.core.canonical import stable_hash
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.pipeline_planner import PipelinePlanResult
-from elspeth.web.composer.pipeline_proposal import AbsentBase, PipelineProposal
+from elspeth.web.composer.pipeline_proposal import AbsentBase, PipelineProposal, owned_composition_state_execution_arguments_from_restored
 from elspeth.web.composer.protocol import (
     PIPELINE_STAGED_AUTO_COMMIT_MESSAGE,
     PIPELINE_STAGED_REVIEW_FINDINGS_MESSAGE,
@@ -178,7 +178,9 @@ class _FakeSessionsService:
 
 def _plan(candidate_state: CompositionState | None) -> PipelinePlanResult:
     proposal = PipelineProposal.create(
-        pipeline={"sources": {}, "nodes": [], "edges": [], "outputs": []},
+        pipeline=owned_composition_state_execution_arguments_from_restored(candidate_state)
+        if candidate_state is not None
+        else {"sources": {}, "nodes": [], "edges": [], "outputs": []},
         base=AbsentBase(),
         repair_count=0,
         skill_hash=stable_hash("planner-skill"),
@@ -208,11 +210,13 @@ async def _stage(
     trust_mode: str,
     preflight: ValidationResult | BaseException | None,
     candidate_state: CompositionState | None,
+    live_trust_mode: str | None = None,
+    state: CompositionState | None = None,
 ) -> tuple[Any, _FakeSessionsService]:
     """Run ``_stage_pipeline_plan`` with a scripted Stage-2 outcome."""
     service = _service()
-    sessions = _FakeSessionsService(trust_mode)
-    state = _empty_state()
+    sessions = _FakeSessionsService(live_trust_mode or trust_mode)
+    state = state if state is not None else _empty_state()
 
     if isinstance(preflight, BaseException):
         preflight_mock = AsyncMock(spec=service._preflight.cached_runtime_preflight, side_effect=preflight)
@@ -221,7 +225,7 @@ async def _stage(
 
     with (
         patch.object(service._planning_application, "_sessions_service_optional", sessions),
-        patch.object(service._planning_application, "_persist_pipeline_planner_audit", new_callable=AsyncMock),
+        patch.object(service._planning_application, "_persist_pipeline_planner_audit", new_callable=AsyncMock) as audit,
         patch.object(service._preflight, "cached_runtime_preflight", preflight_mock),
     ):
         staged_session_id = uuid4()
@@ -242,7 +246,50 @@ async def _stage(
             planner_withheld_replies=(),
             plugin_snapshot=None,
         )
+        audit.assert_awaited_once()
+        if candidate_state is not None and candidate_state.metadata == state.metadata:
+            preflight_mock.assert_not_awaited()
     return result, sessions
+
+
+def _changed_state() -> CompositionState:
+    state = _empty_state()
+    return replace(state, metadata=replace(state.metadata, name="Changed pipeline"))
+
+
+@pytest.mark.parametrize(
+    "snapshot,live", [("explicit_approve", "explicit_approve"), ("auto_commit", "auto_commit"), ("auto_commit", "explicit_approve")]
+)
+async def test_equal_finalized_plan_persists_audit_then_returns_synthesized_unchanged(snapshot: str, live: str) -> None:
+    state = replace(_empty_state(), version=7)
+    result, sessions = await _stage(
+        trust_mode=snapshot,
+        live_trust_mode=live,
+        preflight=AssertionError("no new runtime claim"),
+        candidate_state=replace(state, version=8),
+        state=state,
+    )
+    assert result.state is state
+    assert result.state.version == 7
+    assert sessions.created_proposals == []
+    assert result.pipeline_commit_intent is None
+    assert result.runtime_preflight is None
+    assert result.raw_assistant_content == ""
+    assert result.tool_invocations == () and result.llm_calls == ()
+    assert "unchanged" in result.message.lower()
+
+
+async def test_changed_plan_downgrade_retains_review_and_green_preflight() -> None:
+    result, sessions = await _stage(
+        trust_mode="auto_commit",
+        live_trust_mode="explicit_approve",
+        preflight=_green_result(),
+        candidate_state=_changed_state(),
+    )
+    assert len(sessions.created_proposals) == 1
+    assert result.pipeline_commit_intent is None
+    assert result.message == PIPELINE_STAGED_REVIEW_MESSAGE
+    assert result.runtime_preflight is not None and result.runtime_preflight.is_valid
 
 
 # ---------------------------------------------------------------------------
@@ -254,7 +301,7 @@ async def test_green_preflight_keeps_auto_commit_and_validated_wording() -> None
     result, _ = await _stage(
         trust_mode="auto_commit",
         preflight=_green_result(),
-        candidate_state=_empty_state(),
+        candidate_state=_changed_state(),
     )
 
     assert result.message == PIPELINE_STAGED_AUTO_COMMIT_MESSAGE
@@ -268,7 +315,7 @@ async def test_green_preflight_under_explicit_approve_uses_validated_review_word
     result, _ = await _stage(
         trust_mode="explicit_approve",
         preflight=_green_result(),
-        candidate_state=_empty_state(),
+        candidate_state=_changed_state(),
     )
 
     assert result.message == PIPELINE_STAGED_REVIEW_MESSAGE
@@ -286,7 +333,7 @@ async def test_red_preflight_downgrades_auto_commit_to_review() -> None:
     result, sessions = await _stage(
         trust_mode="auto_commit",
         preflight=_red_result(),
-        candidate_state=_empty_state(),
+        candidate_state=_changed_state(),
     )
 
     # Downgraded, NOT hard-failed: the proposal still staged for a human.
@@ -303,7 +350,7 @@ async def test_red_preflight_on_review_arm_is_truthful() -> None:
     result, _ = await _stage(
         trust_mode="explicit_approve",
         preflight=_red_result(),
-        candidate_state=_empty_state(),
+        candidate_state=_changed_state(),
     )
 
     assert result.message == PIPELINE_STAGED_REVIEW_FINDINGS_MESSAGE
@@ -320,7 +367,7 @@ async def test_pending_interpretation_review_blocks_auto_commit() -> None:
     result, _ = await _stage(
         trust_mode="auto_commit",
         preflight=_pending_review_result(),
-        candidate_state=_empty_state(),
+        candidate_state=_changed_state(),
     )
 
     assert result.pipeline_commit_intent is None
@@ -338,7 +385,7 @@ async def test_pending_interpretation_review_is_not_reported_as_findings() -> No
     result, _ = await _stage(
         trust_mode="auto_commit",
         preflight=_pending_review_result(),
-        candidate_state=_empty_state(),
+        candidate_state=_changed_state(),
     )
 
     assert result.message == PIPELINE_STAGED_REVIEW_PENDING_INTERPRETATION_MESSAGE
@@ -359,7 +406,7 @@ async def test_preflight_failure_is_not_run_and_blocks_auto_commit() -> None:
             original_exc=RuntimeError("preflight exploded"),
             partial_state=None,
         ),
-        candidate_state=_empty_state(),
+        candidate_state=_changed_state(),
     )
 
     assert len(sessions.created_proposals) == 1
@@ -385,7 +432,7 @@ async def test_preflight_timeout_is_not_run() -> None:
             original_exc=TimeoutError("deadline expired"),
             partial_state=None,
         ),
-        candidate_state=_empty_state(),
+        candidate_state=_changed_state(),
     )
 
     assert result.pipeline_commit_intent is None
@@ -403,7 +450,7 @@ async def test_cancellation_is_not_swallowed_into_a_staged_proposal() -> None:
         await _stage(
             trust_mode="auto_commit",
             preflight=asyncio.CancelledError(),
-            candidate_state=_empty_state(),
+            candidate_state=_changed_state(),
         )
 
 
