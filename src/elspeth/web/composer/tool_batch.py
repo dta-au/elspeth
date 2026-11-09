@@ -1637,19 +1637,13 @@ async def run_tool_batch(
                     cached_result = normalize_tool_result_validation(cached_result, ctx.policy_catalog)
                     if cached_admitted is not None:
                         cached_admitted = AdmittedDiscoveryResult(cached_result, cached_admitted.response, cached_admitted.contract)
-                    cached_payload = {
-                        "success": cached_result.success,
-                        "data": cached_admitted.response.to_wire()
-                        if cached_admitted is not None and cached_admitted.response is not None
-                        else cached_result.data,
-                        "cache_hit": True,
-                    }
                     cached_outcome = cached_admitted.to_tool_result() if cached_admitted is not None else cached_result
                     cached_json = (
                         serialize_admitted_discovery_result(cached_admitted)
                         if cached_admitted is not None
                         else _serialize_tool_result(cached_result)
                     )
+                    cached_payload = (cached_admitted if cached_admitted is not None else cached_result).to_dict()
                 except Exception as cache_exc:
                     recorder.record(finish_plugin_crash(audit, exc=cache_exc))
                     raise
