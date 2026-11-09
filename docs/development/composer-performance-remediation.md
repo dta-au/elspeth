@@ -1317,8 +1317,13 @@ Record raw output, not summaries, in each fix's Evidence line.
   (2 cases) fails in this checkout with "an active human admin already
   exists" because the CLI reaches the local PostgreSQL sessions database
   where `pilot`/`demo` were bootstrapped, and passes with `.env` moved
-  aside (verified 2026-11-09). Environmental here; the `--no-dotenv` gap
-  is a latent defect worth a ticket, not part of this plan.
+  aside (verified 2026-11-09). Filed and fixed as
+  [#353](https://github.com/dta-au/elspeth/issues/353): two defects — the
+  pytest-dotenv `env_files` preload leaked the checkout's `.env` into
+  in-process `CliRunner` tests (new opt-in `dotenv_free_environment`
+  fixture), and the CLI's bare `load_dotenv()` searched upward from the
+  package file rather than the cwd (now `find_dotenv(usecwd=True)`;
+  `elspeth web` from the repo root resolves the same file as before).
 - The doctor warns `composer_turn_budget_underfunded`: 240 s funds ~16 turns
   against 34 configured. Left as supplied; revisit if runs time out.
 - Network: this session was moved onto a personal environment allowing

@@ -33,6 +33,11 @@ from tests.unit.web.auth.conftest import local_auth_engine_owner as local_auth_e
 
 runner = CliRunner()
 
+# These tests invoke ``elspeth --no-dotenv`` in-process; strip what
+# pytest-dotenv loaded from the checkout's ``.env`` so the flag means what it
+# says here too (GitHub issue #353).
+pytestmark = pytest.mark.usefixtures("dotenv_free_environment")
+
 
 @pytest.fixture(autouse=True)
 def _restore_web_command_environment() -> Iterator[None]:

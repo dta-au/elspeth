@@ -397,7 +397,7 @@ def _load_dotenv(env_file: Path | None = None) -> bool:
     Raises:
         typer.Exit: If explicit env_file path doesn't exist.
     """
-    from dotenv import load_dotenv
+    from dotenv import find_dotenv, load_dotenv
 
     if env_file is not None:
         if not env_file.exists():
@@ -409,8 +409,14 @@ def _load_dotenv(env_file: Path | None = None) -> bool:
             raise typer.Exit(1)
         return load_dotenv(env_file, override=False)
 
-    # load_dotenv searches current dir and parents by default
-    return load_dotenv(override=False)  # Don't override existing env vars
+    # Search upward from the working directory. A bare ``load_dotenv()``
+    # searches upward from the *calling file* -- this module -- so an editable
+    # checkout loaded the checkout's ``.env`` from any cwd and a wheel install
+    # ignored the operator's cwd ``.env`` (GitHub issue #353).
+    discovered = find_dotenv(usecwd=True)
+    if not discovered:
+        return False
+    return load_dotenv(discovered, override=False)  # Don't override existing env vars
 
 
 def _emit_schema_compatibility_error(
