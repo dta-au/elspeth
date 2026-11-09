@@ -226,7 +226,13 @@ binding/inspection. These are ordinary document reviews, not sealed approvals or
 implementation acceptance. The parent also checked decisive sources and reran
 the source/generation probes.
 
-## Document checks and final source state
+## Document checks and final source state (initial assessment run)
+
+This section records the initial assessment run, before the assessment was
+committed (`6f9cbe4e5`) and before the 2026-11-09 review wave edited the sheets
+and shared documents. Its figures and tree-state lines are historical; the
+review wave's own checks are in
+[§ Per-sheet review wave](#per-sheet-review-wave-2026-11-09).
 
 The completed document instrument compared sheet names to the runtime-emitted
 union, required all seven assessment sections, parsed every retained input
@@ -266,10 +272,16 @@ files are left uncommitted for review.
   do not establish how every provider adapter behaves remotely.
 - No general plugin qualification or full-runtime completeness verdict follows
   from these tool assessments. Relevant plugin/capability paths were traced.
-- A source-inspection concurrent-read race and `clear_source` review-parity
-  consequences remain hypotheses requiring actual permitted lifecycle schedules.
-- Secret-reference metadata/availability interleaving remains unverified. A
-  list-then-check shape alone is not a demonstrated authorization or scope fault.
+- A source-inspection concurrent-read race remains a hypothesis requiring an
+  actual permitted lifecycle schedule. `clear_source` review parity is narrowed:
+  node review hashes never cover sources, so no node-review anchor can drift;
+  pending review records held outside composition state remain unverified
+  (`clear_source-N4`).
+- Secret-reference list/validate divergence is demonstrated as a static
+  mismatch (LSR-N1), and its misattribution consequences are demonstrated in
+  memory under an injected interleaving (`validate_secret_ref-N1`). A true
+  concurrent race against `/api/secrets` remains unrun; neither result is an
+  authorization fault.
 - Whole-file reads before bounded response/preview output are source-established;
   memory/latency severity was not measured. Recovery histories above 100 parks
   were not exercised.
@@ -278,6 +290,254 @@ files are left uncommitted for review.
   data cleanup, migration or the weakening of current preserve/refuse behavior.
 - Incoming `.10 lite` changes require targeted source and control refresh. The
   abandoned full `.10` patch was not used as authority.
+
+## Per-sheet review wave (2026-11-09)
+
+### Method
+
+One Opus reviewer per tool sheet, 46 in all, re-traced its sheet against the
+baseline source, corrected it in place and added §3.1 route inventory, §5.1
+guidance parity, §6.1 simple enhancements and new sheet-scoped findings
+(`<tool>-N<n>`, or the sheet's own prefix). Each wrote a report with
+corrections, new findings, routes, enhancements, guidance problems,
+cross-cutting notes, proposed probes and interference. Reports are untracked
+local files at `.claude/lanes/composer-sheet-review-20261109/<tool>.md`
+relative to the main checkout; the sheets carry the durable content.
+
+Evidence used by reviewers:
+
+- source tracing, with `grep` instruments controlled by a known-positive match;
+- read-only Python introspection with `elspeth.__file__` verified inside the
+  worktree;
+- in-memory runs of handlers, `execute_tool` dispatch, MCP `_dispatch_tool`,
+  planner manifest helpers and selected services on in-memory SQLite; a few
+  drove the compose loop with a scripted fake LLM
+  (`request_interpretation_review-N1`) or the real advisor call path with a
+  stubbed provider (`request_advisor_hint-N1`).
+
+"Demonstrated in memory" in the register means one of these runs observed the
+behaviour. It is not a route-level, provider, deployed or browser observation.
+
+### Limits
+
+Reviewers ran no pytest, live provider, PostgreSQL, deployed service, browser
+or npm. Source-established rows rest on traces whose line anchors the reviewers
+checked against the baseline; their consequences (HTTP status, turn outcome)
+are often marked hypothesis in the sheet. Two lanes applied short scripted
+exact-string substitutions to their own sheets' link lines instead of the edit
+tool (`get_expression_grammar`, `inspect_source`); several lanes recorded the
+advisor tool as rate-limited. No lane reported instructions from a
+non-coordinator sender.
+
+The integrating pass re-checked the decisive cross-cutting claims by grep
+against the baseline: the explicit-approve dry-run gate and its missing refused
+branch (`tool_batch.py:2057-2127`); 0 occurrences of `secret_wiring_policy` in
+the accept route; 0 occurrences of `admit_discovery_result` under
+`composer_mcp/` against 2 in `tool_batch.py`; `DISCOVERY_NO_GAIN` only as enum,
+error-code entry and comment, and no `.covers(` caller; no
+`WEB_SURFACE_PROHIBITED` producer in the snapshot builder, the other snapshot
+constructors copying or passing `()`, and `e7f6f1521` an ancestor of HEAD; both
+`PlannerDiscoveryPolicy` constructions passing the full tool tuple; the planner
+rendering the composer skill (`planning_application.py:1077`).
+
+### Coordinator mutation probe
+
+The only pytest run in the wave, maintainer-approved, tested
+`get_expression_grammar-N4` with lane-private copies of `src/` and
+`elspeth.__file__` verified to resolve into each copy:
+
+| Variant of the grammar's Operators line | `test_expression_grammar_documents_every_operator` |
+|---|---|
+| Baseline | passed, exit 0 |
+| `<` and `>` removed | passed, exit 0 (defect: substring membership is masked by `<=`/`>=`) |
+| `==` removed (control) | failed, exit 1 |
+
+The test therefore does not guard the operators it names. No other proposed
+probe has been run.
+
+### Test files outside the recorded selections
+
+Reviewers cited tests that no selection above includes, read but not run:
+`test_recovery_control_palettes.py` (recovery palette, mixed-batch and
+malformed-head entries), `test_model_discovery_scope.py` (planner-route model
+scope), `test_patch_source_options_noop.py` (the SG-03 source reference) and
+`test_blob_proposal_accept.py` (blob proposal receipt replay, BOS-04).
+
+### Proposed-but-unrun probes
+
+One line per probe; the exact commands are in the lane reports named above
+(untracked, `.claude/lanes/composer-sheet-review-20261109/<tool>.md`), several
+of which embed machine-specific paths and must be transcribed, not copied.
+Probes the reviewers already ran in memory are excluded. "Would show" is the
+question each answers, not a predicted result.
+
+| Sheet | Finding | Would show |
+|---|---|---|
+| `clear_source` | N1 | Orphan `"source"` edge at service level, and how preflight/YAML treat it |
+| `clear_source` | N2 | Whether an explicit-approve clear of an absent root creates a proposal, and the accept outcome |
+| `clear_source` | N5 | Whether clear+rebind loses review carry-over that a direct rebind keeps |
+| `clear_source` | N4 | Whether removing a source with a pending `invented_source` review leaves an open request |
+| `clear_source` | N1 (UI) | Whether GraphView silently drops an edge from a non-existent root |
+| `create_blob` | N2 | Revoked identity through the tool: plugin crash vs the upload route's 503 |
+| `create_blob` | N3 | Identity-cap refusal labelled "Session blob quota exceeded" and uncoded |
+| `create_blob` | N4 | NUL filename through `run_tool_batch`: PLUGIN_CRASH with no durable effect |
+| `create_blob` | strict `description: null` | Control that strict null decodes to omission end to end |
+| `create_blob` | N1 | Whether the planner attempts `create_blob` under a scripted SDK |
+| `create_blob` | N7 | Ready blob with no persisted invocation after a process death |
+| `delete_blob` | N1 | End-to-end deletion of a bound blob named by a non-canonical spelling |
+| `delete_blob` | N3 | Turn outcome when explicit-approve staging raises `ValueError` |
+| `delete_blob` | N2 | Bound blob staged, then 422 auto-reject on accept |
+| `diff_pipeline` | N1 | Planner self-diff returning zero changes end to end |
+| `diff_pipeline` | N2 | MCP baseline rebased after a failed `load_session` |
+| `diff_pipeline` | N5 | Diff refusal listed as resolved in the next mutation's `validation_delta` |
+| `emit_pipeline_proposal` | N2 | Terminal plus recovery sibling ends with `MALFORMED_RESPONSE` and no candidate |
+| `emit_pipeline_proposal` | N1 | Mutation control that the missing-source branch is unreachable while `oneOf` holds |
+| `emit_pipeline_proposal` | N4 | Whether rejection or staleness releases an inline-custody blob |
+| `explain_validation_error` | N1–N5 | Re-confirmation of the measured catalogue counts on a receiving branch |
+| `get_audit_info` | N5 | Whether any web path can carry `landscape.export` |
+| `get_audit_info` | GS-03 | Frontend pin of the corrected sentence (vitest) |
+| `get_blob_content` | N1 | 262,145 vs 262,144 bytes through the handler: credential vs success |
+| `get_blob_content` | N2 | Every page refusing "cannot fit" on a draft with ten dangling nodes |
+| `get_blob_content` | N3 | Raw vs canonical echo for an uppercase selector |
+| `get_blob_content` | N6 | ESTALE from `read_bytes` escaping as `OSError` |
+| `get_blob_metadata` | BOS-03 | Every accepted spelling vs lookup, on SQLite and on PostgreSQL |
+| `get_blob_metadata` | N2 | Manifest covering the uppercase key but not the canonical one |
+| `get_blob_metadata` | N4 | Credential-filename refusal code and empty data |
+| `get_pipeline_state` | N1, N3 | Not-found `error_code` and selector normalization through public dispatch |
+| `get_pipeline_state` | N4 | Absolute vs relative blob path spelling changing the export verdict |
+| `get_pipeline_state` | N2 | Persisted tool result collapsing to the unknown-key sentinel |
+| `get_pipeline_state` | N9 | Whether a node payload copied from the export is accepted by `upsert_node` |
+| `get_plugin_assistance` | N1 | Planner rejection feedback lacking `requirement_code` |
+| `get_plugin_assistance` | N3 | Empty `issue_code` closing the planner key |
+| `get_plugin_assistance` | N4 | MCP vs admitted freeform result parity |
+| `get_plugin_assistance` | N5 | Profiled `llm` assistance telling the model to pin a private field |
+| `get_plugin_assistance` | N1 (planner) | Whether any planner channel exposes the semantic code |
+| `get_plugin_schema` | N2 | What happens when an MCP agent obeys the `operator_profiled` description |
+| `get_plugin_schema` | N1 | How often the 48 KiB projection falls back to the canonical shape |
+| `get_plugin_schema` | N4 | Catalogue fix contradicting the structural-node message |
+| `handoff_to_user` | N3 | User-visible operation code for a mixed recovery batch |
+| `handoff_to_user` | N1 | Pending `set_pipeline` proposal superseded by a reset |
+| `handoff_to_user` | N2 | Safe checkpoint selecting the newer same-operation checkpoint |
+| `inspect_source` | N1 | Absent storage file softened to an uncoded failure |
+| `inspect_source` | N2 | Unhealed crash leftover visible to inspection; concurrent update race |
+| `inspect_source` | N5, N6 | `;`-delimited and headerless files producing wrong or raw headers |
+| `inspect_source` | BOS-03 | Uppercase and braced selectors on inspection |
+| `inspect_source` | N7 | Two encodings sharing one planner key |
+| `list_blobs` | N1 | "Gaps closed" notice after a truncated inventory |
+| `list_blobs` | N4 | Tie ordering on SQLite and PostgreSQL |
+| `list_blobs` | N7 | File panel omitting the 51st blob (browser) |
+| `list_blobs` | N5 | Credential-shaped stored filename withholding the whole inventory |
+| `list_blobs` | BOS-01 | Re-confirmation of the evidence probe on a receiving branch |
+| `list_composer_blobs` | N3, N4 | Oversize and binary ready blobs listed and wireable |
+| `list_composer_blobs` | N4 (validation) | Validation result for a wired binary blob |
+| `list_composer_blobs` | XC-01 | Planner behaviour when the skill asks for an inline marker |
+| `list_composer_blobs` | N7 | Boundary membership varying with equal `created_at` |
+| `list_models` | N4 | Bundled slice and no provenance when OpenRouter is not primed |
+| `list_models` | N1 | Prefixed-provider output under a live OpenRouter snapshot |
+| `list_models` | N7, GS-03 | Progress headline and tooltip in a browser |
+| `list_secret_refs` | LSR-N1 | Rotated `secret_key` observed end to end in a freeform turn |
+| `list_sinks` | N1, N2 | The projection and emptiness findings against the full test baseline |
+| `list_sinks` | N9 | Whether repeated cached discovery is bounded only by the deadline |
+| `list_sinks` | N5 | Cache-hit audit row lacking `validation` |
+| `list_sources` | N1 | No production policy emitting the categorical reason |
+| `list_sources` | N2 | Same placement trap for sinks/transforms; which duplicate the runtime reads |
+| `list_sources` | strict `{}` | Freeform strict empty call returning ARG_ERROR with repair text |
+| `list_transforms` | N15 | Planner executing a repeated read with no `DISCOVERY_NO_GAIN` |
+| `list_transforms` | N1 | No `plugin_not_allowed_on_web` on a running dev service |
+| `list_transforms` | all-cache-hit | Provider calls vs budget counters on repeated cached reads |
+| `patch_node_options` | N5 | Whether `set_pipeline` heals a corrupt digest like `upsert_node` |
+| `patch_node_options` | N6 | Explicit-approve proposal for a patch on a missing node |
+| `patch_node_options` | N7 | Real MCP dispatcher admitting an out-of-root `persist_directory` |
+| `patch_node_options` | N10 | Partial `interpretation_requirements` effect on planner-owned rows |
+| `patch_output_options` | PO-N4 | Refused preview still staged, then 422 on accept |
+| `patch_output_options` | PO-N2 | Turn-level crash for a non-string sink path |
+| `patch_source_options` | N2 | No-op proposal staged, then plain 409 on accept |
+| `patch_source_options` | N6 | MCP stdio refusal on a path-bound source |
+| `patch_source_options` | N8 | Planner feedback naming a tool the planner lacks |
+| `patch_source_options` | N7 | Rendered "EXECUTABLE VERBATIM" patch reaching an uploaded source |
+| `patch_source_options` | N5 | Whether the removed review event survives outside the graph |
+| `preview_pipeline` | N1 | Contract violation through the real custody path |
+| `preview_pipeline` | N6 | Preflight computed before rejecting extra arguments |
+| `preview_pipeline` | N2 | Planner preview showing `runtime_preflight_not_run` on empty state |
+| `preview_pipeline` | N7 | Preview judging the pre-proposal state without disclosure |
+| `preview_pipeline` | N11 | MCP remediation text for a `blob_ref` source |
+| `read_attachment` | N2 | ESTALE through `run_tool_batch`: plugin crash |
+| `read_attachment` | N1 | Which operation kind each caller uses, before enforcing the allowlist |
+| `read_attachment` | N3 | Non-ASCII document against a live provider |
+| `remove_node` | N5 | Removing a required control and the explicit-approve rewrite |
+| `remove_node` | explicit approval | Proposal round trip for `remove_node` |
+| `remove_node` | N11 | Persisted-response redaction of `applied_component` |
+| `remove_output` | N2 | Absent-sink proposal staged, then 422 on accept |
+| `request_advisor_hint` | N8 | SPA outcome stamp per advisor status |
+| `request_advisor_hint` | N2 | Transcript size vs the prompt cap |
+| `request_advisor_hint` | N7 | Oversized abandonment context failing as generic `ADVISOR_ERROR` |
+| `request_advisor_hint` | N6 | Anti-anchor reset suppressing the §7.7 hint |
+| `request_advisor_hint` | N13 | Clarification framing after `cannot_complete` |
+| `request_interpretation_review` | N1, N2, N3 | The in-memory results as focused tests with existing fixtures |
+| `request_interpretation_review` | PostgreSQL | Stage/resolve contention on PostgreSQL |
+| `restore_parked_graph` | N5 | Turn-level failure code for a malformed restore |
+| `restore_parked_graph` | N1, N2 | Success-path supersession, and an incremental proposal left to 409 |
+| `restore_parked_graph` | N3 | Uppercase park id refused |
+| `set_metadata` | N6 | Compose-loop effect of a rename on progress consumers |
+| `set_metadata` | N5 | Whether wire limits bound a 10M-character name |
+| `set_metadata` | N2 | Reachability of the unrelated-output refusal from a loaded state |
+| `set_output` | N1, N3 | Turn-level crash for `path: null`; explicit-approve staging |
+| `set_pipeline` | N8 | The builder-count test turning red when it patches the bound name |
+| `set_pipeline` | N1 | MCP stdio storing `/etc/passwd` as a source path |
+| `set_pipeline` | N5 | Refusal channel for `source` plus `sources` by trust mode |
+| `set_source` | N8 | Accept-route outcome when a preview `ToolArgumentError` recurs |
+| `set_source` | N1 | Service-level PLUGIN_CRASH for `path: 123` |
+| `set_source` | N1 sibling | Provider-config path type escape via `upsert_node` |
+| `set_source_from_blob` | N5 | Guarantee-stamp carry-over with genuine review evidence |
+| `set_source_from_blob` | N1 | Explicit-approve card omitting accept-time controls |
+| `set_source_from_blob` | N2 | JSONL bound as `json` failing at runtime |
+| `set_source_from_blobs` | N7 | Turn outcome when staging raises `ValueError` |
+| `set_source_from_blobs` | N2 | Whether a `source_data_contract` review is reachable for `blob_rows` |
+| `splice_transform` | N8 | Explicit-approve staging of a refused splice |
+| `splice_transform` | N9 | Replay after required-control auto-wiring failing topology |
+| `update_blob` | N7 | Turn outcome for an unknown id under explicit approval |
+| `update_blob` | N1 | Turn-level `AuditIntegrityError` for an `error` blob |
+| `update_blob` | N8 | Deletion-ledger row escalating on update |
+| `upsert_edge` | N1 (UI) | Whether GraphView renders a `"source"` edge under named sources |
+| `upsert_edge` | N9 | Approval UI omitting the routing change (browser) |
+| `upsert_node` | N1 | Aggregation/coalesce cases of the validity divergence |
+| `upsert_node` | N1 (turn) | Whether the runtime failure reaches the model as a repairable code |
+| `upsert_node` | MCP | Out-of-root `persist_directory` admitted on MCP |
+| `upsert_node` | N4 | Review status after replacing a node with a queue |
+| `upsert_node` | baseline | Existing suites the §6.1 fixes touch, before implementation |
+| `validate_secret_ref` | N3 | Profiled credential shadowed by a user row through `validate_pipeline` |
+| `validate_secret_ref` | N1 | True concurrent race on SQLite and PostgreSQL |
+| `validate_secret_ref` | batch scan | How a whole-batch credential refusal reaches the agent |
+| `wire_blob_inline_ref` | N2, N3 | Explicit-approve consequence of staging an unchecked wire |
+| `wire_blob_inline_ref` | N1 | The validity result under the real catalogue |
+| `wire_blob_inline_ref` | N1 (turn) | Unrelated `delete_blob` failing after the wire |
+| `wire_secret_ref` | N1 | Accept-route denial with the allowlist configured |
+| `wire_secret_ref` | N3 | Undeclared option with a marker at runtime preflight |
+| `wire_secret_ref` | explicit approval | Unchecked wire staged as `APPROVAL_REQUIRED` |
+
+### Integration checks
+
+A read-only checker run by the integrating pass (kept with the lane reports as
+`.claude/lanes/composer-sheet-review-20261109/check_integration.py`) scanned the
+five shared documents. It checks that every relative link target exists, that
+`#Lnn` anchors fall within the target's line count, that heading anchors exist,
+that no user-home absolute path appears, and that every cited finding ID (`<tool>-N<n>`,
+the `-N<n>` shorthand after a tool ID, `LSR-`/`PO-`/`METADATA-N<n>`, and
+`handoff_to_user` N<n>) occurs in the named sheet. A table pass resolves the
+bare N-numbers in the probe table's Finding column against each sheet's own
+prefix.
+
+| Run | Links | Line anchors | Heading anchors | Inline IDs | Table IDs | Problems | Exit |
+|---|---|---|---|---|---|---|---|
+| Shared documents, final | 214 | 29 | 8 | 258 | 134 | 0 | 0 |
+| Negative control: scratch copy with a missing sheet, an anchor past EOF, a missing heading, fabricated N99/N98 inline IDs for `list_sinks`, `upsert_edge` (shorthand form), `list_secret_refs` and `handoff_to_user`, three fabricated probe rows (`clear_source`, `handoff_to_user`, `set_metadata`) and one genuine probe row | 217 | 30 | 9 | 263 | 138 | 10 (each planted defect; genuine row passes) | 1 |
+
+The probe table has 141 rows. Fourteen of them have Finding cells that are
+register IDs or prose (for example `BOS-03`, `XC-01`, `strict {}`, `baseline`),
+which the table pass cannot check. The first run found one wrong citation,
+which was corrected before the final run. Quick-win citations to §6.1 labels (E*, item, row) were checked against
+each sheet separately. Unnumbered §6.1 tables are cited by row position. The
+tool sheets themselves were not re-checked by this pass.
 
 ## Reproduction source
 

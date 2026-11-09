@@ -43,7 +43,10 @@ and truthfully project those semantics rather than independently recreate them.
   and [PolicyCatalogView](../../../src/elspeth/web/catalog/policy_view.py#L191)
   exposes policy/profile projections and shared authored/executable validation.
   A policy-hidden or credential-unavailable plugin is not automatically a
-  defective plugin.
+  defective plugin. The projection is not universal: profiled `llm`/Bedrock
+  assistance falls through unprojected (`get_plugin_assistance-N5`) and the
+  validation-suggestion route calls the raw hook (`get_plugin_assistance-N7`,
+  latent: no profiled publisher today).
 - **Durable publication and recovery authority.**
   [Pipeline commit bindings](../../../src/elspeth/web/composer/pipeline_commit.py)
   and [session turn settlement](../../../src/elspeth/web/sessions/composer_turn.py#L1051)
@@ -62,14 +65,19 @@ The public freeform call to
 [`execute_tool`](../../../src/elspeth/web/composer/tool_batch.py#L3008) omits
 `baseline`; the [dispatcher](../../../src/elspeth/web/composer/tools/_dispatch.py#L795)
 defaults it to `None`; the diff handler then refuses with
-`diff_baseline_unavailable`. Planner context and MCP pass a baseline. Controlled
+`diff_baseline_unavailable`. MCP passes a session baseline (rebased even after a
+failed `load_session`, `diff_pipeline-N2`). The planner passes
+`baseline=current_state` and diffs that same state, so every planner call
+returns zero changes (`diff_pipeline-N1`, 2026-11-09 review). Controlled
 handler cases distinguish missing baseline, a changed baseline and the identical
 state. The attempted full-service reproduction failed at harness admission
 before a provider call, so it is not end-to-end runtime evidence.
 
 **Related evidence:** [source inspection](tools/inspect_source.md) can succeed
 under a direct context that lacks the storage root and operation authority
-required by `get_blob_content`. This proves tool admission inconsistency; it
+required by `get_blob_content`. It also bypasses `_locked_blob_row_for_read`,
+whose docstring requires every content read to run inside the custody lock
+(`inspect_source-N2`). This proves tool admission inconsistency; it
 does not establish a reachable unauthorized HTTP read or a concurrency exploit.
 
 **Underlying cause:** [ToolContext](../../../src/elspeth/web/composer/tools/_common.py#L3678)
@@ -94,8 +102,9 @@ contracts does not mean advertising every tool on every route.
 rows. Controlled 1/50/51-row cases prove the omitted oldest entry and absent
 continuation/completeness signal. No data loss or authorization failure is
 implied. [GS-03, `list_models`](tools/list_models.md) and
-[`get_audit_info`](tools/get_audit_info.md) have browser tooltip claims broader
-than their implementations: a model catalogue is not a deployment credential
+[`get_audit_info`](tools/get_audit_info.md) have browser descriptions broader
+than their implementations, rendered on three surfaces (settled ribbon, info
+bubble and live tool log, not only a tooltip): a model catalogue is not a deployment credential
 probe; constant audit-policy facts are not current-session run lineage.
 
 **Related source limitation:** recovery context advertises at most 100 parked
@@ -120,8 +129,11 @@ unrequested remote probes merely to satisfy an overbroad description.
 
 **Concrete findings:** [BOS-03, `get_blob_metadata`](tools/get_blob_metadata.md)
 admits syntactically valid alternative UUID forms but performs a raw-text
-lookup, whereas other blob paths canonicalize the identity. The canonical ID
-succeeds and the uppercase representation of the same identity reports missing.
+lookup. The canonical ID succeeds and the uppercase representation of the same
+identity reports missing. Other blob paths canonicalize the lookup but not
+every later use: content readers echo the raw selector, proposal custody and
+the delete/update retention guards compare raw text, and planner keys split by
+spelling (BOS-03, XC-08).
 [BOS-02, `get_blob_content`](tools/get_blob_content.md) and
 [`read_attachment`](tools/read_attachment.md) return ordinary failed tool
 results for missing bytes behind ready metadata, while the canonical blob
@@ -159,9 +171,11 @@ then reports progress only for the version-advancing cases.
 **Related limitation:** [BOS-04, `create_blob`](tools/create_blob.md),
 [`update_blob`](tools/update_blob.md), and [`delete_blob`](tools/delete_blob.md)
 have real store effects without graph version advancement. Their durable
-custody machinery is valuable, but a new model call does not carry a generally
-advertised exactly-once replay identity. This is not evidence that completed
-operation replay duplicates a blob or that durable drivers lack recovery.
+custody machinery is valuable. The proposal-accept route already has
+receipt-backed replay for blob proposals ([`delete_blob`](tools/delete_blob.md) §5 BOS-04); a fresh
+freeform `auto_commit` call does not carry a generally advertised exactly-once
+replay identity. This is not evidence that completed operation replay
+duplicates a blob or that durable drivers lack recovery.
 
 The [result envelope](../../../src/elspeth/web/composer/tools/_common.py#L993),
 [prospective effect domains](../../../src/elspeth/web/composer/tools/declarations.py#L106),
@@ -191,12 +205,16 @@ queue invariant runs. Public schema-admitted dispatch reports success, while
 the authoritative invariant rejects a node retaining each same field. The
 reviewer and parent independently reproduced this with a canonical queue
 positive control. This is argument loss before validation, not evidence that
-an invalid queue is stored or executed as a collector.
+an invalid queue is stored or executed as a collector. Bulk `set_pipeline`
+refuses the same input, so SG-07 is specific to `upsert_node`; it is one cell
+of a wider wrong-kind admission matrix (`upsert_node-N2`).
 
 **Other findings/limitations:** [SG-02, `splice_transform`](tools/splice_transform.md)
-works on the valid control graph but refuses an insertion when unrelated
-pre-existing missing-output findings leave the full candidate invalid. The
-full-validity precondition is not adequately explained in its selection guidance.
+works on the valid control graph but refuses a new insertion when unrelated
+pre-existing missing-output findings leave the full candidate invalid (replay
+skips the check). The full-validity precondition is not adequately explained in
+its selection guidance, and the refusal forwards zero entries while its
+guidance says the entries name each new error (`splice_transform-N1`).
 Other incremental tools can preserve invalid drafts for later repair.
 [SG-01, `upsert_edge`](tools/upsert_edge.md) and [`remove_edge`](tools/remove_edge.md)
 also have deliberately different semantics for visual edges and executable
@@ -241,6 +259,11 @@ have several owners to reconcile. The recovered-state receipts demonstrate
 that these paths can be made precise without forcing every operation into a
 synchronous mutation handler.
 
+Async tools are not effect-free: in an opted-out session
+`request_interpretation_review` appends composition state, and the turn then
+fails its own persistence check (`request_interpretation_review-N1`, XC-17).
+"Pending review is not a mutation" holds only when review is enabled.
+
 **Orchestrator consequence:** the model's terminal call, advisor stop, pending
 review, user handoff and committed pipeline completion must remain different
 outcomes. A first-class orchestrator needs those distinctions as owned data,
@@ -251,6 +274,87 @@ cover sync, async and terminal roles; retain specialized execution owners and
 receipts. Descriptions and UI summaries should consume or be checked against
 these contracts. This is an incremental unification of authority, not a demand
 for one giant handler or one universal state store.
+
+## 7. Recurring causes newly evidenced by the 2026-11-09 sheet review
+
+The 46 per-sheet reviews (method and limits in
+[evidence](evidence.md#per-sheet-review-wave-2026-11-09)) mostly add instances
+to groups 1–6. Eight causes recur often enough to name separately. Register
+IDs are in the [README](README.md#cross-cutting-findings-added-by-the-review-wave).
+
+**One skill text, several palettes.** The planner renders the freeform
+composer skill as its own (`rendered_skill = self._composer_skill_text`,
+[planning_application.py L1077](../../../src/elspeth/web/composer/planning_application.py#L1077)),
+plus authoring aids, plugin `composer_hints` and catalogue repair text written
+with the freeform palette in mind. The planner's 23-tool palette lacks every
+mutation, so guidance that is correct on freeform is a dead end there (XC-01).
+The same mechanism runs in reverse (freeform is taught a planner-only manifest)
+and sideways (MCP serves hints naming tools it lacks). The cause is that
+guidance is authored per document, not rendered per route from the palette;
+nothing tests the two together. Group 2's "descriptions authored in separate
+surfaces" is the same cause one level down.
+
+**Publication without admission.** In explicit approval the dry run is gated
+on `tool_name in _MUTATION_TOOLS and tool_name != "set_pipeline"`
+([tool_batch.py L2057](../../../src/elspeth/web/composer/tool_batch.py#L2057));
+the only handled outcome is a valid, version-advancing preview, and a refused
+preview has no branch. Blob and secret mutations are outside the set. A
+proposal therefore reaches the user while the model is told it succeeded, and
+the refusal surfaces at accept (XC-02). The approval path is a second
+dispatcher that does not share the immediate path's admission.
+
+**Every re-invocation assembles its own context.** Group 1's optional
+`ToolContext` reappears at each site that calls `execute_tool` again: the
+explicit-approve preview passes `secret_wiring_policy`, the accept route
+([proposals.py L493](../../../src/elspeth/web/sessions/routes/composer/proposals.py#L493))
+does not, so every accepted secret wire is denied (XC-03); MCP passes
+`data_dir=None` with opposite effects on source, sink and provider paths
+(XC-10); MCP also skips discovery response admission because its dispatcher
+serializes `result.to_dict()` directly
+([server.py L415](../../../src/elspeth/composer_mcp/server.py#L415); XC-09).
+GS-01 was the first instance, not an isolated one.
+
+**Fault taxonomy fails in both directions.** Group 3 described owned faults
+softened into ordinary failures (BOS-02, now on more readers). The reviews
+show the inverse as often: Tier-3 values (non-string or NUL paths, NUL
+filenames, malformed recovery controls) and expected lifecycle states (a
+`pending` blob given to `update_blob`, ESTALE) escape as raw exceptions that end
+the turn, and a public wire can write a shape that later trips a Tier-1 guard
+in an unrelated tool (XC-05). Web-owned gates dereference values before plugin
+validation types them.
+
+**Identity is admitted at one stage and compared raw at another.** Blob and
+park IDs are parsed with `UUID()` for admission, then compared as text in
+lookup, echo, proposal custody, retention guards and planner keys (BOS-03,
+XC-08, XC-13). The integrity-relevant case is the retention guard, not the
+lookup miss.
+
+**Dead policy branches are still taught.** `prohibited` has had no producer
+since `e7f6f1521` (XC-11); `DISCOVERY_NO_GAIN` and `covers()` have no
+production caller (XC-12); the `model_catalog` aid both skills cite is never
+attached (`list_models-N6`). Each is described in tool descriptions or skills as
+live behaviour. When a branch was removed or never wired, its teaching text,
+contracts and tests were not removed with it.
+
+**Validity and reconciliation are evaluated by different readers.** Composer
+Stage-1 validity reads routing fields kind-blind while lowering drops some
+(`upsert_node-N1`); edge/scalar mirroring and the literal `"source"` endpoint are
+reconciled at some writers and not others (XC-15, XC-16). An incremental
+`is_valid=True` is therefore not a runtime promise, which group 5 implied but
+did not demonstrate.
+
+**Instruments that pass for the wrong reason.** Three tests or checks were
+shown to stay green over the defect they appear to guard: the grammar operator
+check uses substring membership, and a coordinator mutation probe confirmed it
+passes with `<` and `>` removed (`get_expression_grammar-N4`); a builder-count
+test patches a name its caller does not bind (`set_pipeline-N8`); guidance tests
+pin the inverted `explain_validation_error` pointer (`explain_validation_error-N1`).
+Remediation acceptance should include a mutation control for each new check.
+
+Audit-facing prose has drifted too: several redaction justifications cite a
+`tools.py` module that no longer exists, four handler docstrings are dead code
+(`get_audit_info-N1`), and `get_tool_definitions` says it returns 42 tools
+against 43 measured. This is hygiene, not an agent-facing defect.
 
 ## Confidence, risk, gaps and follow-ups
 
@@ -268,7 +372,9 @@ Compatibility is required for current supported public/operator/persistence
 surfaces; no blanket old-Composer exception or data reset is assumed here.
 
 The [evidence record](evidence.md) distinguishes executed tests, source proof,
-failed probes and outstanding questions. No live provider, deployed environment,
+failed probes and outstanding questions. The 2026-11-09 review wave's rows are
+source-established or demonstrated in memory; route-level reproduction is the
+first implementation step. No live provider, deployed environment,
 full Python suite, PostgreSQL testcontainer contention selection or browser
 suite was run. No claim is made that every plugin or provider transport is
 qualified. Refresh affected traces, controls and focused tests when `.10 lite`

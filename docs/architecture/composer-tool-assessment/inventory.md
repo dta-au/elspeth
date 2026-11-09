@@ -25,8 +25,15 @@ The stated 46 reconciles exactly: 41 synchronous declarations, two async tools
 (`handoff_to_user`, `restore_parked_graph`) and the private planner terminal
 `emit_pipeline_proposal`. The freeform and planner sets are intentionally
 different. Both dialects have equal name sets; this does not imply equal wire
-schemas or live provider behavior. A configured planner discovery policy may
-narrow the default planner set measured here.
+schemas or live provider behavior. Nothing narrows the planner set at this
+baseline: both `PlannerDiscoveryPolicy` constructions pass the full
+`PLANNER_DISCOVERY_TOOL_NAMES` tuple
+([initial](../../../src/elspeth/web/composer/pipeline_planner.py#L379),
+[with_manifest](../../../src/elspeth/web/composer/pipeline_planner.py#L398));
+the narrowing API at L1663 has no narrowing caller (corrected by the 2026-11-09
+review; [`diff_pipeline`](tools/diff_pipeline.md) §3). Exposure is not usefulness: on the planner
+`diff_pipeline`, `get_pipeline_state` and `preview_pipeline` cannot add
+information (`diff_pipeline-N1`, `get_pipeline_state-N6`, `preview_pipeline-N2`).
 
 MCP exposes 26 names shared with this Web Composer universe and six local-session
 utilities: `new_session`, `save_session`, `load_session`, `list_sessions`,
@@ -103,7 +110,7 @@ explicitly because those tools do not have a synchronous declaration.
 - [Canonical emitter](../../../src/elspeth/web/composer/tools/_dispatch.py#L311).
 - [Loop producer](../../../src/elspeth/web/composer/provider_gateway.py#L391).
 - [Planner producer](../../../src/elspeth/web/composer/pipeline_planner.py#L1647).
-- [Recovery definitions](../../../src/elspeth/web/composer/recovery_controls.py#L32).
+- [Recovery definitions](../../../src/elspeth/web/composer/recovery_controls.py#L35).
 - [MCP filtered surface](../../../src/elspeth/composer_mcp/server.py#L210).
 
 Re-run the producers in a checkout-local frozen environment. For example:
