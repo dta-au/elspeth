@@ -626,3 +626,43 @@ async def test_reasoning_effort_without_capability_raises_capability_unsupported
 
     assert exc_info.value.code == GatewayErrorCode.CAPABILITY_UNSUPPORTED
     assert not upstream.called
+
+
+# --- thinking_blocks ---------------------------------------------------------------
+
+_THINKING_BLOCK = {"type": "thinking", "thinking": "let me think", "signature": "sig-abc"}
+_TOOL_TURN = [
+    {"role": "user", "content": "hi"},
+    {
+        "role": "assistant",
+        "content": None,
+        "thinking_blocks": [_THINKING_BLOCK, {"type": "redacted_thinking", "data": "opaque-blob"}],
+        "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "lookup", "arguments": "{}"}}],
+    },
+    {"role": "tool", "tool_call_id": "call_1", "content": "42"},
+]
+
+
+def test_to_canonical_request_carries_assistant_thinking_blocks_in_order():
+    canonical = to_canonical_request(_chat_request(messages=_TOOL_TURN), {"target": "backend-a"})
+    assistant = canonical.messages[1]
+    assert [(block.kind, block.thinking, block.signature, block.data) for block in assistant.thinking_blocks] == [
+        ("thinking", "let me think", "sig-abc", None),
+        ("redacted_thinking", None, None, "opaque-blob"),
+    ]
+    assert canonical.messages[0].thinking_blocks == ()
+
+
+@respx.mock
+async def test_thinking_blocks_without_reasoning_capability_raise_capability_unsupported_before_upstream_call(client):
+    """Replayed thinking blocks need an adapter that can hand them back to the
+    model; one that cannot refuses rather than silently dropping them."""
+    adapter = FakeAdapter(capabilities=frozenset({Capability.TEXT, Capability.TOOLS}))
+    service = _service(_config(), adapter, client)
+    upstream = respx.post(UPSTREAM_URL)
+
+    with pytest.raises(GatewayError) as exc_info:
+        await service.complete(_chat_request(messages=_TOOL_TURN), "req-cap-thinking")
+
+    assert exc_info.value.code == GatewayErrorCode.CAPABILITY_UNSUPPORTED
+    assert not upstream.called

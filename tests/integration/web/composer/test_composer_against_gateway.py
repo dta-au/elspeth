@@ -151,6 +151,8 @@ _OAUTH_CLIENT_SECRET = "composer-gw-e2e-oauth-client-secret-0123456789abcdef"  #
 _MODEL_ALIAS = "gpt-5.1"
 _SAMPLING_MODEL_ALIAS = "gpt-4.1"  # explicit model whose sampling contract admits temperature + seed
 _MODEL_TARGET = "composer-gw-e2e-target"
+# What the mock upstream returns, as a reasoning model, beside a USE_TOOL call.
+_MOCK_TOOL_MUSINGS = [{"kind": "thought", "text": "MOCK thinking before list_sources", "seal": "MOCK-SEAL-list_sources"}]
 _OAUTH_HOST = "oauth.composer-gw-e2e.mock"
 _UPSTREAM_HOST = "upstream.composer-gw-e2e.mock"
 
@@ -714,6 +716,11 @@ async def test_composer_tool_round_trip_against_gateway(tmp_path: Path, gateway_
             return conversation[conversation.index(trigger)]["text"]
         assert conversation[-1]["speaker"] == "tool"
         assert conversation[-1]["operation_ref"] == "mock-call-ref-1"
+        # The reasoning model's signed thinking from turn one is replayed on
+        # the assistant tool-call entry, exactly and before the operations:
+        # ELSPETH -> ELSPETH LLM Gateway -> adapter -> upstream.
+        (tool_call_entry,) = [entry for entry in conversation if "operations" in entry]
+        assert tool_call_entry["musings"] == _MOCK_TOOL_MUSINGS
         assert json.loads(original_last_text(conversation))["success"] is True
         return original_last_text(conversation)
 
@@ -777,6 +784,12 @@ async def test_composer_tool_round_trip_against_gateway(tmp_path: Path, gateway_
     result = await _run_gateway_loop_turn(service, session_id=session_id, message="USE_TOOL list_sources {}")
     assert unexpected_models == []
     assert len(primary_calls) == len(primary_replies) == len(conversations) == 2
+    # Every primary call carried the reasoning hint, and turn one's thinking
+    # came back out of the gateway in the native shape LiteLLM keeps.
+    assert [call["reasoning_effort"] for call in primary_calls] == ["low", "low"]
+    assert primary_replies[0].choices[0].message.thinking_blocks == [
+        {"type": "thinking", "thinking": "MOCK thinking before list_sources", "signature": "MOCK-SEAL-list_sources"}
+    ]
     assert len(end_calls) == 1
 
     # The tool call was admitted and dispatched -- the defect made this an

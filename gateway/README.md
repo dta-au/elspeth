@@ -71,6 +71,19 @@ that does not declare it, a request carrying the hint is refused with
 derived adapter that does not declare `reasoning` therefore cannot serve
 ELSPETH's composer.
 
+Reasoning models return their thinking, and a tool loop must hand it back. An
+assistant message may carry `thinking_blocks`: a non-empty list of
+`{"type": "thinking", "thinking": ..., "signature": ...}` and
+`{"type": "redacted_thinking", "data": ...}` entries, the shape ELSPETH and
+LiteLLM replay. The gateway passes them to the adapter in order and unmodified
+(`CanonicalMessage.thinking_blocks`), and returns the thinking an adapter
+reports (`CanonicalResponse.thinking_blocks`) on the response message in the
+same shape. Each string counts against `ELSPETH_LLM_GATEWAY_MAX_STRING_CHARS`.
+A request that replays thinking to an adapter without the `reasoning`
+capability is refused with `capability_unsupported`. An adapter for a model
+that requires signed thinking on tool-loop turns (Claude with thinking enabled)
+must forward the blocks byte-for-byte.
+
 One alias exists: **`max_completion_tokens`**, OpenAI's current spelling of
 `max_tokens`, is accepted and folded into `max_tokens`. This is not
 cosmetic — LiteLLM's `openai` provider path *translates* a caller-supplied

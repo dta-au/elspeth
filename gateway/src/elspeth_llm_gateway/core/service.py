@@ -24,7 +24,9 @@ from elspeth_llm_gateway.core.config import GatewayConfig
 from elspeth_llm_gateway.core.contract import (
     Bounds,
     ChatMessage,
+    ChatRedactedThinkingBlock,
     ChatRequest,
+    ChatThinkingBlock,
     ChatTool,
     ChatToolCall,
     ResponseFormat,
@@ -39,6 +41,7 @@ from elspeth_llm_gateway.sdk.types import (
     CanonicalMessage,
     CanonicalRequest,
     CanonicalResponse,
+    CanonicalThinkingBlock,
     CanonicalToolCall,
     CanonicalToolDef,
     Capability,
@@ -59,7 +62,14 @@ def _canonicalize_message(message: ChatMessage) -> CanonicalMessage:
         content=None if message.role == "assistant" and message.content == "" and tool_calls else message.content,
         tool_calls=tool_calls,
         tool_call_id=message.tool_call_id,
+        thinking_blocks=tuple(_canonicalize_thinking_block(block) for block in (message.thinking_blocks or [])),
     )
+
+
+def _canonicalize_thinking_block(block: ChatThinkingBlock | ChatRedactedThinkingBlock) -> CanonicalThinkingBlock:
+    if isinstance(block, ChatThinkingBlock):
+        return CanonicalThinkingBlock(kind="thinking", thinking=block.thinking, signature=block.signature)
+    return CanonicalThinkingBlock(kind="redacted_thinking", data=block.data)
 
 
 def _canonicalize_tool(tool: ChatTool) -> CanonicalToolDef:
@@ -135,6 +145,11 @@ def _check_capabilities(request: ChatRequest, capabilities: frozenset[Capability
         raise GatewayError(GatewayErrorCode.CAPABILITY_UNSUPPORTED)
 
     if request.reasoning_effort is not None and Capability.REASONING not in capabilities:
+        raise GatewayError(GatewayErrorCode.CAPABILITY_UNSUPPORTED)
+
+    # Replayed thinking must reach the model; an adapter that cannot carry it
+    # refuses instead of silently dropping it.
+    if Capability.REASONING not in capabilities and any(message.thinking_blocks for message in request.messages):
         raise GatewayError(GatewayErrorCode.CAPABILITY_UNSUPPORTED)
 
 

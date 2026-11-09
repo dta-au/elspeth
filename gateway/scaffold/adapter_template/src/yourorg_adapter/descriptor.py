@@ -31,6 +31,12 @@ ADAPTER_API_MAJOR = 1
 # a conformance failure, not a harmless overstatement: the conformance kit
 # runs every mandatory test for every capability you declare, and "declare
 # fewer, pass all of them" is the correct default for a first adapter.
+#
+# ELSPETH's composer and advisor must be reasoning models: they send
+# reasoning_effort on every call and replay thinking_blocks on tool-loop
+# turns, and the gateway refuses both unless Capability.REASONING is declared.
+# An adapter that serves ELSPETH's composer must declare it and implement it
+# (see request.py and response.py).
 DECLARED_CAPABILITIES = frozenset({Capability.TEXT})
 
 

@@ -9,7 +9,8 @@ the same reply.
 
 Behavior is keyed on the *last* ``conversation`` entry's ``text``:
 
-- ``"USE_TOOL <op> <json>"`` -> an ``invocations`` response, halt
+- ``"USE_TOOL <op> <json>"`` -> an ``invocations`` response (plus one signed
+  ``musings`` thought when the request sets ``generation.deliberation``), halt
   ``"operations"``.
 - ``"TRIGGER_FAULT <kind>"`` -> the matching fault body and HTTP status
   (``throttle`` 429, ``overloaded`` 503, ``screening``/``too_long`` 400).
@@ -144,10 +145,15 @@ def create_mock_upstream_app(*, require_bearer_prefix: str = _DEFAULT_BEARER_PRE
             except json.JSONDecodeError:
                 return _malformed_trigger_response()
             reply = json.dumps(payload)
+            result: dict = {"invocations": [{"ref": _MOCK_TOOL_CALL_REF, "operation": operation, "payload": payload}]}
+            if "deliberation" in (body.get("generation") or {}):
+                # Like a reasoning model with thinking enabled: signed thinking
+                # beside the tool call, which the caller must replay next turn.
+                result["musings"] = [{"kind": "thought", "text": f"MOCK thinking before {operation}", "seal": f"MOCK-SEAL-{operation}"}]
             return JSONResponse(
                 status_code=200,
                 content={
-                    "result": {"invocations": [{"ref": _MOCK_TOOL_CALL_REF, "operation": operation, "payload": payload}]},
+                    "result": result,
                     "halt": "operations",
                     "accounting": {"input_units": input_units, "output_units": len(reply) // 4},
                 },
