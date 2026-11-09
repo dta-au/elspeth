@@ -11,12 +11,13 @@ from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.compartments import compartment_ingress_record
-from elspeth.web.composer.protocol import ComposerRuntimePreflightError
+from elspeth.web.composer.pipeline_proposal import composition_content_hash
+from elspeth.web.composer.protocol import ComposerRuntimePreflightError, ToolArgumentError
 from elspeth.web.composer.required_controls import (
     merge_required_control_affected_components,
     wire_required_controls_state,
 )
-from elspeth.web.composer.tools import is_approval_required_blob_store_only_mutation_tool
+from elspeth.web.composer.tools import is_approval_required_blob_store_only_mutation_tool, is_blob_store_only_mutation_tool
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.required_work import (
     RequiredAuthorityKind,
@@ -73,12 +74,40 @@ from .._helpers import (
 )
 from .pipeline_settlement import (
     _await_with_deferred_cancellation,
+    _DeferredCancellationState,
     _proposal_chat_ingress_inputs,
     _proposal_user_message_content,
     settle_pipeline_proposal_under_compose_lock,
 )
 
 router = APIRouter()
+
+
+async def _reject_legacy_proposal_refusal(
+    service: SessionServiceProtocol,
+    *,
+    session_id: UUID,
+    proposal_id: UUID,
+    actor: str,
+    lease: SessionOperationLease,
+    cancellations: _DeferredCancellationState,
+) -> bool:
+    """Drain a terminal refusal; only a competing terminal transition is benign."""
+    try:
+        await _await_with_deferred_cancellation(
+            service.reject_composition_proposal(
+                session_id=session_id,
+                proposal_id=proposal_id,
+                actor=actor,
+                session_operation_context=lease.context,
+            ),
+            state=cancellations,
+        )
+    except ProposalStateConflictError:
+        # The winner owns the terminal evidence. A missing loaded row is an
+        # integrity failure and deliberately escapes this narrow catch.
+        return False
+    return True
 
 
 async def _drain_proposal_lease_close(
@@ -489,34 +518,62 @@ async def accept_composition_proposal(
                 if cancellation_deferred or cleanup_cancelled:
                     raise asyncio.CancelledError
                 return response
-            result, was_cancelled = await _await_with_deferred_cancellation(
-                run_sync_in_worker(
-                    execute_tool,
-                    proposal.tool_name,
-                    arguments,
-                    current_state,
-                    policy_catalog,
-                    plugin_snapshot=plugin_snapshot,
-                    data_dir=str(request.app.state.settings.data_dir),
-                    session_engine=request.app.state.session_engine,
-                    session_id=str(session.id),
-                    session_operation_context=lease.context,
-                    session_operation_authority=service.session_operation_authority,
-                    secret_service=request.app.state.scoped_secret_resolver,
-                    secret_wiring_policy=runtime_secret_wiring_policy(request.app.state.settings.secret_wiring_allowlist),
-                    user_id=str(user.user_id),
-                    user_message_id=str(proposal.user_message_id) if proposal.user_message_id is not None else None,
-                    user_message_content=user_message_content,
-                    composer_model_identifier=proposal.composer_model_identifier,
-                    composer_model_version=proposal.composer_model_version,
-                    composer_provider=proposal.composer_provider,
-                    composer_skill_hash=proposal.composer_skill_hash,
-                    tool_arguments_hash=proposal.tool_arguments_hash,
-                    executing_proposal_id=str(proposal.id),
-                    validate_arguments=True,
-                    require_data_dir_for_paths=True,
+            legacy_cancellations = _DeferredCancellationState()
+            try:
+                result, was_cancelled = await _await_with_deferred_cancellation(
+                    run_sync_in_worker(
+                        execute_tool,
+                        proposal.tool_name,
+                        arguments,
+                        current_state,
+                        policy_catalog,
+                        plugin_snapshot=plugin_snapshot,
+                        data_dir=str(request.app.state.settings.data_dir),
+                        session_engine=request.app.state.session_engine,
+                        session_id=str(session.id),
+                        session_operation_context=lease.context,
+                        session_operation_authority=service.session_operation_authority,
+                        secret_service=request.app.state.scoped_secret_resolver,
+                        secret_wiring_policy=runtime_secret_wiring_policy(request.app.state.settings.secret_wiring_allowlist),
+                        user_id=str(user.user_id),
+                        user_message_id=str(proposal.user_message_id) if proposal.user_message_id is not None else None,
+                        user_message_content=user_message_content,
+                        composer_model_identifier=proposal.composer_model_identifier,
+                        composer_model_version=proposal.composer_model_version,
+                        composer_provider=proposal.composer_provider,
+                        composer_skill_hash=proposal.composer_skill_hash,
+                        tool_arguments_hash=proposal.tool_arguments_hash,
+                        executing_proposal_id=str(proposal.id),
+                        validate_arguments=True,
+                        require_data_dir_for_paths=True,
+                    ),
+                    state=legacy_cancellations,
                 )
-            )
+            except ToolArgumentError as argument_error:
+                durable_transition = await _reject_legacy_proposal_refusal(
+                    service,
+                    session_id=session.id,
+                    proposal_id=proposal.id,
+                    actor=f"system:argument-invalid:user:{user.user_id}",
+                    lease=lease,
+                    cancellations=legacy_cancellations,
+                )
+                legacy_cancellations.raise_if_requested()
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "detail": (
+                            f"The composer's proposed change has invalid arguments: {argument_error.args[0]} "
+                            + (
+                                "The proposal has been automatically rejected. Ask the composer to revise and resubmit."
+                                if durable_transition
+                                else "The proposal is already terminal. Reload the proposals to see its recorded outcome."
+                            )
+                        ),
+                        "error_type": "proposal_argument_invalid",
+                        "tool_name": proposal.tool_name,
+                    },
+                ) from argument_error
             cancellation_deferred = cancellation_deferred or was_cancelled
             if result.success and result.updated_state.version > current_state.version and result.validation.is_valid:
                 finalized_state, was_cancelled = await _await_with_deferred_cancellation(
@@ -525,7 +582,8 @@ async def accept_composition_proposal(
                         result.updated_state,
                         plugin_snapshot,
                         policy_catalog,
-                    )
+                    ),
+                    state=legacy_cancellations,
                 )
                 cancellation_deferred = cancellation_deferred or was_cancelled
                 if finalized_state is not result.updated_state:
@@ -533,7 +591,8 @@ async def accept_composition_proposal(
                         run_sync_in_worker(
                             policy_catalog.validate_composition_state,
                             finalized_state,
-                        )
+                        ),
+                        state=legacy_cancellations,
                     )
                     cancellation_deferred = cancellation_deferred or was_cancelled
                     if not finalized_validation.validation.is_valid:
@@ -548,6 +607,38 @@ async def accept_composition_proposal(
                             finalized_validation.authored_state,
                         ),
                     )
+
+            if (
+                result.success
+                and not is_blob_store_only_mutation_tool(proposal.tool_name)
+                and composition_content_hash(result.updated_state) == composition_content_hash(current_state)
+            ):
+                durable_transition = await _reject_legacy_proposal_refusal(
+                    service,
+                    session_id=session.id,
+                    proposal_id=proposal.id,
+                    actor=f"system:no-change:user:{user.user_id}",
+                    lease=lease,
+                    cancellations=legacy_cancellations,
+                )
+                legacy_cancellations.raise_if_requested()
+                if cancellation_deferred:
+                    raise asyncio.CancelledError
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "detail": (
+                            "The composer's proposed change does not change the current composition. "
+                            + (
+                                "The proposal has been automatically rejected. Ask the composer to revise and resubmit."
+                                if durable_transition
+                                else "The proposal is already terminal. Reload the proposals to see its recorded outcome."
+                            )
+                        ),
+                        "error_type": "proposal_no_change",
+                        "tool_name": proposal.tool_name,
+                    },
+                )
 
             accepted_state = None
             if result.updated_state.version == current_state.version:

@@ -2694,6 +2694,119 @@ describe("sessionStore", () => {
       ]);
     });
 
+    it.each(["proposal_validation_failed", "proposal_argument_invalid", "proposal_no_change"])(
+      "refreshes terminal proposals after %s and retains error details",
+      async (errorType) => {
+        const api = await import("@/api/client");
+        const pending = makeCompositionProposal();
+        const rejected = makeCompositionProposal({ status: "rejected" });
+        vi.mocked(api.acceptCompositionProposal).mockRejectedValue({
+          status: 422, error_type: errorType, detail: "The proposal was rejected.",
+          validation_errors: [{ message: "Invalid configuration" }],
+        });
+        vi.mocked(api.fetchCompositionProposals).mockResolvedValue([rejected]);
+        useSessionStore.setState({
+          activeSessionId: pending.session_id, compositionProposals: [pending],
+        });
+
+        await useSessionStore.getState().acceptProposal(pending.id);
+
+        expect(api.fetchCompositionProposals).toHaveBeenCalledWith(pending.session_id);
+        expect(useSessionStore.getState().compositionProposals).toEqual([rejected]);
+        expect(useSessionStore.getState().staleProposalIds).toEqual([]);
+        expect(useSessionStore.getState().proposalActionPendingIds).toEqual([]);
+        expect(useSessionStore.getState().error).toBe("The proposal was rejected.");
+        expect(useSessionStore.getState().errorDetails).toEqual(
+          errorType === "proposal_validation_failed" ? ["Invalid configuration"] : null,
+        );
+        await useSessionStore.getState().loadCompositionProposals();
+        expect(useSessionStore.getState().compositionProposals).toEqual([rejected]);
+      },
+    );
+
+    it.each(["proposal_argument_invalid", "proposal_no_change"])(
+      "keeps %s refusal detail when refresh fails",
+      async (errorType) => {
+        const api = await import("@/api/client");
+        const pending = makeCompositionProposal();
+        vi.mocked(api.acceptCompositionProposal).mockRejectedValue({
+          status: 422, error_type: errorType, detail: "Terminal refusal.",
+        });
+        vi.mocked(api.fetchCompositionProposals).mockRejectedValue(new TypeError("Failed to fetch"));
+        useSessionStore.setState({ activeSessionId: pending.session_id, compositionProposals: [pending] });
+
+        await useSessionStore.getState().acceptProposal(pending.id);
+
+        expect(api.fetchCompositionProposals).toHaveBeenCalledWith(pending.session_id);
+        expect(useSessionStore.getState().error).toBe("Terminal refusal.");
+        expect(useSessionStore.getState().compositionProposals).toEqual([pending]);
+        expect(useSessionStore.getState().staleProposalIds).toEqual([]);
+      },
+    );
+
+    it.each(["proposal_argument_invalid", "proposal_no_change"])(
+      "does not publish delayed %s refresh into a different session",
+      async (errorType) => {
+        const api = await import("@/api/client");
+        const pending = makeCompositionProposal();
+        const refresh = deferred<CompositionProposal[]>();
+        vi.mocked(api.acceptCompositionProposal).mockRejectedValue({
+          status: 422, error_type: errorType, detail: "Old refusal.",
+        });
+        vi.mocked(api.fetchCompositionProposals).mockReturnValueOnce(refresh.promise);
+        useSessionStore.setState({ activeSessionId: pending.session_id, compositionProposals: [pending] });
+        const accepting = useSessionStore.getState().acceptProposal(pending.id);
+        await vi.waitFor(() => expect(api.fetchCompositionProposals).toHaveBeenCalled());
+        useSessionStore.setState({ activeSessionId: "another-session", compositionProposals: [], error: "New session" });
+        refresh.resolve([makeCompositionProposal({ status: "rejected" })]);
+        await accepting;
+        expect(useSessionStore.getState().compositionProposals).toEqual([]);
+        expect(useSessionStore.getState().error).toBe("New session");
+      },
+    );
+
+    it.each(["proposal_argument_invalid", "proposal_no_change"])(
+      "does not publish delayed %s refresh after the same session is reselected",
+      async (errorType) => {
+        const api = await import("@/api/client");
+        const pending = makeCompositionProposal();
+        const current = makeCompositionProposal({ id: "new-proposal", tool_call_id: "new-call" });
+        const refresh = deferred<CompositionProposal[]>();
+        vi.mocked(api.acceptCompositionProposal).mockRejectedValue({
+          status: 422, error_type: errorType, detail: "Old refusal.",
+        });
+        vi.mocked(api.fetchCompositionProposals)
+          .mockReturnValueOnce(refresh.promise)
+          .mockResolvedValueOnce([current]);
+        vi.mocked(api.fetchMessages).mockResolvedValue([]);
+        vi.mocked(api.fetchCompositionState).mockResolvedValue(null);
+        useSessionStore.setState({ activeSessionId: pending.session_id, compositionProposals: [pending] });
+        const accepting = useSessionStore.getState().acceptProposal(pending.id);
+        await vi.waitFor(() => expect(api.fetchCompositionProposals).toHaveBeenCalled());
+        await useSessionStore.getState().selectSession(pending.session_id);
+        useSessionStore.setState({ error: "Current activation" });
+        refresh.resolve([makeCompositionProposal({ status: "rejected" })]);
+        await accepting;
+        expect(useSessionStore.getState().compositionProposals).toEqual([current]);
+        expect(useSessionStore.getState().error).toBe("Current activation");
+        expect(useSessionStore.getState().proposalActionPendingIds).toEqual([]);
+      },
+    );
+
+    it("keeps a transient accept failure pending without a proposal refresh", async () => {
+      const api = await import("@/api/client");
+      const pending = makeCompositionProposal();
+      vi.mocked(api.acceptCompositionProposal).mockRejectedValue({
+        status: 500, error_type: "runtime_preflight_failed", detail: "Try again.",
+      });
+      useSessionStore.setState({ activeSessionId: pending.session_id, compositionProposals: [pending] });
+      await useSessionStore.getState().acceptProposal(pending.id);
+      expect(api.fetchCompositionProposals).not.toHaveBeenCalled();
+      expect(useSessionStore.getState().compositionProposals).toEqual([pending]);
+      expect(useSessionStore.getState().staleProposalIds).toEqual([]);
+      expect(useSessionStore.getState().error).toBe("Try again.");
+    });
+
     it("marks stale proposals after accept returns a stale-state conflict", async () => {
       const apiClient = await import("@/api/client");
       (
