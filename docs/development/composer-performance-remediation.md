@@ -55,7 +55,7 @@ verifying path), not by the type of the container.
 | 1 | Cache immutable catalog summaries | Low | Low | Unit | open |
 | 2A | Route interpretation-resolve validation through the queue | Low | Low | Vitest | open |
 | 3-T1 | Stream read consolidation (no semantic change) | Low–Med | Medium | **Testcontainer**, ADR-047 | landed (change 2 reverted); testcontainer suites owed |
-| 2B | Share validation result with readiness | Medium | Medium | Vitest + readiness unit | open — decision needed |
+| 2B | Share validation result with readiness | Medium | Medium | Vitest + readiness unit | 2B frontend landed (readiness skip stopped); 2C backend memo landed |
 | 4A | Per-component prompt token accounting | Low | Low | None | open |
 | 4B | Reasoning-effort tuning | Medium (quality) | Low | — | open — applies on OpenRouter test models |
 | 3-T2 | Snapshot-bound per-send stream authorization | High (semantic) | Low code | Developer ruling | not started — ruling needed |
@@ -368,7 +368,47 @@ the result `/validate` just computed for the same state. Kept inside
 (`validate_state.assert_awaited_once`) stays valid. Invalidate on any input
 the key names; never cross users.
 
-**Evidence (2C).** _(fill in)_
+**Evidence (2C, landed; lane report
+`.claude/lanes/perf-eval/fix2c-implementation.md`).** New module
+`src/elspeth/web/execution/validation_memo.py`: `ValidationResultMemo`
+(64 entries, 10 s TTL on a monotonic clock, single-flight sharing for
+same-loop callers, a caller on another event loop computes for itself;
+failures and cancellations never stored; every stored and returned result a
+deep copy). The key is content, not `state_id`, because `validate_state`
+receives the state object: `(user_id, session_id,
+composition_content_hash(state), state.version, plugin_snapshot.snapshot_hash,
+frozenset(secret inventory))`. The snapshot hash carries the binding
+generation fingerprint and profile credential fingerprints; the inventory
+carries secret names, scope and availability. Completion gates are merged
+after the memo and are not in the key. Two inputs the key cannot represent
+are handled directly: a state with any user-authored `secret_ref` or
+declared `${NAME}` site bypasses the memo (validation resolves the value and
+nothing fingerprints it), and every blob metadata row the inner run
+consulted is recorded (`BlobReadLog`) and re-read under the caller's own
+session-operation context before a hit is served; a failed content read or a
+blob observed two ways makes the run uncacheable. Execute and approval
+binding call the preflight directly and never read the memo. **Rulings
+(orchestrator, 2026-11-09):** the shareable-review mark validates fresh.
+`validate_state` and `ReadinessService.compute_snapshot` take keyword-only
+`fresh: bool = False` (also on the two local protocols); `mark_ready_for_review`
+passes `fresh=True` to both, so nothing written into the durable review
+record derives from the advisory memo; `/validate` and the readiness route
+keep the default. Call counts (spy on `_authoritative_state_preflight_sync`):
+POST `/validate` then GET `/audit-readiness` 2 → 1; the concurrent pair 2 →
+1; different user, state, version, availability, inventory or blob row, and
+TTL expiry each recompute. Timing (40-transform state, medians): readiness
+after `/validate` 93.3 → 4.5 ms, the pair 185 → 93 ms; not re-measured
+against the live server. Tests: 30 in `test_validation_memo.py` (21 of 21
+deliberate mutations of the memo turned tests red), fresh-bypass test with
+its `fresh=False` control, readiness forwards `fresh`, mark asserts `fresh`
+on both calls; mutation controls for the pass-through and the call-site
+keyword both red. Implementer's scoped selection 3,085 passed; orchestrator
+confirmation `tests/unit/web/execution/ audit_readiness/ shareable_reviews/`
++ `tests/integration/web/test_audit_readiness_routes.py`: 2,306 passed, exit
+0; ruff, format, mypy, `check_contracts` (census 2,615) clean. The
+`test_service_lifecycle` exact-call assertion gained the forwarded
+`blob_reads` argument. Architecture suite and lint corpus deferred to the
+batch 2 gate.
 
 Lane notes: `.claude/lanes/perf-eval/02-validation.md`.
 

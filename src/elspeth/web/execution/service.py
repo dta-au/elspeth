@@ -74,7 +74,7 @@ from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.run_lifecycle_repository import is_valid_sha256_hex
 from elspeth.core.landscape.schema import calls_table, node_states_table, nodes_table, operations_table
 from elspeth.core.payload_store import FilesystemPayloadStore
-from elspeth.core.secrets import SecretResolutionError
+from elspeth.core.secrets import SecretResolutionError, collect_secret_ref_marker_sites
 from elspeth.engine.orchestrator.core import Orchestrator
 from elspeth.engine.orchestrator.preflight import (
     SinkEffectCapabilityError,
@@ -106,6 +106,7 @@ from elspeth.web.blobs.protocol import (
     BlobStateError,
 )
 from elspeth.web.composer._semantic_validator import validate_semantic_contracts
+from elspeth.web.composer.pipeline_proposal import composition_content_hash
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.config import WebSettings
 from elspeth.web.coordination.approval_authority import (
@@ -190,6 +191,7 @@ from elspeth.web.execution.secret_guard import (
     annotate_pipeline_yaml_with_secret_guard,
     evaluate_execution_secret_guard,
 )
+from elspeth.web.execution.validation_memo import BlobReadLog, BlobReads, ValidationMemoKey, ValidationResultMemo
 from elspeth.web.execution_lease_cleanup import ExecutionAcquisitionObligation, ExecutionLeaseReleaseRegistry
 from elspeth.web.interpretation_state import InterpretationReviewPending, materialize_state_for_execution
 from elspeth.web.landscape_access import open_landscape_db
@@ -503,6 +505,20 @@ def _build_web_plugin_policy_evidence(
 
 
 T = TypeVar("T")
+
+
+def _state_has_secret_ref_sites(state: CompositionState, env_ref_names: frozenset[str]) -> bool:
+    """Return whether any authored plugin option wires a deferred secret.
+
+    Validation resolves a wired secret's value; the inventory lists names and
+    availability only, so such a state is kept out of the validate_state memo.
+    """
+    option_trees = (
+        *(source.options for source in state.sources.values()),
+        *(node.options for node in state.nodes),
+        *(output.options for output in state.outputs),
+    )
+    return any(collect_secret_ref_marker_sites(options, env_ref_names) for options in option_trees)
 
 
 @observation_boundary(
@@ -1153,6 +1169,11 @@ class ExecutionServiceImpl:
         self._shutdown_events: dict[str, threading.Event] = {}
         self._shutdown_events_lock = threading.Lock()
         self._lease_completion_futures: set[Future[None]] = set()
+        # Advisory validate_state memo: collapses the POST /validate +
+        # GET /audit-readiness pair for one composition version. Execution
+        # and approval binding never read it (they call the preflight
+        # directly). See validation_memo.py for key, bound and lifetime.
+        self._validation_memo = ValidationResultMemo()
 
         # Per-session asyncio lock to prevent TOCTOU on the active-run check.
         # Keyed by session_id string; lazily created, cleaned up on session
@@ -1413,8 +1434,14 @@ class ExecutionServiceImpl:
         *,
         session_id: UUID | None,
         session_operation_context: SessionOperationContext,
+        blob_reads: BlobReadLog | None = None,
     ) -> _AuthoritativeProofContext:
-        """Resolve only exact, session-owned, ready blob bindings for proof."""
+        """Resolve only exact, session-owned, ready blob bindings for proof.
+
+        ``blob_reads`` (advisory validate_state memo only) records every
+        metadata row consulted; a failed content read marks the run
+        uncacheable.
+        """
         from elspeth.web.composer.tools.blobs import BlobToolRecord
         from elspeth.web.composer.tools.generation import (
             MalformedSourceProofClaim,
@@ -1467,10 +1494,14 @@ class ExecutionServiceImpl:
             try:
                 record = self._call_async(self._blob_service.get_blob(parsed_blob_id, session_operation_context=session_operation_context))
             except BlobNotFoundError:
+                if blob_reads is not None:
+                    blob_reads.record(parsed_blob_id, None)
                 resolved_by_blob_id[blob_id] = _unresolved(blob_id)
                 return resolved_by_blob_id[blob_id]
             if type(record) is not BlobRecord:
                 raise TypeError("BlobServiceProtocol.get_blob() must return an exact BlobRecord")
+            if blob_reads is not None:
+                blob_reads.record(parsed_blob_id, record)
             if (
                 record.id != parsed_blob_id
                 or record.session_id != session_id
@@ -1510,6 +1541,8 @@ class ExecutionServiceImpl:
                     )
                 )
             except (BlobNotFoundError, BlobContentMissingError, BlobStateError):
+                if blob_reads is not None:
+                    blob_reads.mark_uncacheable()
                 resolved_by_blob_id[blob_id] = _unresolved(blob_id)
                 return resolved_by_blob_id[blob_id]
             resolved = ResolvedProofBlob(
@@ -1531,8 +1564,12 @@ class ExecutionServiceImpl:
         user_id: str | None,
         session_id: UUID | None,
         session_operation_context: SessionOperationContext,
+        blob_reads: BlobReadLog | None = None,
     ) -> ValidationResult:
-        """Run the canonical 23 checks and bounded source proof in one worker."""
+        """Run the canonical 23 checks and bounded source proof in one worker.
+
+        ``blob_reads`` is supplied only by the advisory validate_state memo.
+        """
         from elspeth.web.composer.tools.generation import compute_proof_diagnostics
         from elspeth.web.execution.validation import validate_pipeline
 
@@ -1542,9 +1579,13 @@ class ExecutionServiceImpl:
             try:
                 record = self._call_async(self._blob_service.get_blob(blob_id, session_operation_context=session_operation_context))
             except BlobNotFoundError:
+                if blob_reads is not None:
+                    blob_reads.record(blob_id, None)
                 return None
             if type(record) is not BlobRecord:
                 raise TypeError("BlobServiceProtocol.get_blob() must return an exact BlobRecord")
+            if blob_reads is not None:
+                blob_reads.record(blob_id, record)
             if session_id is not None and record.session_id != session_id:
                 return None
             return record
@@ -1552,7 +1593,16 @@ class ExecutionServiceImpl:
         def _blob_get_content(blob_id: UUID) -> tuple[BlobRecord, bytes]:
             if self._blob_service is None:
                 raise BlobNotFoundError(str(blob_id))
-            content = self._call_async(self._blob_service.read_blob_content(blob_id, session_operation_context=session_operation_context))
+            try:
+                content = self._call_async(
+                    self._blob_service.read_blob_content(blob_id, session_operation_context=session_operation_context)
+                )
+            except BaseException:
+                # A failed content read is not a function of the metadata row
+                # the memo re-checks on a hit, so the run must not be stored.
+                if blob_reads is not None:
+                    blob_reads.mark_uncacheable()
+                raise
             record = _blob_get_metadata(blob_id)
             if record is None:
                 raise BlobNotFoundError(str(blob_id))
@@ -1581,6 +1631,7 @@ class ExecutionServiceImpl:
                 state,
                 session_id=session_id,
                 session_operation_context=session_operation_context,
+                blob_reads=blob_reads,
             ),
         )
         return _merge_authoritative_proof_diagnostics(result, diagnostics)
@@ -1595,6 +1646,7 @@ class ExecutionServiceImpl:
         session_operation_context: SessionOperationContext,
         completion_gates: CompletionGateFacts | None,
         completion_gate_state: CompositionState | None = None,
+        blob_reads: BlobReadLog | None = None,
     ) -> ValidationResult:
         """Authoritative shared validation used by both validate and execute."""
 
@@ -1608,6 +1660,7 @@ class ExecutionServiceImpl:
                 user_id=user_id,
                 session_id=session_id,
                 session_operation_context=session_operation_context,
+                blob_reads=blob_reads,
             )
 
         result = await run_sync_in_worker(_preflight)
@@ -3245,6 +3298,7 @@ class ExecutionServiceImpl:
         user_id: str | None = None,
         session_id: UUID | None = None,
         completion_gates: CompletionGateFacts | None = None,
+        fresh: bool = False,
     ) -> ValidationResult:
         """Dry-run validation for an already-read composition state.
 
@@ -3260,26 +3314,79 @@ class ExecutionServiceImpl:
         hold the record pass them here and the merged result withholds
         ``completion_ready`` accordingly. ``None`` — no record at hand, or no
         envelope ever written — leaves the recompute untouched.
+
+        The pre-merge result is memoized briefly (``validation_memo``) so the
+        ``/validate`` + ``/audit-readiness`` pair for one composition version
+        runs the inner validation once. A state carrying a user-authored
+        secret reference bypasses the memo: validation resolves the secret's
+        value, and nothing on this path fingerprints that value.
+
+        ``fresh=True`` always runs the inner validation and neither reads nor
+        writes the memo. Callers whose verdict is written into a durable,
+        audit-bearing record (the shareable-review mark) must pass it: such a
+        record is never derived from an advisory cache.
         """
-        env_ref_names = (
-            frozenset(item.name for item in self._secret_service.list_refs(user_id))
-            if self._secret_service is not None and user_id is not None
-            else frozenset()
+        secret_inventory = (
+            frozenset(self._secret_service.list_refs(user_id)) if self._secret_service is not None and user_id is not None else frozenset()
         )
+        env_ref_names = frozenset(item.name for item in secret_inventory)
         require_no_credential_material_in_state(
             state,
             surface="composer_validation_state",
             env_ref_names=env_ref_names,
         )
         plugin_snapshot = self._plugin_snapshot_for_user(user_id, operation="validation")
-        return await self._authoritative_state_preflight(
-            state,
-            plugin_snapshot=plugin_snapshot,
-            user_id=user_id,
-            session_id=session_id,
-            session_operation_context=session_operation_context,
-            completion_gates=completion_gates,
-        )
+
+        async def _compute(blob_reads: BlobReadLog | None) -> ValidationResult:
+            return await self._authoritative_state_preflight(
+                state,
+                plugin_snapshot=plugin_snapshot,
+                user_id=user_id,
+                session_id=session_id,
+                session_operation_context=session_operation_context,
+                completion_gates=None,
+                blob_reads=blob_reads,
+            )
+
+        async def _blob_reads_current(blob_reads: BlobReads) -> bool:
+            return await self._blob_reads_still_current(blob_reads, session_operation_context=session_operation_context)
+
+        if fresh or _state_has_secret_ref_sites(state, env_ref_names):
+            result = await _compute(None)
+        else:
+            result = await self._validation_memo.get_or_compute(
+                ValidationMemoKey(
+                    user_id=user_id,
+                    session_id=session_id,
+                    state_content_hash=composition_content_hash(state),
+                    state_version=state.version,
+                    plugin_snapshot_hash=plugin_snapshot.snapshot_hash,
+                    secret_inventory=secret_inventory,
+                ),
+                compute=_compute,
+                blob_reads_current=_blob_reads_current,
+            )
+        return merge_completion_gates(result, completion_gates, state)
+
+    async def _blob_reads_still_current(
+        self,
+        blob_reads: BlobReads,
+        *,
+        session_operation_context: SessionOperationContext,
+    ) -> bool:
+        """Re-read each blob row a memoized validation consulted; True iff all are unchanged."""
+        for blob_id, recorded in blob_reads:
+            if self._blob_service is None:
+                return False
+            try:
+                current = await self._blob_service.get_blob(blob_id, session_operation_context=session_operation_context)
+            except BlobNotFoundError:
+                current = None
+            if current is not None and type(current) is not BlobRecord:
+                raise TypeError("BlobServiceProtocol.get_blob() must return an exact BlobRecord")
+            if current != recorded:
+                return False
+        return True
 
     async def verify_run_ownership(self, user: UserIdentity, run_id: str) -> bool:
         """Verify that a run belongs to the authenticated user's session.

@@ -463,6 +463,7 @@ class _ExecutionServiceLike(Protocol):
         session_id: UUID | None = None,
         session_operation_context: SessionOperationContext,
         completion_gates: CompletionGateFacts | None = None,
+        fresh: bool = False,
     ) -> ValidationResult: ...
 
 
@@ -537,8 +538,14 @@ class ReadinessService:
         session_id: UUID,
         user_id: str,
         session_operation_context: SessionOperationContext,
+        fresh: bool = False,
     ) -> AuditReadinessSnapshot:
         """Return the six-row snapshot.
+
+        ``fresh=True`` is forwarded to ``validate_state`` so the validation
+        row bypasses the short-lived advisory memo. Callers that write the
+        snapshot into a durable review record (the shareable-review mark)
+        pass it; the readiness route keeps the default.
 
         Raises:
             CompositionStateNotFoundError: when the session has no composition
@@ -563,6 +570,7 @@ class ReadinessService:
             session_id=session_id,
             session_operation_context=session_operation_context,
             completion_gates=parse_completion_gates(record.composer_meta),
+            fresh=fresh,
         )
         # Pre-fetch interpretation-event signal for the llm_interpretations
         # row. Two separate reads because:
