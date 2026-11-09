@@ -1712,6 +1712,145 @@ _CREATE_BLOB_DECLARATION = ToolDeclaration(
 )
 
 
+def _validated_blob_update(arguments: object) -> UpdateBlobArgumentsModel:
+    try:
+        return UpdateBlobArgumentsModel.model_validate(arguments)
+    except PydanticValidationError as exc:
+        raise ToolArgumentError(
+            argument="update_blob arguments",
+            expected="object conforming to UpdateBlobArgumentsModel",
+            actual_type=type(exc).__name__,
+            category=ToolArgumentErrorCategory.MODEL_VALIDATION,
+        ) from exc
+
+
+def _blob_update_bytes(validated: UpdateBlobArgumentsModel) -> bytes:
+    try:
+        return validated.content.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ToolArgumentError(
+            argument="update_blob content",
+            expected="valid UTF-8 text",
+            actual_type=type(exc).__name__,
+        ) from exc
+
+
+def _blob_replacement_record(
+    expected: BlobRecord, content_bytes: bytes, provenance: _BlobCreationProvenance, context: ToolContext
+) -> BlobRecord:
+    return replace(
+        expected,
+        size_bytes=len(content_bytes),
+        content_hash=content_hash(content_bytes),
+        creation_modality=provenance.creation_modality,
+        created_from_message_id=_blob_provenance_message_id(context.user_message_id),
+        creating_model_identifier=provenance.creating_model_identifier,
+        creating_model_version=provenance.creating_model_version,
+        creating_provider=provenance.creating_provider,
+        creating_composer_skill_hash=provenance.creating_composer_skill_hash,
+        creating_arguments_hash=provenance.creating_arguments_hash,
+    )
+
+
+def admit_blob_mutation(tool_name: str, arguments: object, state: CompositionState, context: ToolContext) -> ToolResult | None:
+    """Observe update/delete prerequisites without invoking either effect handler.
+
+    None means stageable admission, including identical content. Only an
+    actual refusal produces feedback; acceptance repeats every prerequisite.
+    """
+    from elspeth.web.blobs.replacement import BlobReplacementCoordinator
+
+    if tool_name not in {"update_blob", "delete_blob"}:
+        raise ValueError("blob admission requires update_blob or delete_blob")
+    deleting = tool_name == "delete_blob"
+    deletion_arguments = _validate_mutation_arguments(BlobIdArgumentsModel, arguments, "delete_blob arguments") if deleting else None
+    if context.session_engine is None or context.session_id is None:
+        return _failure_result(state, "Blob tools require session context.")
+    if context.data_dir is None:
+        return _failure_result(state, "Blob tools require data_dir for storage.")
+    if deletion_arguments is not None:
+        blob_id = deletion_arguments.blob_id
+        update_arguments = None
+    else:
+        update_arguments = _validated_blob_update(arguments)
+        blob_id = update_arguments.blob_id
+    blob_id_error = _blob_id_uuid_validation_error(blob_id)
+    if blob_id_error is not None:
+        return _failure_result(state, blob_id_error)
+    content_bytes = _blob_update_bytes(update_arguments) if update_arguments is not None else None
+    authority, operation = _require_blob_tool_authority(context)
+    provenance = _blob_creation_provenance(update_arguments.content, context) if update_arguments is not None else None
+    if context.executing_proposal_id is not None:
+        raise AuditIntegrityError("proposal preview cannot invent a retention exclusion")
+    with _blob_custody_session_lock(context.session_engine, context.session_id):
+        observed = authority.mutate(
+            operation,
+            lambda transaction: transaction.blobs.inspect_blob_mutation(
+                blob_id=UUID(blob_id), tool_name="delete_blob" if deleting else "update_blob"
+            ),
+        )
+        service = BlobServiceImpl(context.session_engine, Path(context.data_dir), session_operation_authority=authority)
+        driver = BlobReplacementCoordinator(
+            engine=context.session_engine, data_dir=Path(context.data_dir), session_operation_authority=authority
+        )
+        if observed.deletion is not None or observed.replacement is not None:
+            if observed.deletion is not None:
+                service._require_blob_deletion_recovery_content(observed.deletion)
+            if observed.replacement is not None:
+                with driver._directory(observed.replacement.session_id) as directory_fd:
+                    driver._require_recovery_content(observed.replacement, directory_fd)
+            current = authority.mutate(
+                operation,
+                lambda transaction: transaction.blobs.inspect_blob_mutation(
+                    blob_id=UUID(blob_id), tool_name="delete_blob" if deleting else "update_blob"
+                ),
+            )
+            if current != observed:
+                raise AuditIntegrityError("blob recovery evidence changed during admission")
+            return _failure_result(state, f"Blob '{blob_id}' requires recovery before another mutation can be proposed.")
+        expected = observed.blob
+        if expected is None:
+            return _failure_result(state, f"Blob '{blob_id}' not found.")
+        if expected.status != "ready":
+            return _failure_result(state, f"Blob '{blob_id}' is not ready and cannot be proposed for mutation.")
+        if _state_references_blob(state, blob_id, expected.storage_path):
+            return _failure_result(
+                state,
+                f"Blob '{blob_id}' is referenced by the current composition and cannot be {'deleted' if deleting else 'updated'}; unbind it first.",
+            )
+        try:
+            if deleting:
+                present, size, digest = service._observe_blob_deletion_content(expected)
+                authority.mutate(
+                    operation,
+                    lambda transaction: transaction.blobs.admit_blob_deletion(
+                        expected=expected,
+                        expected_file_present=present,
+                        expected_file_size=size,
+                        expected_file_hash=digest,
+                        accepting_proposal_id=None,
+                    ),
+                )
+            else:
+                if content_bytes is None or provenance is None:
+                    raise AuditIntegrityError("blob update admission lost prepared content or provenance")
+                replacement = _blob_replacement_record(expected, content_bytes, provenance, context)
+                with driver._directory(expected.session_id) as directory_fd:
+                    driver._require_canonical_replacement_content(expected, directory_fd)
+                authority.mutate(
+                    operation,
+                    lambda transaction: transaction.blobs.admit_blob_replacement(
+                        expected=expected,
+                        replacement=replacement,
+                        max_storage_per_session=_resolve_blob_quota_bytes(context.max_blob_storage_per_session_bytes),
+                        accepting_proposal_id=None,
+                    ),
+                )
+        except (BlobActiveRunError, BlobPendingProposalError, BlobInProgressForkError, BlobQuotaExceededError, BlobStateError) as exc:
+            return _failure_result(state, str(exc))
+    return None
+
+
 def _execute_update_blob(
     arguments: dict[str, Any],
     state: CompositionState,
@@ -1725,26 +1864,11 @@ def _execute_update_blob(
         return _failure_result(state, "Blob tools require session context.")
     if context.data_dir is None:
         return _failure_result(state, "Blob tools require data_dir for storage.")
-    try:
-        validated = UpdateBlobArgumentsModel.model_validate(arguments)
-    except PydanticValidationError as exc:
-        raise ToolArgumentError(
-            argument="update_blob arguments",
-            expected="object conforming to UpdateBlobArgumentsModel",
-            actual_type=type(exc).__name__,
-            category=ToolArgumentErrorCategory.MODEL_VALIDATION,
-        ) from exc
+    validated = _validated_blob_update(arguments)
     blob_id_error = _blob_id_uuid_validation_error(validated.blob_id)
     if blob_id_error is not None:
         return _failure_result(state, blob_id_error)
-    try:
-        content_bytes = validated.content.encode("utf-8")
-    except UnicodeEncodeError as exc:
-        raise ToolArgumentError(
-            argument="update_blob content",
-            expected="valid UTF-8 text",
-            actual_type=type(exc).__name__,
-        ) from exc
+    content_bytes = _blob_update_bytes(validated)
     authority, operation = _require_blob_tool_authority(context)
     provenance = _blob_creation_provenance(validated.content, context)
     driver = BlobReplacementCoordinator(
@@ -1764,18 +1888,7 @@ def _execute_update_blob(
                 state,
                 f"Blob '{validated.blob_id}' is referenced by the current composition and cannot be updated; unbind it first.",
             )
-        replacement = replace(
-            expected,
-            size_bytes=len(content_bytes),
-            content_hash=content_hash(content_bytes),
-            creation_modality=provenance.creation_modality,
-            created_from_message_id=_blob_provenance_message_id(context.user_message_id),
-            creating_model_identifier=provenance.creating_model_identifier,
-            creating_model_version=provenance.creating_model_version,
-            creating_provider=provenance.creating_provider,
-            creating_composer_skill_hash=provenance.creating_composer_skill_hash,
-            creating_arguments_hash=provenance.creating_arguments_hash,
-        )
+        replacement = _blob_replacement_record(expected, content_bytes, provenance, context)
         result = driver.replace_blob(
             expected=expected,
             replacement=replacement,
