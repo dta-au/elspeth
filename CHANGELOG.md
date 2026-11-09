@@ -99,6 +99,17 @@ establish qualification, a published tag or an image.
   no longer answers a bare 409. No backend change; the tutorial runs the same
   backend as every session. Closes
   [#352](https://github.com/dta-au/elspeth/issues/352).
+- **Shared, published and exported graphs no longer keep half of a
+  transform's uploaded-file reference.** A transform that reads an uploaded
+  file (a `reference_join` lookup table, a file-backed prompt) previously
+  lost only the file's identifier in share snapshots, library publications,
+  the MCP `generate_yaml` tool and YAML export, leaving a fragment that named
+  no file but still carried its digest. The whole reference is now removed,
+  the export's redaction account names each affected node and option
+  (`stripped_node_options`, `# redacted-node:` header lines), and YAML import
+  refuses a leftover fragment with guidance to re-attach the file. Re-importing
+  such an export reports the missing option; attaching files to transforms on
+  import is not yet supported.
 
 ### LLM gateway
 
