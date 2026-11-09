@@ -14,11 +14,12 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
-from dataclasses import dataclass
 from pathlib import Path
-from typing import final
 
-from elspeth.web.process_watchdog_codec import (
+from elspeth.contracts.process_watchdog_wire import (
+    BootstrapCompletionWitness as BootstrapCompletionWitness,
+)
+from elspeth.contracts.process_watchdog_wire import (
     FrameKind,
     FrameReader,
     RecoveryReason,
@@ -26,43 +27,21 @@ from elspeth.web.process_watchdog_codec import (
     WatchdogProtocolError,
     encode_frame,
 )
+from elspeth.contracts.process_watchdog_wire import (
+    GraceAcknowledgement as GraceAcknowledgement,
+)
+from elspeth.contracts.process_watchdog_wire import (
+    ProcessCompletionWitness as ProcessCompletionWitness,
+)
+from elspeth.contracts.process_watchdog_wire import (
+    ProcessWatchdogTarget as ProcessWatchdogTarget,
+)
 
 WEB_PROCESS_RECOVERY_GRACE_SECONDS = 30.0
 
 
 class ProcessWatchdogFailure(RuntimeError):
     """Required private process supervision failed."""
-
-
-@final
-@dataclass(frozen=True, slots=True)
-class ProcessWatchdogTarget:
-    pid: int
-    nonce: str
-
-
-@final
-@dataclass(frozen=True, slots=True)
-class GraceAcknowledgement:
-    target: ProcessWatchdogTarget
-    armed_at_ns: int
-    deadline_ns: int
-
-
-@final
-@dataclass(frozen=True, slots=True)
-class ProcessCompletionWitness:
-    """Owned lifecycle creates this only after all joins and engine finalization."""
-
-    target: ProcessWatchdogTarget
-
-
-@final
-@dataclass(frozen=True, slots=True)
-class BootstrapCompletionWitness:
-    """Owned factory creates this only while no construction effects entered."""
-
-    target: ProcessWatchdogTarget
 
 
 class ProcessWatchdogControl(ABC):
