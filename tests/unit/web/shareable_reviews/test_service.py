@@ -2897,8 +2897,8 @@ async def test_resolve_token_legacy_snapshot_is_view_only_with_no_files(
     session_record,
     state_record,
     session_operation_context: SessionOperationContext,
-    monkeypatch: pytest.MonkeyPatch,
 ):
+    """A pre-import 7-key snapshot stored and signed for real still resolves, view-only."""
     service, *_ = _build_service(
         engine=session_engine_with_row,
         payload_store=payload_store,
@@ -2914,15 +2914,26 @@ async def test_resolve_token_legacy_snapshot_is_view_only_with_no_files(
         username=_OWNER_USERNAME,
         session_operation_context=session_operation_context,
     )
-    payload, current = await service.load_snapshot(token=marked.token)
-    legacy = ParsedSnapshot(blob=current.blob, import_allowed=False, files=())
+    blob = _stored_snapshot(payload_store, marked.payload_digest)
+    del blob["import_allowed"]
+    del blob["files"]
+    assert len(blob) == 7
+    legacy_hex = payload_store.store(canonical_json(blob).encode())
+    now = datetime.now(UTC)
+    legacy_token = signer.sign(
+        ShareTokenPayload(
+            version=1,
+            session_id=session_record.id,
+            state_id=state_record.id,
+            created_at=now,
+            expires_at=now + timedelta(days=1),
+            nonce_hex="cd" * 16,
+            payload_digest=f"sha256:{legacy_hex}",
+            created_by_user_id=session_record.user_id,
+        )
+    )
 
-    async def _load_legacy(*, token: str) -> tuple[Any, ParsedSnapshot]:
-        return payload, legacy
-
-    monkeypatch.setattr(service, "load_snapshot", _load_legacy)
-
-    resolved = await service.resolve_token(token=marked.token, requesting_user_id="reviewer")
+    resolved = await service.resolve_token(token=legacy_token, requesting_user_id="reviewer")
 
     assert resolved.import_allowed is False
     assert resolved.files == []
