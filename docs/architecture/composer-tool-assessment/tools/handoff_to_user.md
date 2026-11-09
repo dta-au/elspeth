@@ -411,7 +411,7 @@ explicit compatibility handling.
 ### 7.1 Probe runs (2026-11-09)
 
 Worktree `$WT` (production source at baseline `3b28d537b`), lane-private
-directory `$L`. `$PY` is the main checkout's `.venv/bin/python`. Every run used
+directory `$L`. `$PY` is the main checkout's `.venv/bin/python`. Every logged run used
 the network fail-closed prefix `HTTPS_PROXY=http://127.0.0.1:9 HTTP_PROXY=http://127.0.0.1:9 NO_PROXY= ELSPETH_DISABLE_NETWORK=1`
 with `PYTHONPATH=$WT:$WT/src:$WT/elspeth-lints/src` (P0: `$WT/src:$WT/elspeth-lints/src`),
 `TMPDIR=$L/tmp`, `-n 0 -p no:cacheprovider` and a matching whitespace-separated
@@ -423,6 +423,18 @@ that raises on any unscripted call, `litellm.completion` raises, and both
 `provider_gateway._litellm_acompletion` and
 `pipeline_planner._litellm_acompletion` raise unless the double is installed.
 Its positive control showed every unscripted entry point raising.
+
+Not every run was fail-closed. The first P0 run (34 passed, exit 0) predates the
+rule and ran without the prefix. Its log was overwritten by the prefixed re-run
+(same result), so only the lane's results report records it. In that run the
+palette file patches `litellm.acompletion` with finite `side_effect` lists, so an
+extra provider call would have raised and failed a test, and the persistence file
+never reaches a provider. The recorded prefix also omits
+`LITELLM_LOCAL_MODEL_COST_MAP=True`. Every probe run here is a pytest run that loads
+`tests/conftest.py` (by rootdir or with `-p tests.conftest`), and that file calls
+`configure_litellm_pricing()`, which sets the variable before `litellm` is
+imported; the proxy control script imports only `httpx`. No log in `$L` contains a cost-map fetch line (a grep for
+`raw.githubusercontent` that does match the `list_blobs` lane's recorded fetch).
 
 | Probe | Finding | Outcome | Command (abridged) | Exit | Observed |
 |---|---|---|---|---|---|

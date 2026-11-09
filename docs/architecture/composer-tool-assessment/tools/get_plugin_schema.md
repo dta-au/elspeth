@@ -100,11 +100,13 @@ Review-lane read-only introspection (worktree `elspeth.__file__` confirmed): the
 
 ### 7.1 Probe runs
 
-All three probes ran in memory with a fail-closed network posture:
+The three logged probe runs ran in memory with a fail-closed network posture. Earlier unguarded runs predate the rule; they are described after the command. The logged form is:
 
 `cd $WT && env HTTPS_PROXY=http://127.0.0.1:9 HTTP_PROXY=http://127.0.0.1:9 NO_PROXY= ELSPETH_DISABLE_NETWORK=1 LITELLM_LOCAL_MODEL_COST_MAP=True PROBE_L=$L TMPDIR=$L/tmp PYTHONPATH=$WT:$WT/src:$WT/elspeth-lints/src .venv/bin/python $L/<probe>.py > $L/<probe>.log 2>&1`
 
-Here `$WT` is this worktree and `$L` is the lane-private probe directory. Each script prints `elspeth.__file__`, which resolved to `$WT/src/elspeth/__init__.py`. Each script also imports a guard that makes `litellm.acompletion`/`completion` and both composer `_litellm_acompletion` aliases raise. The guard's positive control raised on 4/4 calls, and every probe recorded 0 provider attempts. No pytest was run.
+Here `$WT` is this worktree and `$L` is the lane-private probe directory. Each script prints `elspeth.__file__`, which resolved to `$WT/src/elspeth/__init__.py`. Each script also imports a guard that makes `litellm.acompletion`/`completion` and both composer `_litellm_acompletion` aliases raise. The guard's positive control raised on 4/4 calls, and every logged probe recorded 0 provider attempts. No pytest was run.
+
+Not every run was fail-closed. The early runs (`explore1`, the first two `probe1` runs and the first `probe2` run) predate the rule and had neither the prefix nor the guard. The lane replayed their workloads under the blocking proxy (`$L/netcheck_unguarded.log`): `litellm` was never imported after any step and no connection error appeared, so they had no provider path. The first guarded run of each probe triggered `litellm`'s import-time model-cost-map fetch from `raw.githubusercontent.com` through the guard's own `import litellm`; the dead proxy refused it (three attempts per run) and `litellm` fell back to its local copy. Those logs were later overwritten, so the lane's results report is the only record. Adding `LITELLM_LOCAL_MODEL_COST_MAP=True` suppressed the fetch in the logged runs.
 
 | # | Finding | Script | Exit | Outcome | Observed |
 |---|---|---|---|---|---|

@@ -417,8 +417,12 @@ requirement code its feedback never carries (XC-24). The loop keeps one
 freeform cache hit records `{success, data, cache_hit}` while the model receives
 the rebuilt validation and version (XC-25). The general claim that audit loses
 what the model saw was refuted: a private role=audit evidence row keeps the
-served result for ordinary calls (`get_pipeline_state-N2`). Sheets that inferred
-audit loss from the redacted chat row should be re-read against that private row.
+served result for ordinary calls (`get_pipeline_state-N2`). The sheets that
+inferred audit loss from the redacted chat row have been re-read against that
+private row: a fix-up run showed it keeps the `outbound_call_made` key that
+`request_advisor_hint-N3`'s chat row collapses (other N3 outcomes unchecked);
+`remove_node-N11` had already found the result retained there; the incidental
+`upsert_node` note now says the private row was not read.
 
 Two of the eight refutations touched claims the shared documents relied on: the
 `clear_source` pending-review residual (`clear_source-N4`; pending session events

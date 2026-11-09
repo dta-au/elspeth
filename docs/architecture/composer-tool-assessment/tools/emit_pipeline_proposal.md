@@ -114,7 +114,7 @@ fences and proposal authority own concurrent publication.
 
 ### 3.1 Route inventory
 
-Measured by source trace and two read-only introspections (§7). Name searches
+Measured by source trace and two read-only introspections (§7); the §7.1 probe runs later exercised the planner precheck, the terminal-alone rule and the inline-blob custody write behind some of these rows. Name searches
 were controlled: each file reported as having no mention of the tool does mention
 `set_pipeline`.
 
@@ -429,7 +429,14 @@ each gave only `oneOf` at `['oneOf']`, and `source: null` gave `type`.
 carries `strict: False` on `openai_strict` and no `strict` key on `none`. Neither
 `set_pipeline` nor `request_interpretation_review` is in the discovery set.
 
-**Probe runs (2026-11-09, production tree `3b28d537b`).** `$WT` is the worktree and
+Source/local protocol confidence is high; a claim of
+full end-to-end readiness would be unsupported. Unifying lifecycle receipts has
+high integrity/compatibility risk if authored identity, required controls,
+fencing or review evidence is weakened; proceed by bounded contract slices.
+
+### 7.1 Probe runs (2026-11-09)
+
+Production tree `3b28d537b`. `$WT` is the worktree and
 `$L` is `.claude/lanes/composer-sheet-review-20261109/probes/emit_pipeline_proposal`
 in the main checkout. The ad-hoc probe files live in `$L`, not in
 `tests/`. They import the planner unit-test helpers and load the four test conftests as
@@ -448,11 +455,6 @@ test ids ran in the brief's fixed pytest form.
 | `$L/test_probe_n1.py` on baseline, mutA, mutB | N1 mutation | confirmed | 0 / 0 / 0 (probe); 0 / 1 / 1 (controls) | mutA is a lane copy of `src/` with `oneOf` stripped at the planner precheck call site. mutB is mutA plus the `_exactly_one_source_configuration` raise neutered. Missing source, by tree: baseline `canonical_schema` `rule: oneOf`; mutA `canonical_schema` `rule: value_error`; mutB `no_source_configured` with explanation and suggested fix. Both sources, by tree: baseline `oneOf`; mutA `value_error`; mutB `source_binding_ambiguous`. Controls: mutA 2 failed and 2 passed; mutB 3 failed and 1 passed. |
 | `$L/test_probe_n4.py` plus id `test_invalid_inline_draft_exhaustion_leaves_zero_pre_custody_residue` | N4 pre-approval write | confirmed | 0 / 0 | Admitted inline candidate: blob rows went 0 → 1, `ready`, `created_by="assistant"`, id equal to the bound `source.blob_id`, file on disk, and 0 `composition_proposals` rows. Negative control: a non-admitted inline candidate leaves 0 rows and 0 files. |
 | `$L/n4-static-trace.log` (grep/awk, controlled) | N4 release on reject/stale | confirmed (static) | 0 | Known-positive: the custody write sites are found. Every `blobs_table` delete in `src/elspeth/web` traces to one of three paths. (1) Explicit deletion: `delete_blob` → `_delete_blob_with_ledger` → `_commit_blob_deletion_plan` → `commit_blob_deletion`. (2) Pending-row cleanup inside `_persist_fenced_blob_record`: `discard_pending_blob` on failed create, and `_reconcile_abandoned_creations_locked` → `retire_abandoned_blob_reservation`. `_discard_nonidempotent_reservation` deletes only `status == "pending"`. (3) Fork cleanup from the fork route. The rejection modules: `pipeline_rejection_custody.py` has 0 `blob` mentions and `pipeline_settlement.py` has 1 (the storage-ceiling setting). The reject handler body in `proposals.py` (L724–860) has 0. That file's other 20 mentions are on the accept path, which shows the grep is live. The `SessionServiceImpl` rejection methods touch only `composition_proposals_table`, `proposal_events_table` and `sessions_table`. A runtime reject-then-query was not exercised. |
-
-Source/local protocol confidence is high; a claim of
-full end-to-end readiness would be unsupported. Unifying lifecycle receipts has
-high integrity/compatibility risk if authored identity, required controls,
-fencing or review evidence is weakened; proceed by bounded contract slices.
 
 ## Runtime argument schema and measured exposure
 

@@ -236,7 +236,7 @@ The message names `t1` but not `g`, and carries no error code.
 - Controls:
   - isolation (no `on_success`): the t1 result is already `is_valid: false` with `node:t1 node_input_not_reachable`;
   - positive (gate `routes true: side`): preview runtime preflight `is_valid: true`.
-- Incidental: the persisted `preview_pipeline` tool row carries `_unknown_response` and no `runtime_preflight`, so the failure the model saw is not in the stored transcript row.
+- Incidental: the persisted `preview_pipeline` chat (`role=tool`) row carries `_unknown_response` and no `runtime_preflight`, so the failure the model saw is not in that transcript row. The private `role=audit` evidence row, which retains the credential-filtered result for other tools (`get_pipeline_state` §7.1 P3, `request_advisor_hint` §7.1), was not read in this probe, so this is not evidence that the audit record loses it.
 
 **Probe 3** (`$L/run_pytest.sh probe3 $L/test_probe3_mcp_persist_directory.py`).
 

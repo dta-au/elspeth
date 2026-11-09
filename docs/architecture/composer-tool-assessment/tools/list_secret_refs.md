@@ -121,7 +121,7 @@ Sheet review (2026-11-09) added one in-memory probe: real `UserSecretStore`/`Ser
 
 | Probe | Finding | Outcome | Exit | Observed |
 |---|---|---|---|---|
-| End-to-end freeform turn against a deployment with a rotated `secret_key`: does a live model wire a listed-but-undecryptable reference without validating it? ([evidence](../evidence.md) proposed-but-unrun row) | LSR-N1 (user impact) | **Not runnable here** — needs a live provider and a running web server, both forbidden for probe runs | — | Not run. LSR-N1 stays *demonstrated in memory, not end to end*; the model-behaviour question remains open for an operator-run provider session. |
+| End-to-end freeform turn against a deployment with a rotated `secret_key`: does a live model wire a listed-but-undecryptable reference without validating it? ([evidence](../evidence.md#probe-wave-outcomes-2026-11-09) outcome row) | LSR-N1 (user impact) | **Not runnable here** — needs a live provider and a running web server, both forbidden for probe runs | — | Not run. LSR-N1 stays *demonstrated in memory, not end to end*; the model-behaviour question remains open for an operator-run provider session. |
 | Extra (bounded substitute, not the probe above): replay of the rotated-store run, plus freeform public dispatch of `list_secret_refs` then `wire_secret_ref` **without** `validate_secret_ref` | LSR-N1 consequence, LSR-N2 | **Confirmed** (LSR-N1/N2 reproduce); consequence **bounded** on the freeform wiring path | 0 (rotated), 0 (control) | See below. |
 
 Command (run once with reader key `key-B` = rotated, once with `key-A` = control; writer key always `key-A`):

@@ -128,6 +128,8 @@ The review first used in-memory `python -c` probes:
 - (b) one compose-loop turn with a scripted fake LLM and the test lease adapter, for request_interpretation_review-N1;
 - (c) `arg_error_payload` projection for request_interpretation_review-N4.
 
+### 7.1 Probe runs (2026-11-09)
+
 The proposed probes were then run as pytest. Everything ran from a lane-private test file `$L/test_rir_probes.py`, with `$WT` the worktree at the baseline sources. Nothing was written into the worktree's `tests/`. The file reuses the existing fixtures: `engine`, `sessions_service`, the scripted LLM, `_build_composer` and the seed helpers from `test_compose_loop_interpretation_review_dispatch.py`, plus the helpers in `test_request_interpretation_review_tool.py`. It loads the four conftests with `-p`. `--setup-show` recorded `explicit_required_executor_recovery`, `_fenced_compose_for_legacy_tests` and `_stub_advisor_end_gate_clean` in setup for all 33 tests. A test asserted that `elspeth.__file__` resolves inside the worktree.
 
 An autouse guard made these calls raise: `litellm.acompletion`, `litellm.completion`, `provider_gateway._litellm_acompletion` (which the advisor, auto-title and planning-application paths read at call time), `pipeline_planner._litellm_acompletion`, and `socket.connect`. A positive control showed each one raising. The guard recorded zero hits across the run.

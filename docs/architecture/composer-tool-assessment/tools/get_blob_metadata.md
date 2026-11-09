@@ -163,7 +163,9 @@ Sheet review, 2026-11-09, read-only introspection against the worktree (`elspeth
 - **Exposure:** 43 `get_tool_definitions` entries; 45 freeform wire tools per dialect, tool present; MCP exclusion confirmed with `list_sources` as the control.
 - **N1:** an in-memory `execute_tool` call with no session context, using test-module fixtures, with the repository root added to `PYTHONPATH`. No database.
 
-Probe runs, 2026-11-09. `$WT` is the audit worktree and `$L` is this tool's lane-private probe directory. Scripts and logs live under `$L` and nothing was written into `$WT`. Every run printed `elspeth.__file__`, and each resolved into the source tree under test (`$WT/src`, `$L/mutant/src` or `$L/control/src`). Each probe below gives its outcome, the command, the exit code and what was observed.
+### 7.1 Probe runs (2026-11-09)
+
+`$WT` is the audit worktree and `$L` is this tool's lane-private probe directory. Scripts and logs live under `$L` and nothing was written into `$WT`. Every run printed `elspeth.__file__`, and each resolved into the source tree under test (`$WT/src`, `$L/mutant/src` or `$L/control/src`). Each probe below gives its outcome, the command, the exit code and what was observed.
 
 - **P1 — BOS-03, every accepted spelling on SQLite: confirmed.**
   - *Command:* `cd $WT && PYTHONPATH=$WT:$WT/src:$WT/elspeth-lints/src .venv/bin/python $L/probe_gbm.py`, exit 0, log `$L/probe_gbm.log`.
