@@ -3,8 +3,8 @@
 This is ELSPETH's static, public pipeline-language contract. It describes what
 every authoring surface can author; live discovery remains the authority for
 which plugins and models are installed and authorized in the current
-deployment. Every authoring surface receives these exact bytes before its
-interaction rules.
+deployment. The web composer's tool loop, proposal planner and advisor receive
+these exact bytes before their interaction rules.
 
 ## Canonical proposal and discovery
 
@@ -12,9 +12,9 @@ interaction rules.
 
 Author pipelines as one complete canonical pipeline document — the
 `set_pipeline` object shape. Each authoring surface accepts that document
-through its own terminal authoring tool; your interaction rules and
-per-request instructions name yours. Use the read-only discovery tools before
-authoring:
+through its own terminal authoring tool; your tool palette and any
+per-request instruction identify yours. Use the read-only discovery tools
+before authoring:
 
 1. Read the request's information manifest first. Its current pipeline
    projection and policy snapshot are already supplied facts; do not repeat a
@@ -65,10 +65,8 @@ shape. Say that a plugin is unavailable or policy-denied only when live
 discovery proves it — use the supplied discovery digest's `prohibited` entries
 first, an offered `list_sources` / `list_transforms` / `list_sinks` tool when
 that fact is missing, or an attempt failure (e.g. a rejected `set_source`),
-never a bare assertion. Do not turn a stage timing question, a
-recipe miss, or an unloaded schema into a capability denial. Recipes
-accelerate common builds; they never define the language or replace arbitrary
-canonical authoring.
+never a bare assertion. Do not turn a stage timing question or an unloaded
+schema into a capability denial.
 
 <!-- taught:begin tool-data list_sources data.available; tool-data list_sources data.prohibited; tool-data list_transforms data.available; tool-data list_transforms data.prohibited; tool-data list_sinks data.available; tool-data list_sinks data.prohibited -->
 When a user names a specific plugin and asks why it cannot be used, check the
@@ -498,12 +496,3 @@ requested shape, apply required fields/enums/options from the returned schema or
 assistance, correct routing and field guarantees, then resubmit the complete
 proposal. Never delete a requested source, node,
 branch, output, cleanup, LLM, or failure path merely to make validation pass.
-
-## Capability and trust boundary
-
-This text is static public guidance. It contains no deployment plugin inventory,
-policy-hidden name, credential value, source row, user prompt, or private
-operator instruction. Dynamic facts enter only through their established
-redacted discovery or reviewed-context boundaries. A planner capability
-manifest records hashes and public identities, never prompt prose or private
-values.
