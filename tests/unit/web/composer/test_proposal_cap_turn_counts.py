@@ -12,6 +12,7 @@ batch here follows one persisted discovery turn.
 from __future__ import annotations
 
 from typing import Any
+from uuid import UUID
 
 import pytest
 from sqlalchemy import update
@@ -75,3 +76,9 @@ async def test_proposal_cap_after_a_discovery_turn_reports_turns_used_and_failed
     assert caught.failed_turn.assistant_message_id is not None
     assert caught.failed_turn.tool_calls_attempted == 1
     assert caught.failed_turn.tool_responses_persisted == 1
+    assert [inv.tool_call_id for inv in caught.tool_invocations] == [f"call_cap_proposal_{index}" for index in range(10)]
+    sessions = composer_service_with_real_sessions._sessions_service
+    assert sessions is not None
+    proposals = await sessions.list_composition_proposals(UUID(result_session_id))
+    assert {proposal.tool_call_id for proposal in proposals} == {f"call_cap_proposal_{index}" for index in range(10)}
+    assert all(inv.version_before == inv.version_after for inv in caught.tool_invocations)

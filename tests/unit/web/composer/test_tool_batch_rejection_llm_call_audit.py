@@ -1,9 +1,7 @@
-"""Pre-effect tool-batch rejections keep the carrying provider call on the audit path.
+"""Tool-batch rejections keep the carrying provider call on the audit path.
 
-``run_tool_batch`` refuses two batch shapes before any handler, proposal, or
-blob effect runs: an explicit-approval batch with more approval-requiring
-mutations than the per-turn proposal cap, and a batch that reuses a provider
-tool-call ID a durable row already owns. Both refusals happen after the
+``run_tool_batch`` caps admitted proposals after the actual attempted prefix,
+and rejects reused provider tool-call IDs before any effects. Both happen after the
 provider completion was recorded, so the completion must ride out on the
 exception for the route's LLM-call persistence (``_llm_calls_from_exception``)
 to write it. The proposal-cap refusal is a convergence failure (the model's
@@ -51,10 +49,10 @@ async def test_proposal_cap_rejection_is_convergence_error_carrying_llm_calls(
     assert caught.budget_exhausted == "composition"
     assert caught.reason == "tool_call_cap_exceeded"
     assert dict(caught.evidence) == {"observed": 11, "cap": 10, "cap_kind": "pending_proposals"}
-    # No handler ran and nothing mutated: no partial state, and the rejected
-    # batch has no tool invocations of its own to replay.
+    # The admitted prefix staged ten proposals without applying graph state.
+    # The denied call never acquires a fabricated invocation.
     assert caught.partial_state is None
-    assert caught.tool_invocations == ()
+    assert [inv.tool_call_id for inv in caught.tool_invocations] == [f"call_cap_proposal_{index}" for index in range(10)]
     llm_calls = _llm_calls_from_exception(caught)
     assert len(llm_calls) == 1
 
