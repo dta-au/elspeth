@@ -5,7 +5,7 @@ Baseline assessed: `3b28d537be98234da8135c418bf185a998c18b68`, restored 0.8.9.
 backlog publication, merge or deployment is included in this assessment.
 The [synthesis](synthesis.md) explains the evidence and ownership diagnosis;
 [individual sheets](inventory.md) retain tool-specific requirements. Finding
-IDs (SG-, GS-, BOS-, XC-) and maintainer decisions (D1–D13) are defined in the
+IDs (SG-, GS-, BOS-, XC-) and maintainer decisions (D1–D38) are defined in the
 [README register](README.md#findings-register).
 
 ## Target and design choice
@@ -70,13 +70,13 @@ not a claim that each item is equally large or should ship in one release.
 | Work item | Register findings |
 |---|---|
 | R1 | GS-01, SG-04, SG-07, XC-02 (admission before publication), XC-03, XC-10, XC-17 (batch state authority) |
-| R2 | BOS-01, BOS-03, GS-02, GS-03, SG-05, XC-06 (with R3), XC-07, XC-08, XC-09, XC-11, XC-13, XC-14 (limit disclosure), XC-18 (description contracts), XC-19 |
+| R2 | BOS-01, BOS-03, GS-02, GS-03, SG-05, XC-06 (with R3), XC-07, XC-08, XC-09, XC-11, XC-13, XC-14 (limit disclosure), XC-18 (description contracts), XC-19, XC-20 (discovery kept out of mutation deltas), XC-24, XC-25 |
 | R3 | SG-04, BOS-02, BOS-05, XC-04 (typed malformed control), XC-05, XC-06, XC-14 |
-| R4 | SG-03, BOS-04, XC-02 (proposal obligations), XC-17 |
-| R5 | SG-01, SG-02, SG-06, SG-07, XC-05 (Tier-3 checks before web-owned gates), XC-15, XC-16 |
+| R4 | SG-03, BOS-04, XC-02 (proposal obligations and accept outcomes), XC-17, XC-20, XC-21 (finalization effects), XC-22 (effects listed in proposals), XC-25 (audit of observed results) |
+| R5 | SG-01, SG-02, SG-06, SG-07, XC-05 (Tier-3 checks before web-owned gates), XC-15, XC-16, XC-21 (replay identity), XC-23 |
 | R6 | XC-04, XC-12, XC-17 |
-| R7 | XC-09 route parity; every route-dependent acceptance below |
-| R8 | GS-03, XC-01, XC-07, XC-11, XC-12, XC-18 |
+| R7 | XC-09 route parity, XC-22 presentation; every route-dependent acceptance below |
+| R8 | GS-03, XC-01, XC-07, XC-11, XC-12, XC-18, XC-22 (UI copy), XC-24 |
 
 ## R0 — Rebind reconnaissance before implementation
 
@@ -89,9 +89,11 @@ candidate on the actual implementation branch. Classify findings as remaining,
 changed, corrected or still unverified. Keep the old 0.8.9 observations as dated
 evidence; do not revive the abandoned full `.10` workplan. Inspect policy,
 provider and session routes implicated by a changed handler rather than merely
-relocating line references. The [proposed-but-unrun probes](evidence.md#proposed-but-unrun-probes)
-are the starting list for turning source-established rows into demonstrated or
-refuted ones.
+relocating line references. The [probe wave outcomes](evidence.md#probe-wave-outcomes-2026-11-09)
+give each finding's 0.8.9 control (confirmed, refuted or not runnable, with the
+sheet's run record); re-run the confirmed controls on the receiving branch, and
+treat the 16 not-runnable rows (browser, running server, PostgreSQL, live
+provider) as the remaining route-level reproductions.
 
 **Compatibility:** none changed by this step. Preserve current data and work.
 **Acceptance:** exact branch/revision and measured tool names; each selected
@@ -130,7 +132,14 @@ refused must not reach the user as an approvable proposal while the model is
 told it succeeded: run validation-only admission for blob and secret mutations
 before staging, convert staging-time `ValueError` from proposal blob-reference
 validation into a tool refusal, and either return a refused preview in-turn or
-disclose to the model that the proposal is unchecked. Same-batch writers must
+disclose to the model that the proposal is unchecked. The accept route must
+settle every proposal it cannot apply: today a recurring preview
+`ToolArgumentError` escapes as an unhandled 500 and a no-op 409s, and both
+leave the proposal pending indefinitely (`set_source-N8`,
+`patch_source_options-N2`; D1). MCP path admission (XC-10) is an
+authoring-time false "valid", not a runtime escape: the stdio server's runtime
+preflight already refuses the stored paths at preview, so D2 decides only where
+the refusal surfaces. Same-batch writers must
 read the batch's current state, not the pre-batch persisted id
 (`request_interpretation_review-N2`).
 
@@ -178,7 +187,11 @@ hashes. Changing MCP path authority changes MCP's file-source capability (D2).
   unrelated blocker, bound blob, unauthorized secret, unknown or non-canonical
   blob id) does not return `APPROVAL_REQUIRED` with `success=True` unless D1 rules
   that intended and the result discloses it; no staging path raises an
-  unconverted exception.
+  unconverted exception (today an unknown or upper-case blob id ends the turn,
+  `delete_blob-N3`).
+- Accepting a proposal whose replay raises `ToolArgumentError` returns a
+  handled refusal and settles the proposal; a repeated accept does not 500
+  (`set_source-N8`).
 - Existing strict/non-strict wire bytes, semantic omission/null behavior,
   tutorial/provider transitions and redaction remain covered.
 - A canonical queue succeeds; each forbidden collector scope field and their
@@ -342,7 +355,8 @@ depends on R3. **Owner:** tool outcome contracts and Composer
 lifecycle; store-specific settlement remains with its current service.
 **Findings:** SG-03 no-op/version inconsistency, BOS-04 graph-independent blob
 effects and retry limitations, XC-02 proposal obligations, XC-17 async state
-appends; synthesis groups 4 and 6.
+appends, XC-20 validation scope, XC-21 finalization effects, XC-22 proposal
+effects, XC-25 cache-hit audit; synthesis groups 4, 6 and 8.
 
 Define stage-specific owned outcomes, or a discriminated family, for argument
 admission, semantic success/refusal, graph-content change, observed external/store
@@ -368,6 +382,16 @@ occurred. Keep existing blob custody drivers, ambiguous-effect refusal, operatio
 replay and fences; wrap their actual receipts rather than recreating
 transactions in Composer.
 
+Server-owned steps are effects of the call that triggered them. When
+required-control finalization, an approval rewrite or review reconciliation
+changes the authored edit, the outcome reports it and the echo shows the
+committed form (`remove_node-N5`); a proposal lists the effects accepting it will
+have, including controls and moved routes, not only the authored delta
+(`upsert_edge-N9`, `set_source_from_blob-N1`). Validation scope is part of the
+outcome: a discovery refusal's synthetic validation must not become the next
+mutation's prior validation (`diff_pipeline-N5`). Audit evidence records the
+envelope the model received, including on a cache hit (`list_sinks-N5`).
+
 **Affected components:** `ToolResult`, discovery/progress helpers, mutation
 handlers, `declarations.py` effect domains, blob effect adapters, tool-batch
 accumulator, proposals and acceptance, audit projections, completion checks,
@@ -384,7 +408,13 @@ previously ambiguous effect as safe to repeat.
 controls preserve semantic graph identity and report no graph change; one actual
 field change advances identity once; `affected_nodes` covers reconciliation side
 effects. A no-op is not staged as a proposal, and accepting an existing no-op
-proposal behaves the same for source, node and output patches. Blob creation
+proposal behaves the same for source, node and output patches and gives it a
+terminal status (today: 409 with the proposal left pending,
+`patch_source_options-N2`). A required control removed and later re-spliced is
+reported in that call's outcome; a proposal card for an edge that moves a
+producer's `on_success` says so. A successful mutation after a refused discovery
+lists no discovery error as resolved. A cache-hit audit row carries the same
+`validation` the model received. Blob creation
 reports an effect even with unchanged graph state. Failed admission performs no
 effect. An opted-out `request_interpretation_review` reports its state append and
 the turn persists. Cancellation before, during and after an effect has an
@@ -428,7 +458,13 @@ schema/capability/output contracts; do not move deployment secrets, profile
 allowlists or review authority into plugin configuration classes. Preserve
 provider authorship and provenance through required-control insertion. Name the
 owner for interpretation-review reconciliation and for which review kinds
-auto-surface (D10).
+auto-surface (D10). Run the same post-commit review reconciliation from every
+writer, queue insertion included, so a resolved review cannot drift and wedge
+the draft (`upsert_node-N4`, D29), and so a rebind neither keeps a guarantee
+stamp without its resolved row nor carries an acknowledgement to a different
+file without re-asking (`set_source_from_blob-N5`, D18). Define replay identity
+over the authored projection, or document that server-wired controls end it
+(`splice_transform-N9`, D35).
 
 **Affected components:** source/node/edge/output mutations, `set_pipeline`,
 planner terminal, `_common` prevalidation and path validators, `state.py`
@@ -478,8 +514,15 @@ graph mutations. The orchestrator's terminal vocabulary must distinguish waiting
 for human review, waiting for proposal approval, provider-declined work,
 authorized handoff, editable recovery, staged proposal and fully satisfied
 completion obligations. Recovery receipts list collateral proposal dispositions
-(superseded, left stale). Decide the discovery-economy rule: refuse answered
-rereads, charge them, or say neither happens (D7).
+(superseded, left stale), and head-changing recovery applies one disposition to
+every pending proposal (D15). Decide the discovery-economy rule (D7). The probe
+wave corrected its premise: freeform has no discovery-turn cap at all, because
+`composer_max_discovery_turns` is read only by the planner and a test pins
+freeform's open-ended discovery as intended, so cached and uncached rereads both
+ran to the compose deadline (`list_sinks-N9`). Decide whether freeform needs a
+cap (in turns or provider calls), whether answered rereads are refused on either
+route, and make the setting's name, the config validator's warning and the skill
+text say what then happens.
 
 **Affected components:** async effect/name sets, inline definitions, session-tool
 owner, advisor checkpoints, recovery controls, planner terminal, tool batch,
@@ -538,7 +581,7 @@ describe a behaviour that a pending decision or R2 change will alter.
 **Owner:** skill authors (`pipeline_composer.md`, `pipeline_capabilities.md`),
 planner authoring aids, tool declarations and the guidance catalogue, plugin
 `composer_hints` owners, UI copy. **Findings:** GS-03, XC-01, XC-07, XC-11,
-XC-12, XC-18.
+XC-12, XC-18, XC-22 (proposal summaries), XC-24.
 
 Render guidance per route from the route's palette: the freeform skill, planner
 aids, plugin hints reachable on the planner or MCP, and catalogue repair text
@@ -620,7 +663,7 @@ planner tool/prompt hashes.
 |---|---|---|---|
 | Q1 | Pass `secret_wiring_policy` on proposal accept, with a mutation-controlled accept test | Every accepted secret wire is currently denied (XC-03) | [`wire_secret_ref`](tools/wire_secret_ref.md) §6.1 E1 |
 | Q2 | Type-check `path`/`file` as a non-empty, NUL-free `str` before resolving source and sink paths | Turn-ending `TypeError`/`ValueError` (XC-05) | [`set_source`](tools/set_source.md) §6.1 item 1; [`set_output`](tools/set_output.md) item 1; [`patch_output_options`](tools/patch_output_options.md) E2 |
-| Q3 | Convert staging-time `ValueError` into a failed tool result and canonicalize the id first | Unconverted proposal-staging exceptions (XC-02) | [`wire_blob_inline_ref`](tools/wire_blob_inline_ref.md) §6.1 item 4; [`update_blob`](tools/update_blob.md) item 4 |
+| Q3 | Convert staging-time `ValueError` into a failed tool result and canonicalize the id first | Unconverted proposal-staging exceptions that end the turn with no tool row (XC-02; `delete_blob-N3`, `set_source_from_blobs-N7`) | [`wire_blob_inline_ref`](tools/wire_blob_inline_ref.md) §6.1 item 4; [`update_blob`](tools/update_blob.md) item 4 |
 | Q4 | Refuse non-ready blobs in `update_blob` before the replacement integrity check | `AuditIntegrityError` ending the turn for a listed `pending`/`error` blob | [`update_blob`](tools/update_blob.md) §6.1 item 3 |
 | Q5 | Refuse an over-limit file with an honest size code before credential inspection | Size reported as a credential, with secret-service advice (XC-14) | [`get_blob_content`](tools/get_blob_content.md) §6.1 row 1 |
 | Q6 | Fix the three JSON proof diagnostics to match `PreviewResponse` | Request-terminating `FrameworkBugError` on JSON sources | [`preview_pipeline`](tools/preview_pipeline.md) §6.1 E1 |
@@ -637,20 +680,28 @@ planner tool/prompt hashes.
 | Q17 | Catch `StorageAccountingUnavailableError` as a coded refusal | Plugin crash where upload returns 503 | [`create_blob`](tools/create_blob.md) §6.1 row 3 |
 | Q18 | Wrap malformed freeform/malformed-head recovery controls in the planner's typed `MALFORMED_RESPONSE` | Generic first-party fault with no repair (XC-04) | [`handoff_to_user`](tools/handoff_to_user.md) §6.1 item 3; [`restore_parked_graph`](tools/restore_parked_graph.md) item 8 |
 | Q19 | Remove or scope planner-visible instructions for tools the planner lacks | Planner build guidance ending `DISCOVERY_ONLY` (XC-01) | [`emit_pipeline_proposal`](tools/emit_pipeline_proposal.md) §6.1 item 7; [`create_blob`](tools/create_blob.md) row 7; [`wire_blob_inline_ref`](tools/wire_blob_inline_ref.md) item 7 (**pin churn**: skill, planner prompt) |
-| Q20 | Correct the skill's "refused rather than answered" claim | Model expecting a refusal that never comes (XC-12) | [`list_sinks`](tools/list_sinks.md) §6.1 E6; [`list_sources`](tools/list_sources.md) item 5 (**pin churn**: skill) |
+| Q20 | Correct the skill's "refused rather than answered" claim (what freeform does instead waits for D7) | Model expecting a refusal that never comes (XC-12) | [`list_sinks`](tools/list_sinks.md) §6.1 E6; [`list_sources`](tools/list_sources.md) item 5 (**pin churn**: skill) |
 | Q21 | Reword "full replacement options object" to merge semantics with `null` delete | Refused read-modify-write patches | [`patch_node_options`](tools/patch_node_options.md) §6.1 item 6; [`patch_output_options`](tools/patch_output_options.md) E7; [`patch_source_options`](tools/patch_source_options.md) item 11 (**pin churn**: skill) |
 | Q22 | Stop the false json `on_write_failure` hint; attach post-call hints on `set_output` | A suggested patch that is always refused | [`patch_output_options`](tools/patch_output_options.md) E1; [`set_output`](tools/set_output.md) item 2 |
 | Q23 | Reword the `list_*` "only for enum values…" sentence to agree with the schema precondition | Discovery order contradiction (XC-18) | [`get_plugin_schema`](tools/get_plugin_schema.md) §6.1 E1 (**pin churn**: declaration) |
 | Q24 | Route `openrouter/...` through the catalogue accessor; remove the never-supplied `model_catalog` from both skills | Model ids the validator rejects (XC-19) | [`list_models`](tools/list_models.md) §6.1 E1, E6 (**pin churn**: skill) |
 | Q25 | Tokenize the grammar operator parity test | A parity test that passes with `<`/`>` removed (mutation-confirmed) | [`get_expression_grammar`](tools/get_expression_grammar.md) §6.1 item 3 |
+| Q26 | Treat a `ToolArgumentError` raised on proposal accept like a refused result: 422 and auto-reject | Unhandled 500 that leaves the proposal pending on every retry (XC-03, `set_source-N8`) | [`set_source`](tools/set_source.md) §6.1 item 9 |
+| Q27 | Record `version` and `validation` in the cache-hit audit payload | Audit evidence missing the envelope the model received (XC-25) | [`list_sinks`](tools/list_sinks.md) §6.1 E13 |
+| Q28 | Show the producer's routing change on an `upsert_edge` proposal whose target is a sink | Approver cannot see that accepting moves `on_success` (XC-22) | [`upsert_edge`](tools/upsert_edge.md) §6.1 item 10 |
+| Q29 | Canonicalize a UUID-parseable `park_id` at admission | Uppercase, braced or padded ids of an advertised park refused as unavailable (BOS-03) | [`restore_parked_graph`](tools/restore_parked_graph.md) §6.1 item 3 |
+| Q30 | Say audit export is not available for composer-built Web runs, instead of operator-configured | Users sent to a setting no Web path can write (XC-18; the product question is D14) | [`get_audit_info`](tools/get_audit_info.md) §6.1 item 7 |
 
 ## Confidence, risks and unresolved decisions
 
 Confidence is high that the concrete findings warrant the named contract fixes;
 confidence is moderate in the exact packaging/order beyond dependencies because
-no implementation spike or migration prototype was performed. Most review-wave
-rows are source-established or demonstrated in memory, not end-to-end; R0 should
-turn the decisive ones into route-level reproductions first. The highest risks
+no implementation spike or migration prototype was performed. After the probe
+wave most rows are demonstrated through in-memory runs, scripted-provider
+compose or planner turns, the in-process REST accept route, the MCP handler or
+jsdom, but none through a live provider, deployed service, PostgreSQL or real
+browser; R0 should re-run the recorded controls and do the 16 not-runnable
+reproductions first. The highest risks
 are loss of authority/evidence, incompatible persisted responses, and accidental
 redefinition of routing or retry safety. The recommended approach is reversible
 by bounded adapters until a persistent semantic change is approved.
@@ -658,7 +709,7 @@ by bounded adapters until a persistent semantic change is approved.
 Before implementation, decide the supported response version strategy, precise
 diff baseline, noncanonical-ID policy, splice invalid-draft policy, effect
 replay identity, and the questions in the
-[README decisions list](README.md#decisions-needed-from-the-maintainer) (D1–D13).
+[README decisions list](README.md#decisions-needed-from-the-maintainer) (D1–D38).
 Those decisions do not block this assessment; they belong to the separately
 scoped changes. Refresh against `.10 lite` first. No estimate, release
 assignment, cloud qualification or historical-data migration is implied.

@@ -68,10 +68,14 @@ defaults it to `None`; the diff handler then refuses with
 `diff_baseline_unavailable`. MCP passes a session baseline (rebased even after a
 failed `load_session`, `diff_pipeline-N2`). The planner passes
 `baseline=current_state` and diffs that same state, so every planner call
-returns zero changes (`diff_pipeline-N1`, 2026-11-09 review). Controlled
-handler cases distinguish missing baseline, a changed baseline and the identical
-state. The attempted full-service reproduction failed at harness admission
-before a provider call, so it is not end-to-end runtime evidence.
+returns zero changes (`diff_pipeline-N1`). Controlled handler cases distinguish
+missing baseline, a changed baseline and the identical state. The probe wave
+then ran all three routes: a real planner loop with a scripted provider returned
+zero changes while a mutant binding another baseline returned one; a freeform
+service compose refused, and the refusal's synthetic error later appeared in a
+successful mutation's `resolved_errors` (`diff_pipeline-N5`, XC-20); and the
+MCP handler rebased after a failed load (`diff_pipeline-N2`). These are
+scripted-provider runs, not a live model or deployed route.
 
 **Related evidence:** [source inspection](tools/inspect_source.md) can succeed
 under a direct context that lacks the storage root and operation authority
@@ -79,6 +83,9 @@ required by `get_blob_content`. It also bypasses `_locked_blob_row_for_read`,
 whose docstring requires every content read to run inside the custody lock
 (`inspect_source-N2`). This proves tool admission inconsistency; it
 does not establish a reachable unauthorized HTTP read or a concurrency exploit.
+The probe wave demonstrated the crash-leftover consequence (inspection reads an
+unhealed pre-update sidecar that `get_blob_content` restores); the concurrent
+race was not runnable.
 
 **Underlying cause:** [ToolContext](../../../src/elspeth/web/composer/tools/_common.py#L3678)
 is a broad optional-dependency carrier, while
@@ -280,7 +287,9 @@ for one giant handler or one universal state store.
 The 46 per-sheet reviews (method and limits in
 [evidence](evidence.md#per-sheet-review-wave-2026-11-09)) mostly add instances
 to groups 1–6. Eight causes recur often enough to name separately. Register
-IDs are in the [README](README.md#cross-cutting-findings-added-by-the-review-wave).
+IDs are in the [README](README.md#cross-cutting-findings-added-by-the-review-and-probe-waves).
+The probe wave's corrections to these paragraphs are folded in; its new causes
+are in section 8.
 
 **One skill text, several palettes.** The planner renders the freeform
 composer skill as its own (`rendered_skill = self._composer_skill_text`,
@@ -299,17 +308,26 @@ on `tool_name in _MUTATION_TOOLS and tool_name != "set_pipeline"`
 ([tool_batch.py L2057](../../../src/elspeth/web/composer/tool_batch.py#L2057));
 the only handled outcome is a valid, version-advancing preview, and a refused
 preview has no branch. Blob and secret mutations are outside the set. A
-proposal therefore reaches the user while the model is told it succeeded, and
-the refusal surfaces at accept (XC-02). The approval path is a second
-dispatcher that does not share the immediate path's admission.
+proposal therefore reaches the user while the model is told it succeeded
+(XC-02). The probe wave drove staging and then the REST accept route for the
+tools XC-02 names and found three accept outcomes, not one: a refused preview gives 422
+and auto-reject; a no-op preview gives 409 "did not change composition state"
+and leaves the proposal pending indefinitely; a preview `ToolArgumentError`
+gives an unhandled 500 and leaves it pending. Staging itself can raise a bare
+`ValueError` for an unknown or non-canonical blob id, ending the turn with no
+tool row. The approval path is a second dispatcher that does not share the
+immediate path's admission, and the accept route is a third.
 
 **Every re-invocation assembles its own context.** Group 1's optional
 `ToolContext` reappears at each site that calls `execute_tool` again: the
 explicit-approve preview passes `secret_wiring_policy`, the accept route
 ([proposals.py L493](../../../src/elspeth/web/sessions/routes/composer/proposals.py#L493))
-does not, so every accepted secret wire is denied (XC-03); MCP passes
-`data_dir=None` with opposite effects on source, sink and provider paths
-(XC-10); MCP also skips discovery response admission because its dispatcher
+does not, so every accepted secret wire is denied (XC-03, demonstrated through
+the accept route with a mutation control); MCP passes `data_dir=None` with
+opposite effects on source, sink and provider paths (XC-10). The probe wave
+narrowed XC-10: the stdio server's runtime preflight refuses the stored
+out-of-root paths at preview and the YAML export omits them, so the effect is a
+false "valid" during authoring, not a confinement escape. MCP also skips discovery response admission because its dispatcher
 serializes `result.to_dict()` directly
 ([server.py L415](../../../src/elspeth/composer_mcp/server.py#L415); XC-09).
 GS-01 was the first instance, not an isolated one.
@@ -330,9 +348,14 @@ XC-08, XC-13). The integrity-relevant case is the retention guard, not the
 lookup miss.
 
 **Dead policy branches are still taught.** `prohibited` has had no producer
-since `e7f6f1521` (XC-11); `DISCOVERY_NO_GAIN` and `covers()` have no
+since `e7f6f1521` (XC-11, empty across a five-cell policy matrix with a
+producer-mutant control); `DISCOVERY_NO_GAIN` and `covers()` have no
 production caller (XC-12); the `model_catalog` aid both skills cite is never
-attached (`list_models-N6`). Each is described in tool descriptions or skills as
+attached (`list_models-N6`). The probe wave found a neighbouring case of a
+setting that reads as live: `composer_max_discovery_turns` caps only the
+planner, freeform has no discovery cap (a test pins that as intended), and the
+config validator still adds it to "configured turns". Cached and uncached
+freeform rereads both ran to the compose deadline. Each is described in tool descriptions or skills as
 live behaviour. When a branch was removed or never wired, its teaching text,
 contracts and tests were not removed with it.
 
@@ -343,18 +366,68 @@ reconciled at some writers and not others (XC-15, XC-16). An incremental
 `is_valid=True` is therefore not a runtime promise, which group 5 implied but
 did not demonstrate.
 
-**Instruments that pass for the wrong reason.** Three tests or checks were
-shown to stay green over the defect they appear to guard: the grammar operator
-check uses substring membership, and a coordinator mutation probe confirmed it
-passes with `<` and `>` removed (`get_expression_grammar-N4`); a builder-count
-test patches a name its caller does not bind (`set_pipeline-N8`); guidance tests
-pin the inverted `explain_validation_error` pointer (`explain_validation_error-N1`).
+**Instruments that pass for the wrong reason.** Tests or checks were shown to
+stay green over the defect they appear to guard: the grammar operator check
+uses substring membership, and a coordinator mutation probe confirmed it passes
+with `<` and `>` removed (`get_expression_grammar-N4`); a builder-count test
+patches a name its caller does not bind, and the probe wave ran it green while
+both bindings each counted one build (`set_pipeline-N8`); guidance tests pin the
+inverted `explain_validation_error` pointer (`explain_validation_error-N1`);
+disabling the metadata credential-refusal branch left both test files that name
+the tool green (`get_blob_metadata-N4`). Harness defaults hide behaviour too: the
+shared `composer_service_with_real_sessions` fixture wires no `session_engine`,
+so `create_blob` through it creates nothing, and `StaticPluginSnapshotFactory`
+drops `control_modes`, hiding accept-time control wiring
+([`create_blob`](tools/create_blob.md) §6.1; [`set_source_from_blob`](tools/set_source_from_blob.md) §7).
 Remediation acceptance should include a mutation control for each new check.
 
 Audit-facing prose has drifted too: several redaction justifications cite a
 `tools.py` module that no longer exists, four handler docstrings are dead code
 (`get_audit_info-N1`), and `get_tool_definitions` says it returns 42 tools
 against 43 measured. This is hygiene, not an agent-facing defect.
+
+## 8. Causes newly evidenced by the 2026-11-09 probe wave
+
+The probe wave ran the review wave's proposed probes (outcomes and network
+record in [evidence](evidence.md#probe-wave-outcomes-2026-11-09)). Most runs
+confirmed an existing row at a stronger level; eight refuted a claim. Three
+causes are new.
+
+**Server-owned steps change the edit without saying so.** Required-control
+finalization re-splices a control the model removed and leaves the model's
+`applied_component` echo showing the pre-finalization wiring (XC-21,
+`remove_node-N5`); after controls are wired around a spliced node, an identical
+replay is refused instead of reported as already applied (`splice_transform-N9`).
+The approval surface has the same gap for the user: proposal cards fall back to
+"Apply composer tool X." and do not show moved routes or the controls accept
+will add (XC-22). Review evidence is reconciled on some writers only, so a queue
+insertion through `upsert_node` can wedge a draft behind
+`review_reconciliation_failed`, and a rebind can carry an acknowledgement to a
+different file (XC-23). The cause is that these steps belong to the server, but
+their results are not part of the tool outcome or the proposal obligations
+(groups 4 and 6).
+
+**Validation state crosses tool boundaries.** A failed discovery's synthetic
+validation becomes the next mutation's prior validation, so the mutation reports
+the discovery refusal as "resolved" (XC-20); the planner is told to pass a
+requirement code its feedback never carries (XC-24). The loop keeps one
+`last_validation` for both observations and mutations.
+
+**Audit records what the tool returned; the model sometimes sees more.** A
+freeform cache hit records `{success, data, cache_hit}` while the model receives
+the rebuilt validation and version (XC-25). The general claim that audit loses
+what the model saw was refuted: a private role=audit evidence row keeps the
+served result for ordinary calls (`get_pipeline_state-N2`). Sheets that inferred
+audit loss from the redacted chat row should be re-read against that private row.
+
+Two of the eight refutations touched claims the shared documents relied on: the
+`clear_source` pending-review residual (`clear_source-N4`; pending session events
+are retired on save) and the audit half of `get_pipeline_state-N2`. The other six
+refuted single-sheet claims (`list_sources-N2` mirror, `patch_node_options-N10`,
+`patch_source_options-N5` audit loss, METADATA-N6(e), `set_pipeline-N5` as first
+stated, and a `set_source` provider-path sibling). Two shared claims were
+corrected rather than refuted: the cause of XC-12 (no freeform cap, not
+uncharged cache hits) and the severity of XC-10 (preview refuses the paths).
 
 ## Confidence, risk, gaps and follow-ups
 
@@ -372,11 +445,13 @@ Compatibility is required for current supported public/operator/persistence
 surfaces; no blanket old-Composer exception or data reset is assumed here.
 
 The [evidence record](evidence.md) distinguishes executed tests, source proof,
-failed probes and outstanding questions. The 2026-11-09 review wave's rows are
-source-established or demonstrated in memory; route-level reproduction is the
-first implementation step. No live provider, deployed environment,
-full Python suite, PostgreSQL testcontainer contention selection or browser
-suite was run. No claim is made that every plugin or provider transport is
+failed probes and outstanding questions. After the probe wave, most register
+rows are demonstrated through in-memory runs, scripted-provider compose or
+planner turns, the REST accept route driven in process, the MCP `call_tool`
+handler or jsdom; 16 probes were not runnable here (browser, running server,
+PostgreSQL or live provider) and remain the route-level reproductions to do
+first. No live provider, deployed environment, full Python suite, PostgreSQL
+testcontainer contention selection or real-browser suite was run. No claim is made that every plugin or provider transport is
 qualified. Refresh affected traces, controls and focused tests when `.10 lite`
 changes arrive; do not carry an old defect forward solely because it appears
 in this document.
