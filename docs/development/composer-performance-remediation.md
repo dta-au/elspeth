@@ -1128,3 +1128,14 @@ Record raw output, not summaries, in each fix's Evidence line.
 - `scripts/branch-safety-check.sh` and `scripts/full-suite-gate.sh` are the
   canonical pre-commit/pre-merge instruments; use them, not raw commands.
   The PreToolUse guard refuses `pkill -f`; stop the server with `kill <pid>`.
+- **Gate exit codes must gate.** Twice in this session a chain of the form
+  `gate | tail -1 && commit` let a red gate through (fix 15's pytest; the
+  2B commit's safety check), because `tail`'s exit code replaced the gate's.
+  Run every gate as `gate > log 2>&1 && next`, and read the log only on
+  failure. Both incidents were re-verified after the fact (fix 15: 159/159
+  at HEAD in a clean worktree; 2B: the `home-paths` FAIL was the
+  pre-existing prose "syntax" + "root-section" joined by a slash in
+  `ImportYamlModal.tsx:164`, which matches this container's `$HOME` (the
+  superuser's home) — a false positive that cannot fire where `$HOME` is a
+  per-user directory. Writing that literal here would trip the same check,
+  which is why it is described rather than quoted).
