@@ -4,6 +4,75 @@ All notable changes to ELSPETH are documented here.
 
 ---
 
+## 0.8.12 - Unreleased (Composer tool remediation)
+
+This entry records the Composer tool remediation that follows the 0.8.11
+candidate. It is in development: the changes below are integrated on the
+remediation branch, but the combined test, proof and PostgreSQL gates have not
+yet run on the integrated tree, and the package version has not been advanced.
+The entry will be completed, and corrected where verification disagrees,
+before the release is cut.
+
+### Composer
+
+- **Refusals and no-ops go back to the model, not to an approval card.** A
+  mutation is now run through validation-only admission before a proposal is
+  staged. A change the server already knows it will refuse, or one that would
+  change nothing, is returned to the model as tool feedback so it can repair
+  its request. Approval cards are created only for changes that pass
+  admission, so a user is no longer asked to approve a proposal that cannot
+  be accepted.
+- **Blob and secret changes are checked before a proposal is published.**
+  Blob update and delete prerequisites, quota and custody checks run at
+  admission. No blob-store effect is executed as a preview.
+- **A proposal that loses a race for its resource says so.** When the blob or
+  graph a staged proposal depends on changes before publication, the tool
+  reports the race instead of reporting that the proposal was staged.
+- **Blob and parked-graph selectors accept any spelling of a UUID.** Blob
+  lookups, bindings, retention, planner facts and proposal custody resolve a
+  UUID written in upper case, with braces or as a URN to the same blob, and
+  duplicate detection treats those spellings as one blob. Restoring a parked
+  graph canonicalises its selector the same way. The arguments the model
+  sent, and the hashes recorded over them, are preserved unchanged.
+- **A cache hit is audited as the envelope the model received.** The audit
+  record for a cached discovery result now matches the admitted envelope
+  delivered to the model.
+- **Queue scope fields reach node admission.** Three queue scope fields that
+  were dropped before `NodeSpec` admission are now carried through.
+
+### MCP server
+
+- **File paths are confined to the configured data directory.** File paths
+  authored over MCP are resolved against the configured data directory and a
+  path outside it is refused at admission, including the explicit-null case
+  that previously bypassed the check.
+- **The standalone MCP server owns its process lifecycle.** The installed CLI
+  runs the server under a private supervisor that keeps custody of the child
+  process, so shutdown, a failed start, loss of the control channel and the
+  death of the parent all settle the child instead of leaving it running.
+  Work started during preflight is retained and settled through shutdown.
+  The supervisor uses the same portable path on every platform; it has been
+  exercised on Linux only.
+
+### Landscape
+
+- **Creating Landscape tables on PostgreSQL no longer breaks a later SQLite
+  initialization in the same process.** PostgreSQL table creation left
+  transient constraint rules on the shared schema metadata, which suppressed
+  inline foreign keys when a SQLite Landscape was created afterwards. Table
+  creation is now serialized and restores the original rules, including when
+  the DDL fails.
+
+### Upgrade notes
+
+- An MCP client that authors a file path outside the configured data
+  directory is now refused. Move the file under the data
+  directory or change the configured root.
+- A pending approval for a change that is now known to be refused or to be a
+  no-op settles as terminal instead of remaining pending.
+
+---
+
 ## Unreleased (0.8.11)
 
 This section records changes on the 0.8.11 candidate. It does not establish
