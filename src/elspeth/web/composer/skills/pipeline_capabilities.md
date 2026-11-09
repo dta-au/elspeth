@@ -138,7 +138,9 @@ component; `row_union` requires an explicit `on_success` connection.
   assignment-transform emulation. Condition expressions read row values ONLY
   by subscripting the row namespace — `row['field']`; a bare field name is
   not in scope and is rejected. `get_expression_grammar` is the full grammar
-  authority.
+  authority. A boolean `condition` routes on exactly the labels `"true"` and
+  `"false"`; each route value is a sink name, a downstream node's `input`
+  connection, or `fork`.
   Gate expression-evaluation failures use the optional node-level `on_error`
   policy: set it to `discard`, a declared sink name, or an eligible enclosing
   bound-region closer as described above. Omit it to preserve
@@ -259,7 +261,8 @@ inspection records, not a substitute for exact `set_pipeline_arguments`.
 <!-- taught:end -->
 
 Named sources use the same routing semantics as the singular source without
-inline custody fields.
+inline custody fields. `inline_blob` sits on `source` beside `options`, never
+inside it, and a source bound by `inline_blob` or `blob_id` authors no `path`.
 
 Use `source` only for the canonical single-source custody shape; use `sources`
 for plural named roots. Use stable, descriptive source/node/output ids. Edges
@@ -313,7 +316,14 @@ cleanup node and then from the cleanup node to the sink.
 
 Source plugins may coerce declared fields only where their live contract permits it.
 CSV fixed/flexible schemas coerce declared fields at ingestion; observed CSV cells remain strings.
+Declare fields as `name: type`. A coercing source turns integer text into `int`,
+numeric text into `float`, and `true`/`false`, `yes`/`no`, `1`/`0` into `bool`;
+a cell that does not parse fails source validation.
 Source validation failures use `on_validation_failure`.
+Fields declared under `fixed`/`flexible` are guaranteed. For rows you generated,
+declare typed `fields` for what a consumer requires; you need not author
+`guaranteed_fields`. Sinks never coerce: declare sink `schema.fields` with
+the types that arrive when the output's columns are known.
 A downstream input type declaration validates arriving values without converting them:
 value-dependent mismatches use `on_error`; provable contradictions may be refused
 at build. Only `int` widens to `float`. Declare actual types; use `any` for created

@@ -1578,6 +1578,55 @@ class TestSkillFollowsCurrentToolBehaviour:
         assert "declare its input requirements as `schema.required_fields`" in flattened
 
 
+class TestHotPathAuthoringFacts:
+    """Facts a traced planner had to guess, each stated once and checked against code."""
+
+    def test_boolean_gate_labels_match_the_gate_settings_validator(self) -> None:
+        import pytest
+        from pydantic import ValidationError
+
+        from elspeth.core.config import GateSettings
+
+        flattened = " ".join(SYSTEM_PROMPT.split())
+        assert 'A boolean `condition` routes on exactly the labels `"true"` and `"false"`' in flattened
+
+        GateSettings(name="g", input="rows", condition="row['n'] >= 20", routes={"true": "a", "false": "b"})
+        with pytest.raises(ValidationError, match="route labels"):
+            GateSettings(name="g", input="rows", condition="row['n'] >= 20", routes={"big": "a", "small": "b"})
+
+    def test_source_coercion_spellings_match_the_schema_factory(self) -> None:
+        import pytest
+        from pydantic import ValidationError
+
+        from elspeth.contracts.schema import SchemaConfig
+        from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
+
+        flattened = " ".join(SYSTEM_PROMPT.split())
+        assert "turns integer text into `int`, numeric text into `float`, and `true`/`false`, `yes`/`no`, `1`/`0` into `bool`" in flattened
+        assert "a cell that does not parse fails source validation" in flattened
+        assert "Sinks never coerce" in flattened
+
+        config = SchemaConfig.from_dict({"mode": "flexible", "fields": ["flag: bool", "count: int", "rate: float"]})
+        coercing = create_schema_from_config(config, "CoercingRow", allow_coercion=True)
+        for text, expected in (("true", True), ("false", False), ("yes", True), ("no", False), ("1", True), ("0", False)):
+            assert coercing.model_validate({"flag": text, "count": "42", "rate": "1.5"}).model_dump()["flag"] is expected
+        row = coercing.model_validate({"flag": "true", "count": "42", "rate": "1.5"}).model_dump()
+        assert (row["count"], row["rate"]) == (42, 1.5)
+        with pytest.raises(ValidationError):
+            coercing.model_validate({"flag": "maybe", "count": "42", "rate": "1.5"})
+        strict = create_schema_from_config(config, "StrictRow", allow_coercion=False)
+        with pytest.raises(ValidationError):
+            strict.model_validate({"flag": "true", "count": "42", "rate": "1.5"})
+
+    def test_inline_blob_position_and_downgrade_disclosure_are_stated(self) -> None:
+        flattened = " ".join(SYSTEM_PROMPT.split())
+
+        assert "`inline_blob` sits on `source` beside `options`, never inside it" in flattened
+        assert "you need not author `guaranteed_fields`" in flattened
+        assert "omits or substitutes any part of the request, say so first in your reply and in `metadata.description`" in flattened
+        assert "if the missing part is the request's core operation, decline with the named gap instead" in flattened
+
+
 class TestMutationEchoOperatingContract:
     """The high-salience freeform contract prevents post-success reread loops."""
 
