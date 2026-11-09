@@ -1,9 +1,11 @@
-"""Tests for the share-path file-binding collector."""
+"""Tests for the share-path file-binding and sink-path collectors."""
 
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any
+from dataclasses import replace
+from pathlib import Path
+from typing import Any, get_args
 from uuid import UUID, uuid4
 
 import pytest
@@ -15,14 +17,20 @@ from elspeth.web.composer.state import (
     PipelineMetadata,
     SourceSpec,
 )
+from elspeth.web.paths import SINK_LOCAL_PATH_OPTION_KEYS
 from elspeth.web.shareable_reviews.file_manifest import (
     BoundBlob,
     FileBinding,
     ShareManifestError,
+    SinkPathEntry,
+    SinkPathOption,
     _collect_inline_markers,
     collect_file_bindings,
+    collect_sink_paths,
     file_binding_from_json,
     file_binding_to_json,
+    sink_path_entry_from_json,
+    sink_path_entry_to_json,
 )
 
 SHA = "a" * 64
@@ -204,3 +212,108 @@ def test_binding_from_json_rejects_extra_and_missing_keys() -> None:
         file_binding_from_json(
             {"kind": "inline_content", "source_name": None, "row_index": None, "field_path": "bad path", "encoding": "utf-8"}
         )
+
+
+# ── Sink output paths ───────────────────────────────────────────────────
+
+_SID = "5b0f3c0e-8d55-4c1e-9a52-3f1d2b8e7c11"
+_OTHER_SID = "9e2d7a40-1b6c-4f3a-8e5d-0c4b3a2f1e99"
+
+
+def _sink_state(outputs: Mapping[str, Mapping[str, Any]]) -> CompositionState:
+    return replace(
+        _state(),
+        outputs=tuple(
+            OutputSpec(name=name, plugin="csv", options=options, on_write_failure="discard") for name, options in outputs.items()
+        ),
+    )
+
+
+def test_collects_sink_paths_inside_the_sharers_session_folders(tmp_path: Path) -> None:
+    data = tmp_path.resolve()
+    state = _sink_state(
+        {
+            "report": {"path": str(data / "outputs" / _SID / "report.csv"), "schema": {"mode": "observed"}},
+            "stable": {"path": "outputs/stable.csv"},
+            "blob_out": {"file": f"blobs/{_SID}/out.jsonl"},
+            "chroma": {"persist_directory": str(data / "outputs" / _SID / "index" / "chroma")},
+        },
+    )
+
+    assert collect_sink_paths(state, data_dir=tmp_path, session_id=_SID) == (
+        SinkPathEntry("blob_out", "file", "blobs", "out.jsonl"),
+        SinkPathEntry("chroma", "persist_directory", "outputs", "index/chroma"),
+        SinkPathEntry("report", "path", "outputs", "report.csv"),
+        SinkPathEntry("stable", "path", "outputs", "stable.csv"),
+    )
+
+
+def test_collects_every_path_key_of_one_output_sorted_by_option(tmp_path: Path) -> None:
+    state = _sink_state({"both": {"path": "outputs/a.csv", "file": "outputs/b.csv"}})
+
+    assert collect_sink_paths(state, data_dir=tmp_path, session_id=_SID) == (
+        SinkPathEntry("both", "file", "outputs", "b.csv"),
+        SinkPathEntry("both", "path", "outputs", "a.csv"),
+    )
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        pytest.param({"path": "/srv/elsewhere/report.csv"}, id="outside-data-dir"),
+        pytest.param({"path": f"outputs/{_OTHER_SID}/report.csv"}, id="another-session"),
+        pytest.param({"path": f"outputs/{_SID}/../escape.csv"}, id="dotdot-escape"),
+        pytest.param({"path": f"blobs/{_SID}/../{_OTHER_SID}/x.csv"}, id="dotdot-into-another-session"),
+        pytest.param({"path": "blobs/report.csv"}, id="shared-blob-root"),
+        pytest.param({"persist_directory": f"outputs/{_SID}"}, id="the-folder-itself"),
+        pytest.param({"path": None}, id="none"),
+        pytest.param({"path": 7}, id="not-a-string"),
+        pytest.param({"path": "outputs/bad\x00name.csv"}, id="nul-byte"),
+        pytest.param({"url": "outputs/report.csv", "dataset": {"path": "outputs/nested.csv"}}, id="not-a-top-level-path-key"),
+    ],
+)
+def test_sink_paths_outside_the_session_folders_are_not_recorded(tmp_path: Path, options: Mapping[str, Any]) -> None:
+    state = _sink_state({"out": options})
+
+    assert collect_sink_paths(state, data_dir=tmp_path, session_id=_SID) == ()
+
+
+def test_sink_path_option_literal_matches_the_sink_path_keys() -> None:
+    assert frozenset(get_args(SinkPathOption)) == frozenset(SINK_LOCAL_PATH_OPTION_KEYS)
+
+
+def test_sink_path_entry_json_round_trips() -> None:
+    entry = SinkPathEntry("out", "persist_directory", "blobs", "index/chroma")
+
+    assert sink_path_entry_to_json(entry) == {
+        "output": "out",
+        "option": "persist_directory",
+        "folder": "blobs",
+        "relative_path": "index/chroma",
+    }
+    assert sink_path_entry_from_json(sink_path_entry_to_json(entry)) == entry
+
+
+_GOOD_SINK_JSON: dict[str, object] = {"output": "out", "option": "path", "folder": "outputs", "relative_path": "report.csv"}
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param("nope", id="not-object"),
+        pytest.param({**_GOOD_SINK_JSON, "extra": 1}, id="extra-key"),
+        pytest.param({k: v for k, v in _GOOD_SINK_JSON.items() if k != "folder"}, id="missing-key"),
+        pytest.param({**_GOOD_SINK_JSON, "output": ""}, id="output-blank"),
+        pytest.param({**_GOOD_SINK_JSON, "output": 1}, id="output-int"),
+        pytest.param({**_GOOD_SINK_JSON, "option": "url"}, id="option-unknown"),
+        pytest.param({**_GOOD_SINK_JSON, "folder": "payloads"}, id="folder-unknown"),
+        pytest.param({**_GOOD_SINK_JSON, "relative_path": 3}, id="relative-int"),
+        pytest.param({**_GOOD_SINK_JSON, "relative_path": ""}, id="relative-empty"),
+        pytest.param({**_GOOD_SINK_JSON, "relative_path": "../x"}, id="relative-dotdot"),
+        pytest.param({**_GOOD_SINK_JSON, "relative_path": "/etc/passwd"}, id="relative-absolute"),
+        pytest.param({**_GOOD_SINK_JSON, "relative_path": "a/./b"}, id="relative-not-normalised"),
+    ],
+)
+def test_sink_path_entry_from_json_rejects_shape_drift(value: object) -> None:
+    with pytest.raises(ValueError):
+        sink_path_entry_from_json(value)

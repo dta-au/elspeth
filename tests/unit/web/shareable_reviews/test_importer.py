@@ -19,6 +19,7 @@ from uuid import UUID
 import pytest
 from fastapi import FastAPI
 from sqlalchemy import select
+from structlog.testing import capture_logs
 
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.payload_store import IntegrityError
@@ -151,6 +152,7 @@ def _graph(
 ) -> dict[str, Any]:
     """A csv source + reference_join node, optionally with a blob_rows source."""
     outputs_dir = client.app.state.settings.data_dir / "outputs" / str(session_id)
+    blobs_dir = client.app.state.settings.data_dir / "blobs" / str(session_id)
     sources: dict[str, Any] = {
         "customers": {
             "plugin": "csv",
@@ -178,7 +180,7 @@ def _graph(
             {
                 "name": "docs_out",
                 "plugin": "json",
-                "options": {"path": str(outputs_dir / "docs.jsonl"), "format": "jsonl", "schema": {"mode": "observed"}},
+                "options": {"path": str(blobs_dir / "out" / "docs.jsonl"), "format": "jsonl", "schema": {"mode": "observed"}},
                 "on_write_failure": "discard",
             }
         )
@@ -360,6 +362,68 @@ def test_import_copies_files_and_rebinds_every_binding(client: SyncASGITestClien
     for blob in shared.blobs.values():
         assert blob["id"] not in serialized
         assert blob["storage_path"] not in serialized
+
+
+def test_import_rebases_sink_paths_under_the_recipients_session(client: SyncASGITestClient, actor: _Actor) -> None:
+    from elspeth.web.composer.tools._common import _validate_sink_path
+
+    shared = _tom_shares(client, actor, with_rows=True)
+
+    response = _import(client, actor, shared.token)
+
+    assert response.status_code == 201, response.text
+    new_session_id = response.json()["session_id"]
+    data_dir = client.app.state.settings.data_dir.resolve()
+    record = _current_state(client, new_session_id)
+    outputs = {output["name"]: deep_thaw(output["options"]) for output in record.outputs}
+    assert outputs["main"]["path"] == str(data_dir / "outputs" / new_session_id / "main.jsonl")
+    assert outputs["docs_out"]["path"] == str(data_dir / "blobs" / new_session_id / "out" / "docs.jsonl")
+    for options in outputs.values():
+        # The re-authored path passes the composer's sink-path guard for the
+        # recipient's session, unchanged.
+        assert _validate_sink_path(options, str(data_dir), session_id=new_session_id) is None
+    serialized = json.dumps({"sources": record.sources, "nodes": record.nodes, "outputs": record.outputs}, default=str)
+    assert str(shared.session_id) not in serialized
+    # Chris's copy validates as it stands: no sink path needs setting by hand.
+    validated = client.post(f"/api/sessions/{new_session_id}/validate")
+    assert validated.status_code == 200, validated.text
+    assert validated.json()["is_valid"] is True, validated.json()["errors"]
+
+
+@pytest.mark.parametrize("relative_path", ["../escape.jsonl", "/etc/passwd", "", "nested/../../x"])
+def test_import_tampered_sink_path_is_an_integrity_error_and_creates_no_session(
+    client: SyncASGITestClient,
+    actor: _Actor,
+    created_sessions: list[UUID],
+    monkeypatch: pytest.MonkeyPatch,
+    relative_path: str,
+) -> None:
+    """The snapshot is server-written; a sink path that would leave the recipient's folder is corruption."""
+    shared = _tom_shares(client, actor)
+    service = client.app.state.shareable_review_service
+    original_load = service.load_snapshot
+
+    async def _load_snapshot(*, token: str) -> Any:
+        payload, snapshot = await original_load(token=token)
+        assert snapshot.sink_paths, "the shared graph must carry a sink path to tamper with"
+        tampered = replace(snapshot.sink_paths[0], relative_path=relative_path)
+        return payload, replace(snapshot, sink_paths=(tampered, *snapshot.sink_paths[1:]))
+
+    monkeypatch.setattr(service, "load_snapshot", _load_snapshot)
+    created_sessions.clear()
+    stored_before = _stored_session_ids(client, _CHRIS)
+
+    with capture_logs() as logs:
+        response = _import(client, actor, shared.token)
+
+    # The app's fail-closed AuditIntegrityError handler answers 500.
+    assert response.status_code == 500, response.text
+    assert response.json()["error_type"] == "audit_integrity_error"
+    refusals = [log["message"] for log in logs if log["event"] == "http_audit_integrity_error"]
+    assert len(refusals) == 1
+    assert refusals[0].startswith("share manifest sink path for output 'main'")
+    assert created_sessions == []
+    assert _stored_session_ids(client, _CHRIS) == stored_before
 
 
 def test_import_one_file_bound_twice_creates_one_blob(client: SyncASGITestClient, actor: _Actor) -> None:

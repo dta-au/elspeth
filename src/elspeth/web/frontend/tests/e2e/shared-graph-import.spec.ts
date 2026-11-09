@@ -10,7 +10,9 @@
 // /#/shared/<token>, clicks "Import a copy into my workspace", and must land at
 // #/<new session id> with the import notice. The recipient's new session state
 // is then read through the API: both attachments must name blobs of the
-// recipient's session, never the sharer's.
+// recipient's session, never the sharer's, and the sink (seeded with a path
+// under the sharer's session outputs folder) must write under the
+// recipient's session outputs folder instead.
 //
 // No LLM call: the graph has no LLM node, so validation and the completion
 // gate pass with the composer provider unavailable (the E2E deployment).
@@ -45,6 +47,7 @@ const CUSTOMERS_FILENAME = "shared-import-customers.csv";
 const CUSTOMERS_CONTENT = "id,name\n1,Ada\n2,Grace\n";
 const REGIONS_FILENAME = "shared-import-regions.csv";
 const REGIONS_CONTENT = "id,region\n1,North\n2,South\n";
+const RESULTS_FILENAME = "results.jsonl";
 
 interface FullBlobMetadata extends BlobMetadata {
   session_id: string;
@@ -64,14 +67,25 @@ interface StateComponentOptions {
 interface SessionStateResponse {
   sources: Record<string, StateComponentOptions>;
   nodes: (StateComponentOptions & { id: string; plugin: string })[];
+  outputs: (StateComponentOptions & { name: string })[];
 }
 
-function uploadedBlobPath(sessionId: string, blob: BlobMetadata): string {
+function e2eDataDir(): string {
   const dataDir = process.env.PLAYWRIGHT_E2E_DATA_DIR;
   if (!dataDir) {
     throw new Error("PLAYWRIGHT_E2E_DATA_DIR is required for seeded blob-backed state");
   }
-  return join(dataDir, "blobs", sessionId, `${blob.id}_${blob.filename}`);
+  return dataDir;
+}
+
+function uploadedBlobPath(sessionId: string, blob: BlobMetadata): string {
+  return join(e2eDataDir(), "blobs", sessionId, `${blob.id}_${blob.filename}`);
+}
+
+// The sink writes below the sharer's own session outputs folder; the import
+// must re-author it below the recipient's.
+function sessionOutputPath(sessionId: string, filename: string): string {
+  return join(e2eDataDir(), "outputs", sessionId, filename);
 }
 
 function sharedGraph(
@@ -134,7 +148,7 @@ function sharedGraph(
         name: "results",
         plugin: "json",
         options: {
-          path: "outputs/results.jsonl",
+          path: sessionOutputPath(sessionId, RESULTS_FILENAME),
           format: "jsonl",
           schema: { mode: "observed" },
         },
@@ -289,6 +303,15 @@ test.describe("shared graph import", () => {
       expect(sharerBlobIds.has(marker.blob_ref)).toBe(false);
       expect(JSON.stringify(state)).not.toContain(customers.id);
       expect(JSON.stringify(state)).not.toContain(regions.id);
+
+      // ── The sink writes below the recipient's own session ───────────────
+      const results = state.outputs.find((output) => output.name === "results");
+      const resultsPath = results?.options.path;
+      expect(typeof resultsPath, "the recipient's sink has a path").toBe("string");
+      expect(resultsPath as string).toContain(`/outputs/${recipientSessionId}/`);
+      expect((resultsPath as string).endsWith(`/${RESULTS_FILENAME}`)).toBe(true);
+      const graph = JSON.stringify({ sources: state.sources, nodes: state.nodes, outputs: state.outputs });
+      expect(graph).not.toContain(session.id);
     } finally {
       if (recipientSessionId !== undefined) {
         await deleteSession(recipientCtx, recipientSessionId);

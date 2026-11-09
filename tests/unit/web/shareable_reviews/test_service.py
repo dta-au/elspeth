@@ -67,6 +67,7 @@ from elspeth.web.sessions.models import (
 )
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.telemetry import build_sessions_telemetry, observed_value
+from elspeth.web.shareable_reviews.file_manifest import SinkPathEntry
 from elspeth.web.shareable_reviews.models import CompositionStateResponse
 from elspeth.web.shareable_reviews.service import (
     CompositionNotRunnableError,
@@ -237,6 +238,7 @@ class _FakeReadinessService:
 class _FakeSettings:
     shareable_link_lifetime_seconds: int = 30 * 24 * 3600
     compartment_id: str | None = None
+    data_dir: Path = Path("/srv/elspeth")
 
 
 @dataclass(slots=True)
@@ -2067,7 +2069,7 @@ def _track_store(payload_store: FilesystemPayloadStore, monkeypatch: pytest.Monk
 
 
 @pytest.mark.asyncio
-async def test_mark_ready_without_import_writes_nine_key_snapshot_with_empty_files(
+async def test_mark_ready_without_import_writes_ten_key_snapshot_with_empty_manifests(
     session_engine_with_row,
     payload_store,
     signer,
@@ -2106,9 +2108,13 @@ async def test_mark_ready_without_import_writes_nine_key_snapshot_with_empty_fil
         "compartment_id",
         "import_allowed",
         "files",
+        "sink_paths",
     }
     assert blob["import_allowed"] is False
     assert blob["files"] == []
+    # The state's sink path (``outputs/out.csv``) lies in the session's
+    # folders, but a view-only share records no sink paths.
+    assert blob["sink_paths"] == []
     # A view-only share never touches the uploaded files.
     assert blob_service.contexts == []
     assert not payload_store.exists(hashlib.sha256(b"id\n1\n").hexdigest())
@@ -2183,6 +2189,68 @@ async def test_mark_ready_with_import_freezes_each_referenced_file_once(
     serialized = json.dumps(blob["files"])
     assert str(blob_id) not in serialized
     assert "/srv/elspeth" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_mark_ready_with_import_records_session_relative_sink_paths(
+    session_engine_with_row,
+    payload_store,
+    signer,
+    session_record,
+    state_record,
+    session_operation_context: SessionOperationContext,
+    tmp_path: Path,
+):
+    blob_service = _FakeBlobService()
+    blob_id = blob_service.add(session_record.id, filename="customers.csv", content=b"id\n1\n")
+    sid = str(session_record.id)
+    data_dir = tmp_path / "data"
+    bound = _file_bound_state(state_record, source_blob=blob_id, node_value="plain")
+
+    def _sink(name: str, options: dict[str, Any]) -> dict[str, Any]:
+        return {"name": name, "plugin": "csv", "options": {**options, "schema": {"mode": "observed"}}, "on_write_failure": "discard"}
+
+    state = replace(
+        bound,
+        outputs=[
+            _sink("absolute", {"path": str(data_dir / "outputs" / sid / "report.csv")}),
+            _sink("blob_out", {"file": f"blobs/{sid}/out.jsonl"}),
+            _sink("dotdot", {"path": f"outputs/{sid}/../escape.csv"}),
+            _sink("elsewhere", {"path": "/srv/elsewhere/report.csv"}),
+            _sink("main", {"path": "outputs/out.csv"}),
+        ],
+    )
+    service, *_ = _build_service(
+        engine=session_engine_with_row,
+        payload_store=payload_store,
+        signer=signer,
+        session_record=session_record,
+        state_record=state,
+        validation=_ok_validation(),
+        readiness=_readiness_snapshot(session_record.id),
+        blob_service=blob_service,
+        settings=_FakeSettings(data_dir=data_dir),
+    )
+
+    response = await service.mark_ready_for_review(
+        session_id=session_record.id,
+        user_id=session_record.user_id,
+        username=_OWNER_USERNAME,
+        session_operation_context=session_operation_context,
+        allow_import=True,
+    )
+
+    blob = _stored_snapshot(payload_store, response.payload_digest)
+    assert blob["sink_paths"] == [
+        {"output": "absolute", "option": "path", "folder": "outputs", "relative_path": "report.csv"},
+        {"output": "blob_out", "option": "file", "folder": "blobs", "relative_path": "out.jsonl"},
+        {"output": "main", "option": "path", "folder": "outputs", "relative_path": "out.csv"},
+    ]
+    # The manifest never names the sharer's session or data directory.
+    assert sid not in json.dumps(blob["sink_paths"])
+    assert str(data_dir) not in json.dumps(blob["sink_paths"])
+    parsed = await service.load_snapshot(token=response.token)
+    assert [entry.output for entry in parsed[1].sink_paths] == ["absolute", "blob_out", "main"]
 
 
 @pytest.mark.asyncio
@@ -2675,6 +2743,81 @@ def test_parse_blob_rejects_half_upgraded_snapshot(missing_key: str) -> None:
         ShareableReviewService._parse_blob(canonical_json(blob).encode())
 
 
+_SINK_PATH = {"output": "main", "option": "path", "folder": "outputs", "relative_path": "report.csv"}
+
+
+def _v3_blob(**overrides: object) -> dict[str, Any]:
+    blob = _v2_blob(sink_paths=[_SINK_PATH, {**_SINK_PATH, "output": "zeta", "folder": "blobs", "relative_path": "x/out.jsonl"}])
+    blob.update(overrides)
+    return blob
+
+
+def test_parse_blob_reads_nine_key_import_snapshot_with_no_sink_paths() -> None:
+    parsed = ShareableReviewService._parse_blob(canonical_json(_v2_blob()).encode())
+
+    assert parsed.import_allowed is True
+    assert parsed.sink_paths == ()
+
+
+def test_parse_blob_reads_ten_key_snapshot_sink_paths() -> None:
+    parsed = ShareableReviewService._parse_blob(canonical_json(_v3_blob()).encode())
+
+    assert parsed.import_allowed is True
+    assert parsed.sink_paths == (
+        SinkPathEntry("main", "path", "outputs", "report.csv"),
+        SinkPathEntry("zeta", "path", "blobs", "x/out.jsonl"),
+    )
+
+
+def test_parse_blob_reads_ten_key_view_only_snapshot_with_empty_manifests() -> None:
+    parsed = ShareableReviewService._parse_blob(canonical_json(_v3_blob(import_allowed=False, files=[], sink_paths=[])).encode())
+
+    assert parsed.import_allowed is False
+    assert parsed.files == ()
+    assert parsed.sink_paths == ()
+
+
+@pytest.mark.parametrize(
+    "blob",
+    [
+        pytest.param({k: v for k, v in _v3_blob().items() if k != "files"}, id="ten-minus-files"),
+        pytest.param({k: v for k, v in _v3_blob().items() if k != "import_allowed"}, id="ten-minus-import-flag"),
+        pytest.param({k: v for k, v in _v3_blob().items() if k not in ("files", "import_allowed")}, id="eight-with-sink-paths"),
+        pytest.param({**_v3_blob(), "extra": 1}, id="eleven-keys"),
+    ],
+)
+def test_parse_blob_rejects_any_other_key_set(blob: dict[str, Any]) -> None:
+    with pytest.raises(InvalidToken, match="unsupported share snapshot shape"):
+        ShareableReviewService._parse_blob(canonical_json(blob).encode())
+
+
+@pytest.mark.parametrize(
+    "sink_paths",
+    [
+        pytest.param({}, id="not-list"),
+        pytest.param(None, id="null"),
+        pytest.param(["x"], id="entry-not-object"),
+        pytest.param([{**_SINK_PATH, "extra": 1}], id="entry-extra-key"),
+        pytest.param([{k: v for k, v in _SINK_PATH.items() if k != "folder"}], id="entry-missing-key"),
+        pytest.param([{**_SINK_PATH, "option": "url"}], id="option-unknown"),
+        pytest.param([{**_SINK_PATH, "folder": "payloads"}], id="folder-unknown"),
+        pytest.param([{**_SINK_PATH, "relative_path": "../x"}], id="relative-dotdot"),
+        pytest.param([{**_SINK_PATH, "relative_path": "/etc/passwd"}], id="relative-absolute"),
+        pytest.param([{**_SINK_PATH, "relative_path": ""}], id="relative-empty"),
+        pytest.param([{**_SINK_PATH, "output": "zeta"}, _SINK_PATH], id="unsorted"),
+        pytest.param([_SINK_PATH, {**_SINK_PATH, "relative_path": "other.csv"}], id="duplicate-output-option"),
+    ],
+)
+def test_parse_blob_rejects_malformed_sink_paths(sink_paths: object) -> None:
+    with pytest.raises(InvalidToken, match="sink path"):
+        ShareableReviewService._parse_blob(canonical_json(_v3_blob(sink_paths=sink_paths)).encode())
+
+
+def test_parse_blob_rejects_view_only_snapshot_with_sink_paths() -> None:
+    with pytest.raises(InvalidToken, match="sink path"):
+        ShareableReviewService._parse_blob(canonical_json(_v3_blob(import_allowed=False, files=[])).encode())
+
+
 @pytest.mark.asyncio
 async def test_load_snapshot_returns_verified_payload_and_frozen_manifest(
     session_engine_with_row,
@@ -2917,6 +3060,7 @@ async def test_resolve_token_legacy_snapshot_is_view_only_with_no_files(
     blob = _stored_snapshot(payload_store, marked.payload_digest)
     del blob["import_allowed"]
     del blob["files"]
+    del blob["sink_paths"]
     assert len(blob) == 7
     legacy_hex = payload_store.store(canonical_json(blob).encode())
     now = datetime.now(UTC)

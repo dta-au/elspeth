@@ -635,7 +635,8 @@ PUBLIC_EXPORT_REDACTED_NODE_MARKER_PREFIX = "# redacted-node: "
 PUBLIC_EXPORT_REDACTED_OUTPUT_MARKER_PREFIX = "# redacted-output: "
 PUBLIC_EXPORT_REBIND_GUIDANCE = (
     "Re-bind each redacted source on import by uploading its data to the target session and passing "
-    'source_blob_ids={"<source name>": "<session blob id>"}; sink paths are re-authored on import.'
+    'source_blob_ids={"<source name>": "<session blob id>"}; sink paths are not exported: set each one after import, '
+    'or pass sink_path_bindings={"<sink name>": {"path": {"folder": "outputs", "relative_path": "<file>"}}}.'
 )
 PUBLIC_EXPORT_NODE_REBIND_GUIDANCE = (
     "Each redacted node lost an uploaded file it read; upload that file to the target session and "

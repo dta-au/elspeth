@@ -17,9 +17,12 @@ exists archives it. Order:
    lease; the blob service enforces the session and identity quotas. Each
    copy's content hash must equal the manifest's sha256.
 4. Seed the graph from the snapshot's public YAML through the ordinary YAML
-   importer, re-binding every manifest binding to the recipient's copies and
-   recording ``shared_import`` provenance in the seeded state's
-   ``composer_meta``.
+   importer, re-binding every manifest binding to the recipient's copies,
+   re-authoring each recorded sink path under the recipient's own session
+   folder, and recording ``shared_import`` provenance in the seeded state's
+   ``composer_meta``. The recorded sink paths are checked in step 1: one that
+   could leave the recipient's folder is an integrity error and no session is
+   created.
 
 The server authors no pipeline structure: the graph is the sharer's own,
 regenerated from the content-addressed snapshot, and the seeder runs every
@@ -30,7 +33,7 @@ Layer: L3 (application).
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import cast
 
@@ -54,15 +57,17 @@ from elspeth.web.composer.state import CompositionState
 from elspeth.web.composer.yaml_generator import generate_public_yaml
 from elspeth.web.config import WebSettings
 from elspeth.web.coordination.lifecycle import SessionOperationLease
+from elspeth.web.paths import normalise_session_relative_path
 from elspeth.web.sessions.protocol import SessionRecord, SessionServiceProtocol
 from elspeth.web.sessions.routes.composer.state import (
     ImportStateYamlRequest,
     InlineBlobBindingRequest,
     SharedImportFile,
+    SinkPathBindingRequest,
     SourceBlobRowsBindingRequest,
 )
 from elspeth.web.sessions.routes.workflow.library import LibraryStateSeeder
-from elspeth.web.shareable_reviews.file_manifest import file_binding_from_json
+from elspeth.web.shareable_reviews.file_manifest import SinkPathEntry, file_binding_from_json
 from elspeth.web.shareable_reviews.models import SharedImportResponse
 from elspeth.web.shareable_reviews.service import ShareableReviewService, ShareFileEntry
 
@@ -91,11 +96,12 @@ class _InlineSite:
 
 @dataclass(frozen=True, slots=True)
 class _BindingPlan:
-    """Every manifest binding site, pointing at the sha256 of its file."""
+    """Every manifest binding site, pointing at the sha256 of its file, plus the sink paths."""
 
     source_blob_ref: dict[str, str]
     source_blob_rows: dict[str, list[str]]
     inline_content: dict[str, _InlineSite]
+    sink_paths: Mapping[str, Mapping[str, SinkPathBindingRequest]]
 
     def import_request(self, *, public_yaml: str, blob_ids: dict[str, str]) -> ImportStateYamlRequest:
         """The seeder request that re-binds every site to the recipient's copy."""
@@ -112,10 +118,36 @@ class _BindingPlan:
                 for field_path, site in self.inline_content.items()
             }
             or None,
+            sink_path_bindings={output: dict(options) for output, options in self.sink_paths.items()} or None,
         )
 
 
-def _plan_bindings(entries: Sequence[ShareFileEntry]) -> _BindingPlan:
+def _plan_sink_paths(entries: Sequence[SinkPathEntry]) -> dict[str, dict[str, SinkPathBindingRequest]]:
+    """Map each recorded sink path to the seeder's ``sink_path_bindings`` shape.
+
+    The manifest is server-written, but the importer does not trust it to
+    stay inside the recipient's folder: a relative path that is not already
+    normalised (empty, absolute, ``..``, a backslash) or an option bound
+    twice is an integrity anomaly, raised before any session exists.
+    """
+    bindings: dict[str, dict[str, SinkPathBindingRequest]] = {}
+    for entry in entries:
+        try:
+            normalised = normalise_session_relative_path(entry.relative_path)
+        except ValueError as exc:
+            raise AuditIntegrityError(f"share manifest sink path for output {entry.output!r} is invalid: {exc}") from exc
+        if normalised != entry.relative_path:
+            raise AuditIntegrityError(f"share manifest sink path for output {entry.output!r} is not normalised")
+        if entry.output not in bindings:
+            bindings[entry.output] = {}
+        options = bindings[entry.output]
+        if entry.option in options:
+            raise AuditIntegrityError(f"share manifest sink path binds output {entry.output!r} option {entry.option!r} twice")
+        options[entry.option] = SinkPathBindingRequest(folder=entry.folder, relative_path=entry.relative_path)
+    return bindings
+
+
+def _plan_bindings(entries: Sequence[ShareFileEntry], sink_paths: Sequence[SinkPathEntry]) -> _BindingPlan:
     """Map every binding site in the manifest to the sha256 of its file.
 
     The manifest is Tier-1 (our own digest-verified snapshot, already parsed
@@ -149,7 +181,12 @@ def _plan_bindings(entries: Sequence[ShareFileEntry]) -> _BindingPlan:
         if sorted(by_index) != list(range(len(by_index))):
             raise AuditIntegrityError(f"share manifest rows for source {source_name!r} are not numbered 0..n-1")
         source_blob_rows[source_name] = [by_index[index] for index in range(len(by_index))]
-    return _BindingPlan(source_blob_ref=source_blob_ref, source_blob_rows=source_blob_rows, inline_content=inline_content)
+    return _BindingPlan(
+        source_blob_ref=source_blob_ref,
+        source_blob_rows=source_blob_rows,
+        inline_content=inline_content,
+        sink_paths=_plan_sink_paths(sink_paths),
+    )
 
 
 async def _copy_files(
@@ -229,6 +266,8 @@ async def import_shared_snapshot(*, token: str, request: Request, user: UserIden
         ImportNotAllowedError: the link is view-only.
         PayloadNotFoundError: the snapshot or a frozen file is gone.
         IntegrityError: a frozen file's bytes no longer match its sha256.
+        AuditIntegrityError: the snapshot's file or sink path manifest is
+            inconsistent (raised before any session exists).
         HTTPException: 503 when seeding is unwired, the quota refusals of
             the upload route, and every refusal the YAML seeder raises.
 
@@ -244,7 +283,7 @@ async def import_shared_snapshot(*, token: str, request: Request, user: UserIden
     copies = [
         _FrozenCopy(entry=entry, content=await run_sync_in_worker(payload_store.retrieve, entry["sha256"])) for entry in snapshot.files
     ]
-    plan = _plan_bindings(snapshot.files)
+    plan = _plan_bindings(snapshot.files, snapshot.sink_paths)
     composition = CompositionState.from_dict(snapshot.blob["composition_snapshot"])
     public_yaml = generate_public_yaml(composition)
     # Validate the request shape that does not depend on the new blob ids

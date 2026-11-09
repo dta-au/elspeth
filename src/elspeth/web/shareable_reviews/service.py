@@ -35,10 +35,17 @@ a snapshot that names them). If the snapshot write fails after the audit
 insert, the audit row stands as honest evidence of the attempt; no token is
 returned.
 
-Snapshot shapes: this release writes nine keys (the seven ``_BlobShape``
-keys plus ``import_allowed`` and ``files``). The reader also accepts the previous
-release's exact seven-key shape and treats it as view-only. Those are the
-only two shapes; any other key set is refused.
+Snapshot shapes: this release writes ten keys (the seven ``_BlobShape``
+keys plus ``import_allowed``, ``files`` and ``sink_paths``). The reader also
+accepts the nine-key shape written earlier in this release (read with no sink
+paths) and the previous release's exact seven-key shape (read as view-only).
+Those are the only three shapes; any other key set is refused.
+
+Sink paths: when import is allowed, each sink path option that lies inside the
+sharer's own session folders (``outputs/<session_id>/`` or
+``blobs/<session_id>/``) is recorded in the private ``sink_paths`` manifest as
+a folder kind plus a path relative to that folder, so the import can re-author
+it under the recipient's session. Paths anywhere else are not recorded.
 
 Frozen-at-mark-time discipline (load-bearing):
 
@@ -111,9 +118,14 @@ from elspeth.web.sessions.protocol import SessionOperationAuthority
 from elspeth.web.shareable_reviews.file_manifest import (
     FileBinding,
     ShareManifestError,
+    SinkPathEntry,
+    SinkPathJson,
     collect_file_bindings,
+    collect_sink_paths,
     file_binding_from_json,
     file_binding_to_json,
+    sink_path_entry_from_json,
+    sink_path_entry_to_json,
 )
 from elspeth.web.shareable_reviews.models import (
     CompositionStateResponse,
@@ -273,6 +285,7 @@ class _SnapshotShape(_BlobShape):
 
     import_allowed: bool
     files: list[ShareFileEntry]  # sorted by sha256; [] when not importable
+    sink_paths: list[SinkPathJson]  # sorted by (output, option); [] when not importable
 
 
 # Closed-set guards. The digest only proves bytes-on-disk integrity; it does
@@ -280,10 +293,11 @@ class _SnapshotShape(_BlobShape):
 # bytes round-trip cleanly through the digest). The producer guard in
 # ``_build_snapshot`` catches that class of drift at the producer so the bug
 # surfaces in the owner's request instead of several frames away in the
-# reviewer's Pydantic construction. The reader accepts exactly these two
-# closed sets — the previous release's seven keys (read as view-only) and
-# the current nine — and nothing in between. Update the TypedDicts and these
-# sets together.
+# reviewer's Pydantic construction. The reader accepts exactly these three
+# closed sets — the previous release's seven keys (read as view-only), the
+# nine keys written earlier in this release before sink paths were recorded
+# (read with no sink paths), and the current ten — and nothing in between.
+# Update the TypedDicts and these sets together.
 _LEGACY_BLOB_KEYS: Final[frozenset[str]] = frozenset(
     {
         "pipeline_metadata",
@@ -295,7 +309,8 @@ _LEGACY_BLOB_KEYS: Final[frozenset[str]] = frozenset(
         "compartment_id",
     }
 )
-_BLOB_KEYS: Final[frozenset[str]] = _LEGACY_BLOB_KEYS | {"import_allowed", "files"}
+_IMPORT_BLOB_KEYS: Final[frozenset[str]] = _LEGACY_BLOB_KEYS | {"import_allowed", "files"}
+_BLOB_KEYS: Final[frozenset[str]] = _IMPORT_BLOB_KEYS | {"sink_paths"}
 _FILE_ENTRY_KEYS: Final[frozenset[str]] = frozenset({"sha256", "size_bytes", "filename", "mime_type", "bindings"})
 _SHA256_HEX: Final = re.compile(r"[0-9a-f]{64}")
 
@@ -305,12 +320,15 @@ class ParsedSnapshot:
     """A verified share snapshot, as the resolve and import paths read it.
 
     ``blob`` carries the seven keys every readable snapshot has. A legacy
-    seven-key snapshot reads as ``import_allowed=False`` with no files.
+    seven-key snapshot reads as ``import_allowed=False`` with no files; a
+    nine-key snapshot reads with no sink paths. ``sink_paths`` is private to
+    the import path: no recipient-facing response carries it.
     """
 
     blob: _BlobShape
     import_allowed: bool
     files: tuple[ShareFileEntry, ...]
+    sink_paths: tuple[SinkPathEntry, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -458,6 +476,28 @@ def _parse_file_manifest(value: object) -> tuple[ShareFileEntry, ...]:
     return tuple(entries)
 
 
+def _parse_sink_path_manifest(value: object) -> tuple[SinkPathEntry, ...]:
+    """Validate a snapshot's ``sink_paths`` manifest; raise ``InvalidToken`` on any drift.
+
+    Tier-1 data, like the file manifest: every entry must round-trip
+    ``sink_path_entry_from_json`` (exact keys, known option and folder, a
+    normalised relative path), and entries are strictly sorted by
+    (output, option), which also forbids duplicates.
+    """
+    if type(value) is not list:
+        raise InvalidToken("share snapshot sink path manifest is invalid")
+    entries: list[SinkPathEntry] = []
+    for raw in value:
+        try:
+            entry = sink_path_entry_from_json(raw)
+        except ValueError as exc:
+            raise InvalidToken("share snapshot sink path entry is invalid") from exc
+        if entries and (entry.output, entry.option) <= (entries[-1].output, entries[-1].option):
+            raise InvalidToken("share snapshot sink paths are not uniquely sorted by output and option")
+        entries.append(entry)
+    return tuple(entries)
+
+
 def _build_snapshot(
     *,
     session_id: UUID,
@@ -468,15 +508,16 @@ def _build_snapshot(
     compartment_id: str | None,
     import_allowed: bool,
     files: list[ShareFileEntry],
+    sink_paths: tuple[SinkPathEntry, ...],
 ) -> _Snapshot:
     """Build the canonical-JSON snapshot blob and compute its content-address.
 
     The blob shape is the one the resolve and import paths read back —
     pipeline_metadata, composition_snapshot, yaml, audit_readiness,
-    created_by_user_id, created_by_username, compartment_id, import_allowed
-    and the private ``files`` manifest. This is the contractual shape for
-    the share artifact; ``payload_digest`` binds the import decision and the
-    manifest along with everything else.
+    created_by_user_id, created_by_username, compartment_id, import_allowed,
+    the private ``files`` manifest and the private ``sink_paths`` manifest.
+    This is the contractual shape for the share artifact; ``payload_digest``
+    binds the import decision and both manifests along with everything else.
 
     Both attribution fields are frozen into the blob: the identity id
     because the token signature binds it, and the username because it is
@@ -515,8 +556,8 @@ def _build_snapshot(
     audit_readiness_dict["checked_at"] = state_record.created_at.isoformat()
     if compartment_id is not None and not is_compartment_id(compartment_id):
         raise ValueError("shareable-review compartment_id does not match the configured shape")
-    if not import_allowed and files:
-        raise ValueError("a view-only share snapshot must not carry a file manifest")
+    if not import_allowed and (files or sink_paths):
+        raise ValueError("a view-only share snapshot must not carry a file or sink path manifest")
     blob: _SnapshotShape = {
         "pipeline_metadata": pipeline_metadata,
         "composition_snapshot": composition_dict,
@@ -527,6 +568,7 @@ def _build_snapshot(
         "compartment_id": compartment_id,
         "import_allowed": import_allowed,
         "files": sorted(files, key=lambda entry: entry["sha256"]),
+        "sink_paths": [sink_path_entry_to_json(entry) for entry in sorted(sink_paths, key=lambda entry: (entry.output, entry.option))],
     }
     # Producer-side drift guard. ``_SnapshotShape: TypedDict`` is a static
     # type — Python does not enforce it at runtime. Without this assert,
@@ -725,6 +767,12 @@ class ShareableReviewService:
             if allow_import
             else ()
         )
+        # Sink paths inside this session's folders travel as session-relative
+        # references, so the import can re-author them under the recipient's
+        # session. A view-only share records none.
+        sink_paths = (
+            collect_sink_paths(composition_state, data_dir=self._settings.data_dir, session_id=str(session_id)) if allow_import else ()
+        )
 
         snapshot = _build_snapshot(
             session_id=session_id,
@@ -735,6 +783,7 @@ class ShareableReviewService:
             compartment_id=self._settings.compartment_id,
             import_allowed=allow_import,
             files=[frozen.entry for frozen in frozen_files],
+            sink_paths=sink_paths,
         )
 
         # Stamp expiry now so the same value lands in both the audit row
@@ -1115,10 +1164,12 @@ class ShareableReviewService:
 
         Tier-1 input: the blob came out of OUR payload store, integrity
         verified by digest. Any decode failure here is a corruption event.
-        Exactly two closed key sets are read: the current nine-key shape,
-        and the previous release's seven-key shape, which predates the
-        import opt-in and so reads as view-only with no files. Any other key
-        set — including a partial or half-upgraded shape — is refused.
+        Exactly three closed key sets are read: the current ten-key shape;
+        the nine-key shape written earlier in this release, which predates
+        sink-path recording and so reads with no sink paths; and the
+        previous release's seven-key shape, which predates the import opt-in
+        and so reads as view-only with no files. Any other key set —
+        including a partial or half-upgraded shape — is refused.
         """
         try:
             parsed = json.loads(blob_bytes.decode("utf-8"))
@@ -1127,16 +1178,21 @@ class ShareableReviewService:
         if type(parsed) is not dict:
             raise InvalidToken("unsupported share snapshot shape")
         keys = frozenset(parsed)
+        sink_paths: tuple[SinkPathEntry, ...] = ()
         if keys == _LEGACY_BLOB_KEYS:
             import_allowed = False
             files: tuple[ShareFileEntry, ...] = ()
-        elif keys == _BLOB_KEYS:
+        elif keys in (_IMPORT_BLOB_KEYS, _BLOB_KEYS):
             import_allowed = parsed["import_allowed"]
             if type(import_allowed) is not bool:
                 raise InvalidToken("share snapshot import flag is invalid")
             files = _parse_file_manifest(parsed["files"])
             if not import_allowed and files:
                 raise InvalidToken("view-only share snapshot carries a file manifest")
+            if keys == _BLOB_KEYS:
+                sink_paths = _parse_sink_path_manifest(parsed["sink_paths"])
+                if not import_allowed and sink_paths:
+                    raise InvalidToken("view-only share snapshot carries a sink path manifest")
         else:
             raise InvalidToken("unsupported share snapshot shape")
         if type(parsed["created_by_username"]) is not str or not parsed["created_by_username"].strip():
@@ -1145,4 +1201,4 @@ class ShareableReviewService:
         if compartment_id is not None and not is_compartment_id(compartment_id):
             raise InvalidToken("share snapshot compartment is invalid")
         blob = cast(_BlobShape, {key: parsed[key] for key in _LEGACY_BLOB_KEYS})
-        return ParsedSnapshot(blob=blob, import_allowed=import_allowed, files=files)
+        return ParsedSnapshot(blob=blob, import_allowed=import_allowed, files=files, sink_paths=sink_paths)

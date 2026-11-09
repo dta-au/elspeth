@@ -64,6 +64,7 @@ _FREE_TEXT_DISPOSITIONS = {
     "src/elspeth/web/secrets/schemas.py:CreateSecretRequest.value": "managed_secret_channel",
     "src/elspeth/web/sessions/routes/composer/state.py:ImportStateYamlRequest.yaml": "parsed_state_guard",
     "src/elspeth/web/sessions/routes/composer/state.py:InlineBlobBindingRequest.blob_id": "structural_identifier",
+    "src/elspeth/web/sessions/routes/composer/state.py:SinkPathBindingRequest.relative_path": "field_guard",
     "src/elspeth/web/sessions/routes/workflow/approvals.py:ApprovalDecisionBody.note": "field_guard",
     "src/elspeth/web/sessions/routes/workflow/approvals.py:ApprovalRequestBody.approver_identity_id": "structural_identifier",
     "src/elspeth/web/sessions/routes/workflow/approvals.py:ApprovalRequestBody.note": "field_guard",

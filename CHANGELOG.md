@@ -131,10 +131,16 @@ establish qualification, a published tag or an image.
   ‹name›", with its own copy of each file and every attachment pointing at the
   copy, and records the share's digest and sharer as `shared_import`
   provenance in the new state. Links minted before this release, and links
-  without the opt-in, stay view-only (403 on import). Secrets never travel,
-  and output file locations do not travel either: the copy must have its sink
-  paths set before it validates. A graph using a plugin the recipient's policy
-  disallows is refused with 422 and the new session is archived.
+  without the opt-in, stay view-only (403 on import). Secrets never travel.
+  A sink output path (`path`, `file` or `persist_directory`) inside the
+  sharer's own session `outputs/` or `blobs/` folder is re-based to the same
+  place under the recipient's new session, so the copy validates without
+  setting it; a sink path outside the sharer's session folders does not travel
+  and must be set in the copy. Sinks that do not write a local file are
+  unaffected. The ordinary YAML import accepts the same re-basing as
+  `sink_path_bindings`, which can only name a path inside the caller's own
+  session folders. A graph using a plugin the recipient's policy disallows is
+  refused with 422 and the new session is archived.
 - **Files written by the assistant cannot be shared for import.** If the graph
   is attached to a file the assistant created rather than one the user
   uploaded, creating an import link is refused with 409 naming the file, and

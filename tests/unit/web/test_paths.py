@@ -9,8 +9,11 @@ import pytest
 from elspeth.web.paths import (
     allowed_sink_directories,
     allowed_source_directories,
+    locate_in_session_folder,
+    normalise_session_relative_path,
     resolve_data_path,
     resolve_sink_data_path,
+    session_folder_path,
 )
 
 
@@ -187,3 +190,77 @@ class TestResolutionNeverAdoptsAnEscapingPath:
 
         assert not any(resolved.is_relative_to(directory) for directory in allowed)
         assert allowed == ()
+
+
+class TestSessionFolderRelativePaths:
+    """Locate a resolved path inside a session's folders and rebuild it in another session."""
+
+    @pytest.mark.parametrize(
+        ("resolved", "expected"),
+        [
+            ("/tmp/data/outputs/sess-a/report.csv", ("outputs", Path("report.csv"))),
+            ("/tmp/data/outputs/sess-a/nested/deep/out.jsonl", ("outputs", Path("nested/deep/out.jsonl"))),
+            ("/tmp/data/blobs/sess-a/out.jsonl", ("blobs", Path("out.jsonl"))),
+            ("/tmp/data/outputs/sess-a", ("outputs", Path("."))),
+        ],
+    )
+    def test_locates_a_path_inside_the_session_folders(self, resolved: str, expected: tuple[str, Path]) -> None:
+        assert locate_in_session_folder(Path(resolved), "/tmp/data", session_id="sess-a") == expected
+
+    @pytest.mark.parametrize(
+        "resolved",
+        [
+            "/tmp/data/outputs/sess-b/report.csv",
+            "/tmp/data/outputs/report.csv",
+            "/tmp/data/blobs/report.csv",
+            "/tmp/data/other/sess-a/report.csv",
+            "/etc/passwd",
+        ],
+    )
+    def test_a_path_outside_the_session_folders_is_not_located(self, resolved: str) -> None:
+        assert locate_in_session_folder(Path(resolved), "/tmp/data", session_id="sess-a") is None
+
+    def test_session_folder_path_builds_under_the_named_session(self) -> None:
+        assert session_folder_path("/tmp/data", "blobs", session_id="sess-b", relative_path="nested/out.jsonl") == Path(
+            "/tmp/data/blobs/sess-b/nested/out.jsonl"
+        )
+
+    @pytest.mark.parametrize("session_id", ["", ".", "..", "a/b", "a\\b"])
+    def test_malformed_session_id_is_refused(self, session_id: str) -> None:
+        with pytest.raises(ValueError, match="malformed session_id"):
+            locate_in_session_folder(Path("/tmp/data/outputs/x"), "/tmp/data", session_id=session_id)
+        with pytest.raises(ValueError, match="malformed session_id"):
+            session_folder_path("/tmp/data", "outputs", session_id=session_id, relative_path="x")
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            ("report.csv", "report.csv"),
+            ("nested/deep/out.jsonl", "nested/deep/out.jsonl"),
+            ("nested/./out.jsonl", "nested/out.jsonl"),
+            ("nested//out.jsonl", "nested/out.jsonl"),
+            ("./report.csv", "report.csv"),
+        ],
+    )
+    def test_normalise_accepts_and_normalises_a_relative_path(self, value: str, expected: str) -> None:
+        assert normalise_session_relative_path(value) == expected
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "",
+            ".",
+            "./",
+            "/etc/passwd",
+            "//server/share",
+            "../x",
+            "nested/../../x",
+            "nested/../x",
+            "..\\x",
+            "nested\\out.csv",
+            "bad\x00name",
+        ],
+    )
+    def test_normalise_refuses_empty_absolute_dotdot_and_backslash(self, value: str) -> None:
+        with pytest.raises(ValueError):
+            normalise_session_relative_path(value)

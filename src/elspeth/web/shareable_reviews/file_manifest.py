@@ -15,13 +15,18 @@ where":
 The collector is pure: it reads a ``CompositionState`` and returns one
 ``BoundBlob`` per binding site. The same blob bound in two places yields two
 bindings, because each site is rebound independently on import.
+
+Beside it, ``collect_sink_paths`` records each sink output path that lies in
+the sharer's own session folders, so the import can re-author it under the
+recipient's session.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Final, Literal, cast, get_args
+from pathlib import Path
+from typing import Final, Literal, TypedDict, cast, get_args
 from uuid import UUID
 
 from elspeth.contracts.blobs_inline import (
@@ -33,15 +38,29 @@ from elspeth.contracts.blobs_inline import (
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, SourceSpec
+from elspeth.web.paths import (
+    SESSION_FOLDERS,
+    SINK_LOCAL_PATH_OPTION_KEYS,
+    SessionFolder,
+    locate_in_session_folder,
+    normalise_session_relative_path,
+    resolve_sink_data_path,
+)
 
 __all__ = [
     "BindingKind",
     "BoundBlob",
     "FileBinding",
     "ShareManifestError",
+    "SinkPathEntry",
+    "SinkPathJson",
+    "SinkPathOption",
     "collect_file_bindings",
+    "collect_sink_paths",
     "file_binding_from_json",
     "file_binding_to_json",
+    "sink_path_entry_from_json",
+    "sink_path_entry_to_json",
 ]
 
 BindingKind = Literal["source_blob_ref", "source_blob_rows", "inline_content"]
@@ -233,3 +252,108 @@ def file_binding_from_json(value: object) -> FileBinding:
         field_path,
         cast("ContentEncoding | None", encoding),
     )
+
+
+# ── Sink output paths ───────────────────────────────────────────────────
+#
+# A sink holds no blob: only a path string, usually under the owner's
+# ``data_dir/outputs/<session_id>/`` or ``data_dir/blobs/<session_id>/``
+# folder (the file is written when the pipeline runs). The public projection
+# strips those keys, so the share records each one that lies inside the
+# sharer's own session folders as a session-relative reference, and the
+# import re-authors it under the recipient's session.
+
+SinkPathOption = Literal["path", "file", "persist_directory"]
+_SINK_PATH_OPTIONS: Final = frozenset(get_args(SinkPathOption))
+_SESSION_FOLDERS: Final = frozenset(SESSION_FOLDERS)
+_SINK_PATH_JSON_KEYS: Final = frozenset({"output", "option", "folder", "relative_path"})
+
+
+@dataclass(frozen=True, slots=True)
+class SinkPathEntry:
+    """One sink path option, as a path below one of its session's folders."""
+
+    output: str
+    option: SinkPathOption
+    folder: SessionFolder
+    relative_path: str  # normalised POSIX path (normalise_session_relative_path)
+
+
+def collect_sink_paths(state: CompositionState, *, data_dir: str | Path, session_id: str) -> tuple[SinkPathEntry, ...]:
+    """Return every top-level sink path option that lies inside ``session_id``'s folders.
+
+    Each value is resolved as sink validation resolves it
+    (``resolve_sink_data_path``: the stable ``outputs/<file>`` authoring form
+    is scoped to the session). A value that is not a string, resolves
+    anywhere else, or names a session folder itself is not recorded: it
+    cannot be re-authored under another session. Sorted by (output, option).
+    """
+    data_dir_text = str(data_dir)
+    found: list[SinkPathEntry] = []
+    for output in state.outputs:
+        for option in SINK_LOCAL_PATH_OPTION_KEYS:
+            if option not in output.options:
+                continue
+            value = output.options[option]
+            if type(value) is not str or "\x00" in value:
+                continue
+            located = locate_in_session_folder(
+                resolve_sink_data_path(value, data_dir_text, session_id=session_id),
+                data_dir_text,
+                session_id=session_id,
+            )
+            if located is None:
+                continue
+            folder, relative = located
+            try:
+                relative_path = normalise_session_relative_path(relative.as_posix())
+            except ValueError:
+                continue
+            found.append(SinkPathEntry(output.name, cast(SinkPathOption, option), folder, relative_path))
+    return tuple(sorted(found, key=lambda entry: (entry.output, entry.option)))
+
+
+class SinkPathJson(TypedDict):
+    """A ``SinkPathEntry`` as the snapshot's ``sink_paths`` manifest stores it."""
+
+    output: str
+    option: SinkPathOption
+    folder: SessionFolder
+    relative_path: str
+
+
+def sink_path_entry_to_json(entry: SinkPathEntry) -> SinkPathJson:
+    return {
+        "output": entry.output,
+        "option": entry.option,
+        "folder": entry.folder,
+        "relative_path": entry.relative_path,
+    }
+
+
+def sink_path_entry_from_json(value: object) -> SinkPathEntry:
+    """Rebuild a ``SinkPathEntry``; raises ``ValueError`` on any shape drift.
+
+    ``relative_path`` must already be in its normalised form: the producer
+    only writes normalised paths, so anything else is drift.
+    """
+    if type(value) is not dict:
+        raise ValueError("sink path entry must be a JSON object")
+    payload = cast(dict[str, object], value)
+    if set(payload) != _SINK_PATH_JSON_KEYS:
+        raise ValueError(f"sink path entry keys must be exactly {sorted(_SINK_PATH_JSON_KEYS)}")
+    output = payload["output"]
+    if type(output) is not str or not output:
+        raise ValueError("sink path entry output must be a non-empty string")
+    option = payload["option"]
+    if type(option) is not str or option not in _SINK_PATH_OPTIONS:
+        raise ValueError(f"sink path entry option must be one of {sorted(_SINK_PATH_OPTIONS)}")
+    folder = payload["folder"]
+    if type(folder) is not str or folder not in _SESSION_FOLDERS:
+        raise ValueError(f"sink path entry folder must be one of {sorted(_SESSION_FOLDERS)}")
+    relative_path = payload["relative_path"]
+    if type(relative_path) is not str:
+        raise ValueError("sink path entry relative_path must be a string")
+    if normalise_session_relative_path(relative_path) != relative_path:
+        raise ValueError("sink path entry relative_path is not in normalised form")
+    return SinkPathEntry(output, cast(SinkPathOption, option), folder, relative_path)

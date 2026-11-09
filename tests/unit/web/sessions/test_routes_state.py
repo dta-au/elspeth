@@ -4327,3 +4327,157 @@ class TestImportRebindsSharedFiles:
         assert deep_thaw(record.composer_meta["shared_import"]) == facts["shared_import"]
         assert "ingress" in record.composer_meta
         assert record.nodes[0]["options"]["tables"]["t"]["reference_content"]["blob_ref"] == str(blob.id)
+
+
+_SINK_BINDING_YAML_WITH_PATH = _REBIND_NODE_YAML.replace(
+    "    plugin: json\n    on_write_failure: discard\n",
+    "    plugin: json\n    on_write_failure: discard\n    options:\n      path: outputs/existing.json\n",
+)
+
+
+class TestImportRebasesSinkPaths:
+    """``sink_path_bindings`` re-authors a sink path under the CALLER's own session folders."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("folder", ["outputs", "blobs"])
+    async def test_binding_writes_a_path_under_the_callers_session(self, tmp_path: Path, folder: str) -> None:
+        from elspeth.contracts.freeze import deep_thaw
+        from elspeth.web.composer.tools._common import _validate_sink_path
+
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session = await service.create_session("alice", "Rebase", "local")
+
+        with patch("elspeth.web.sessions.routes.composer.state._runtime_preflight_for_state", side_effect=_rebind_preflight):
+            resp = client.post(
+                f"/api/sessions/{session.id}/state/yaml",
+                json={
+                    "yaml": _REBIND_NODE_YAML,
+                    "sink_path_bindings": {"main": {"path": {"folder": folder, "relative_path": "nested/./out.jsonl"}}},
+                },
+            )
+
+        assert resp.status_code == 200, resp.text
+        record = await service.get_current_state(session.id)
+        assert record is not None
+        options = deep_thaw(record.outputs[0]["options"])
+        assert options["path"] == str(tmp_path.resolve() / folder / str(session.id) / "nested" / "out.jsonl")
+        # The re-based path passes the composer's own sink-path guard unchanged.
+        assert _validate_sink_path(options, str(tmp_path), session_id=str(session.id)) is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("bindings", "detail_fragment"),
+        [
+            pytest.param(
+                {"missing": {"path": {"folder": "outputs", "relative_path": "x.json"}}}, "unknown output 'missing'", id="unknown-output"
+            ),
+            pytest.param({"main": {"url": {"folder": "outputs", "relative_path": "x.json"}}}, "main.url", id="unknown-option"),
+            pytest.param({"main": {"path": {"folder": "outputs", "relative_path": "../x.json"}}}, "main.path", id="dotdot"),
+            pytest.param(
+                {"main": {"path": {"folder": "outputs", "relative_path": "nested/../../x.json"}}}, "main.path", id="nested-dotdot"
+            ),
+            pytest.param({"main": {"path": {"folder": "outputs", "relative_path": "/etc/passwd"}}}, "main.path", id="absolute"),
+            pytest.param({"main": {"path": {"folder": "outputs", "relative_path": ""}}}, "main.path", id="empty"),
+            pytest.param({"main": {"path": {"folder": "outputs", "relative_path": "."}}}, "main.path", id="the-folder-itself"),
+            pytest.param({"main": {"path": {"folder": "outputs", "relative_path": "..\\..\\x.json"}}}, "main.path", id="backslash"),
+        ],
+    )
+    async def test_binding_that_is_unknown_or_escapes_is_400(self, tmp_path: Path, bindings: dict[str, Any], detail_fragment: str) -> None:
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session = await service.create_session("alice", "Rebase", "local")
+
+        resp = client.post(
+            f"/api/sessions/{session.id}/state/yaml",
+            json={"yaml": _REBIND_NODE_YAML, "sink_path_bindings": bindings},
+        )
+
+        assert resp.status_code == 400, resp.text
+        assert detail_fragment in resp.json()["detail"]
+        assert await service.get_current_state(session.id) is None
+
+    @pytest.mark.asyncio
+    async def test_binding_through_a_symlink_out_of_the_session_is_400(self, tmp_path: Path) -> None:
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session = await service.create_session("alice", "Rebase", "local")
+        outside = tmp_path / "elsewhere"
+        outside.mkdir()
+        session_outputs = tmp_path / "outputs" / str(session.id)
+        session_outputs.mkdir(parents=True)
+        (session_outputs / "link").symlink_to(outside, target_is_directory=True)
+
+        resp = client.post(
+            f"/api/sessions/{session.id}/state/yaml",
+            json={
+                "yaml": _REBIND_NODE_YAML,
+                "sink_path_bindings": {"main": {"path": {"folder": "outputs", "relative_path": "link/x.json"}}},
+            },
+        )
+
+        assert resp.status_code == 400, resp.text
+        assert "main.path" in resp.json()["detail"]
+        assert await service.get_current_state(session.id) is None
+
+    @pytest.mark.asyncio
+    async def test_binding_refuses_an_option_that_already_has_a_value(self, tmp_path: Path) -> None:
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session = await service.create_session("alice", "Rebase", "local")
+
+        resp = client.post(
+            f"/api/sessions/{session.id}/state/yaml",
+            json={
+                "yaml": _SINK_BINDING_YAML_WITH_PATH,
+                "sink_path_bindings": {"main": {"path": {"folder": "outputs", "relative_path": "x.json"}}},
+            },
+        )
+
+        assert resp.status_code == 400, resp.text
+        assert "main.path" in resp.json()["detail"]
+        assert await service.get_current_state(session.id) is None
+
+    @pytest.mark.asyncio
+    async def test_binding_refuses_credential_material_in_the_path(self, tmp_path: Path) -> None:
+        """The bound path is persisted after the YAML's own credential guard ran, so it carries its own."""
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session = await service.create_session("alice", "Rebase", "local")
+        candidate = "sk-" + "a" * 24
+
+        resp = client.post(
+            f"/api/sessions/{session.id}/state/yaml",
+            json={
+                "yaml": _REBIND_NODE_YAML,
+                "sink_path_bindings": {"main": {"path": {"folder": "outputs", "relative_path": f"{candidate}.json"}}},
+            },
+        )
+
+        assert resp.status_code == 422, resp.text
+        # This bare test app keeps FastAPI's default 422 body; the real app's
+        # RequestValidationError handler strips the echoed input.
+        assert [error["type"] for error in resp.json()["detail"]] == ["credential_material_rejected"]
+        assert await service.get_current_state(session.id) is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "binding",
+        [
+            pytest.param({"folder": "payloads", "relative_path": "x.json"}, id="unknown-folder"),
+            pytest.param({"folder": "outputs", "relative_path": "x.json", "extra": 1}, id="extra-key"),
+            pytest.param({"folder": "outputs"}, id="missing-relative-path"),
+        ],
+    )
+    async def test_binding_request_shape_is_validated(self, tmp_path: Path, binding: dict[str, Any]) -> None:
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session = await service.create_session("alice", "Rebase", "local")
+
+        resp = client.post(
+            f"/api/sessions/{session.id}/state/yaml",
+            json={"yaml": _REBIND_NODE_YAML, "sink_path_bindings": {"main": {"path": binding}}},
+        )
+
+        assert resp.status_code == 422, resp.text
+        assert await service.get_current_state(session.id) is None

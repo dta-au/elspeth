@@ -31,6 +31,7 @@ from elspeth.web.coordination.contracts import (
 )
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.credential_guard import CredentialMaterialRefused, require_no_credential_material
+from elspeth.web.paths import locate_in_session_folder, session_folder_path
 from elspeth.web.sessions.fork_custody import _free_text_embeds_parent_blob, _value_references_parent_blob
 from elspeth.web.sessions.operation_receipts import operation_receipt_response_hash
 from elspeth.web.sessions.protocol import (
@@ -346,13 +347,12 @@ def _rewrite_session_owned_sink_options(
             raise AuditIntegrityError(f"Tier 1 audit anomaly: {field_path}.{key} must be a string")
         raw = Path(value)
         resolved = raw.resolve() if raw.is_absolute() else (base / raw).resolve()
-        for namespace in ("outputs", "blobs"):
-            parent_root = base / namespace / str(parent_session_id)
-            if not resolved.is_relative_to(parent_root):
-                continue
-            rebuilt[key] = str(base / namespace / str(child_session_id) / resolved.relative_to(parent_root))
-            rewritten = True
-            break
+        located = locate_in_session_folder(resolved, base, session_id=str(parent_session_id))
+        if located is None:
+            continue
+        folder, relative = located
+        rebuilt[key] = str(session_folder_path(base, folder, session_id=str(child_session_id), relative_path=relative))
+        rewritten = True
     return rebuilt, rewritten
 
 

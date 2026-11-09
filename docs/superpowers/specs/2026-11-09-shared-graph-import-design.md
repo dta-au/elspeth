@@ -34,7 +34,7 @@ Success means:
 | Link lifespan | **Tom picks per link** (1, 7 or 30 days); the existing `shareable_link_lifetime_seconds` setting becomes the maximum. |
 | Early revocation | **Out of scope.** Tom chooses a short lifespan instead. |
 | RAG vector indexes (`persist_directory`) | **Not copied.** Chris's copy gets a fresh, empty index location and rebuilds it. |
-| Sink output locations | **Not copied.** Re-authored for Chris's session, as YAML import already does. |
+| Sink output locations | **Re-based.** A sink path inside Tom's session folders (`outputs/` or `blobs/`) is re-authored under the same folder of Chris's session; a path elsewhere does not travel and Chris sets it. See §2 step 5. |
 | Notify Tom on import | **No user-facing notification.** The import is audited on Chris's session, keyed by the share's snapshot digest. |
 | Sessions schema | **No change** (no migration pathway; an epoch bump would force a fresh store). |
 
@@ -98,7 +98,8 @@ blob ids or storage paths). The dialog gains:
    snapshot digest and expiry; the digest binds `import_allowed` and the
    manifest — see §4).
 
-The `files` manifest is private to the snapshot: the shared inspect response
+The `files` manifest (and the `sink_paths` manifest, §2 step 5) is private to
+the snapshot: the shared inspect response
 continues to expose only the public projection plus a recipient-safe file list
 (names and sizes), never blob ids or storage paths.
 
@@ -125,8 +126,10 @@ continues to expose only the public projection plus a recipient-safe file list
   1-day link is not stretched to 30 days and a lowered maximum is honoured.
 - **Compatibility:** tokens minted before this release carry no import flag and
   are treated as view-only. Existing snapshot blobs (the old 7-key shape) remain
-  readable as view-only; new snapshots use a 9-key shape adding `import_allowed`
-  and `files`.
+  readable as view-only; new snapshots use a 10-key shape adding `import_allowed`,
+  `files` and `sink_paths` (§2 step 5; `[]` for a view-only link). 9-key
+  snapshots minted earlier on this branch (before `sink_paths`) remain readable
+  with no sink paths; any other key set is refused.
 
 ### 2. Importing (Chris)
 
@@ -160,11 +163,25 @@ would need a sessions-schema change. Order of operations:
    Each inline binding rebuilds the widened marker in full (`blob_ref`, `mode`,
    `sha256`, `encoding`) through the canonical marker writer's checks, and the
    copy's hash must equal the manifest sha256.
-5. **Sink output locations do not travel.** The public projection strips them
-   and the seeder does not re-author them, so a file sink in the copy lands
-   without a `path` and the copy fails validation until Chris (or the composer)
-   sets one — the same result as importing a public YAML export. RAG
-   `persist_directory` is likewise not copied.
+5. **Re-base sink output locations under Chris's session.** The public
+   projection strips a sink's `path`, `file` and `persist_directory`. When Tom
+   creates an import link, the snapshot's private `sink_paths` manifest records
+   each of those values that lies inside Tom's own session folders —
+   `outputs/<Tom's session>/…` (including the stable `outputs/<file>` form) or
+   `blobs/<Tom's session>/…` — as the folder kind plus the path below it. The
+   seeder's new `sink_path_bindings` writes each one under the same folder of
+   Chris's new session (`<data_dir>/<folder>/<Chris's session>/<path>`, the
+   absolute form the same-user fork writes), so the copy validates without
+   Chris setting them. Tom's session id never appears in Chris's graph. A sink
+   whose path was outside Tom's session folders is not recorded and lands
+   without that option, so Chris (or the composer) sets it, as when importing a
+   public YAML export; a non-file sink's configuration is unaffected. The
+   manifest is server-written, but a recorded path that is empty, absolute or
+   contains `..` is refused as an integrity error before Chris's session is
+   created, and `sink_path_bindings` (also open to the ordinary YAML import
+   route) can only produce a path inside the caller's own session folders.
+   Links minted before this was added carry no `sink_paths`; their copies'
+   sinks still need setting.
 6. **Record provenance** in the seeded state's `composer_meta` as
    `shared_import` (see §4). Respond with the new `session_id` and `state_id`.
 7. **On any error after step 2**, archive the new session, as library fork does.
@@ -179,8 +196,8 @@ The Import button is disabled while its request is in flight.
 *references* arrive unresolved; Chris's readiness panel shows them as missing
 until he adds his own.
 
-**Graphs that do not validate for Chris** (missing secrets, sink locations to
-set) still import; the readiness panel reports the problems, as with a library
+**Graphs that do not validate for Chris** (missing secrets, sink locations
+outside Tom's session folders to set) still import; the readiness panel reports the problems, as with a library
 fork. **A graph using a plugin Chris's policy disallows is refused**: the seeder
 answers 422 and the new session is archived, as library fork does (the design
 said such graphs would still import).

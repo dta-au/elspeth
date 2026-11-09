@@ -6,7 +6,7 @@ import re
 from dataclasses import replace
 from typing import Annotated, NotRequired, TypedDict
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from elspeth.contracts.blobs import BlobRecord
 from elspeth.contracts.blobs_inline import BlobInlineRef, ContentEncoding
@@ -47,7 +47,18 @@ from elspeth.web.interpretation_state import (
     InterpretationReviewSite,
     parse_interpretation_requirements,
 )
-from elspeth.web.paths import SOURCE_LOCAL_PATH_OPTION_KEYS, allowed_source_directories, managed_blob_directory, resolve_data_path
+from elspeth.web.paths import (
+    SINK_LOCAL_PATH_OPTION_KEYS,
+    SOURCE_LOCAL_PATH_OPTION_KEYS,
+    SessionFolder,
+    allowed_sink_directories,
+    allowed_source_directories,
+    managed_blob_directory,
+    normalise_session_relative_path,
+    resolve_data_path,
+    resolve_sink_data_path,
+    session_folder_path,
+)
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId, PluginUnavailableReason
 from elspeth.web.secrets.ref_policy import allowed_secret_ref_fields
 from elspeth.web.sessions.operation_receipts import operation_receipt_response_hash
@@ -65,6 +76,7 @@ from elspeth.web.sessions.routes.operation_receipts import (
     reserve_or_replay_operation_receipt,
 )
 from elspeth.web.sessions.schemas import CompositionHeadResponse
+from elspeth.web.validation import reject_credential_material
 
 from .._helpers import (
     UTC,
@@ -288,6 +300,23 @@ class SourceBlobRowsBindingRequest(BaseModel):
     blob_ids: list[str] = Field(min_length=1)
 
 
+class SinkPathBindingRequest(BaseModel):
+    """A sink path to author below one of the target session's own folders."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    folder: SessionFolder
+    relative_path: str
+
+    # The bound path is written into the state after the imported YAML's
+    # credential guard has run, so it needs its own.
+    @field_validator("relative_path")
+    @classmethod
+    def _reject_credential_relative_path(cls, value: str) -> str:
+        reject_credential_material(value)
+        return value
+
+
 class ImportStateYamlRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -298,6 +327,8 @@ class ImportStateYamlRequest(BaseModel):
     inline_blob_bindings: dict[str, InlineBlobBindingRequest] | None = None
     # Key: source name.
     source_blob_rows: dict[str, SourceBlobRowsBindingRequest] | None = None
+    # Key: output name -> sink path option key (``path``/``file``/``persist_directory``).
+    sink_path_bindings: dict[str, dict[str, SinkPathBindingRequest]] | None = None
 
 
 class SeedCompositionStateRequest(BaseModel):
@@ -763,6 +794,58 @@ async def _state_with_imported_source_blob_rows(
     return replace(state, sources=sources)
 
 
+def _state_with_imported_sink_paths(
+    state: CompositionState,
+    *,
+    sink_path_bindings: Mapping[str, Mapping[str, SinkPathBindingRequest]] | None,
+    data_dir: str,
+    session_id: UUID,
+) -> CompositionState:
+    """Author each bound sink path below this session's own ``outputs``/``blobs`` folder.
+
+    The shared-graph import passes the sharer's session-relative sink paths
+    here; this request field is also open to the ordinary pasted-YAML route,
+    so it can only ever produce a path inside the CALLER's session folders.
+    ``relative_path`` is normalised and refused (400) when it is empty,
+    absolute, holds ``..`` or a backslash, or resolves outside the session's
+    sink directories (a symlink, say). An unknown output or option, and an
+    option that already carries a value, are refused too. The path is written
+    in the absolute form the same-user fork writes. The version is unchanged:
+    this completes the imported graph, it is not an edit of it.
+    """
+    if not sink_path_bindings:
+        return state
+
+    outputs_by_name = {output.name: index for index, output in enumerate(state.outputs)}
+    allowed = allowed_sink_directories(data_dir, session_id=str(session_id))
+    outputs = list(state.outputs)
+    for output_name, options in sink_path_bindings.items():
+        if output_name not in outputs_by_name:
+            raise HTTPException(status_code=400, detail=f"sink_path_bindings references unknown output '{output_name}'")
+        index = outputs_by_name[output_name]
+        rebuilt = deep_thaw(outputs[index].options)
+        for option, binding in options.items():
+            where = f"sink_path_bindings.{output_name}.{option}"
+            if option not in SINK_LOCAL_PATH_OPTION_KEYS:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{where}: the option must be one of {', '.join(SINK_LOCAL_PATH_OPTION_KEYS)}",
+                )
+            if option in rebuilt and rebuilt[option] is not None:
+                raise HTTPException(status_code=400, detail=f"{where}: the sink already carries a value for this option")
+            try:
+                relative_path = normalise_session_relative_path(binding.relative_path)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=f"{where}: {exc}") from None
+            target = str(session_folder_path(data_dir, binding.folder, session_id=str(session_id), relative_path=relative_path))
+            resolved = resolve_sink_data_path(target, data_dir, session_id=str(session_id))
+            if not any(resolved.is_relative_to(directory) for directory in allowed):
+                raise HTTPException(status_code=400, detail=f"{where}: the path resolves outside this session's folders")
+            rebuilt[option] = target
+        outputs[index] = replace(outputs[index], options=rebuilt)
+    return replace(state, outputs=tuple(outputs))
+
+
 @router.get(
     "/{session_id}/composer-progress",
     response_model=ComposerProgressSnapshot,
@@ -1195,6 +1278,12 @@ async def seed_state_from_runtime_yaml(
                 request=request,
                 session_id=session.id,
                 session_operation_context=lease.context,
+            )
+            imported_state = _state_with_imported_sink_paths(
+                imported_state,
+                sink_path_bindings=body.sink_path_bindings,
+                data_dir=str(request.app.state.settings.data_dir),
+                session_id=session.id,
             )
             _reject_redacted_sources_without_rebind(imported_state, yaml_text=body.yaml)
             _reject_unbound_blob_storage_sources(
