@@ -121,6 +121,7 @@ from elspeth.web.shareable_reviews.models import (
     ShareableFilesResponse,
     ShareableFileView,
     ShareableLinkResponse,
+    SharedFileSummary,
     SharedInspectResponse,
 )
 from elspeth.web.shareable_reviews.signer import (
@@ -912,6 +913,8 @@ class ShareableReviewService:
             # the blob is content-addressed and must not carry mint-time data.
             created_at=payload.created_at,
             expires_at=payload.expires_at,
+            import_allowed=snapshot.import_allowed,
+            files=[SharedFileSummary(filename=entry["filename"], size_bytes=entry["size_bytes"]) for entry in snapshot.files],
         )
 
     async def load_snapshot(self, *, token: str) -> tuple[ShareTokenPayload, ParsedSnapshot]:

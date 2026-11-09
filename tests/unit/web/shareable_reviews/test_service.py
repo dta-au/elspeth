@@ -2844,3 +2844,85 @@ async def test_mark_ready_view_only_still_works_with_llm_authored_file(
     assert blob_service.contexts == []
     assert blob_service.reads == []
     assert len(_completion_rows(session_engine_with_row, session_record.id)) == 1
+
+
+@pytest.mark.asyncio
+async def test_resolve_token_exposes_import_flag_and_file_names_only(
+    session_engine_with_row,
+    payload_store,
+    signer,
+    session_record,
+    state_record,
+    session_operation_context: SessionOperationContext,
+):
+    content = b"id,name\n1,Ada\n"
+    blob_service = _FakeBlobService()
+    blob_id = blob_service.add(session_record.id, filename="customers.csv", content=content)
+    service, *_ = _build_service(
+        engine=session_engine_with_row,
+        payload_store=payload_store,
+        signer=signer,
+        session_record=session_record,
+        state_record=_file_bound_state(state_record, source_blob=blob_id, node_value="plain"),
+        validation=_ok_validation(),
+        readiness=_readiness_snapshot(session_record.id),
+        blob_service=blob_service,
+    )
+    marked = await service.mark_ready_for_review(
+        session_id=session_record.id,
+        user_id=session_record.user_id,
+        username=_OWNER_USERNAME,
+        session_operation_context=session_operation_context,
+        allow_import=True,
+    )
+
+    resolved = await service.resolve_token(token=marked.token, requesting_user_id="reviewer")
+
+    assert resolved.import_allowed is True
+    assert [(f.filename, f.size_bytes) for f in resolved.files] == [("customers.csv", len(content))]
+    dumped = resolved.model_dump_json()
+    content_hash = blob_service.records[blob_id].content_hash
+    assert content_hash is not None
+    assert content_hash not in dumped
+    assert "sha256" not in dumped
+    assert "mime_type" not in dumped
+    assert "bindings" not in dumped
+
+
+@pytest.mark.asyncio
+async def test_resolve_token_legacy_snapshot_is_view_only_with_no_files(
+    session_engine_with_row,
+    payload_store,
+    signer,
+    session_record,
+    state_record,
+    session_operation_context: SessionOperationContext,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    service, *_ = _build_service(
+        engine=session_engine_with_row,
+        payload_store=payload_store,
+        signer=signer,
+        session_record=session_record,
+        state_record=state_record,
+        validation=_ok_validation(),
+        readiness=_readiness_snapshot(session_record.id),
+    )
+    marked = await service.mark_ready_for_review(
+        session_id=session_record.id,
+        user_id=session_record.user_id,
+        username=_OWNER_USERNAME,
+        session_operation_context=session_operation_context,
+    )
+    payload, current = await service.load_snapshot(token=marked.token)
+    legacy = ParsedSnapshot(blob=current.blob, import_allowed=False, files=())
+
+    async def _load_legacy(*, token: str) -> tuple[Any, ParsedSnapshot]:
+        return payload, legacy
+
+    monkeypatch.setattr(service, "load_snapshot", _load_legacy)
+
+    resolved = await service.resolve_token(token=marked.token, requesting_user_id="reviewer")
+
+    assert resolved.import_allowed is False
+    assert resolved.files == []

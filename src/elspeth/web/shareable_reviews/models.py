@@ -235,6 +235,17 @@ class CompositionStateResponse(_StrictResponse):
     outputs: list[OutputSpecResponse]
 
 
+class SharedFileSummary(_StrictResponse):
+    """A file that comes with a share link, as the recipient sees it.
+
+    Name and size only: content hashes, blob ids, MIME types and binding
+    sites stay in the private snapshot manifest.
+    """
+
+    filename: str
+    size_bytes: int
+
+
 class SharedInspectResponse(_StrictResponse):
     """Returned by ``GET /api/sessions/shared/{token}``.
 
@@ -259,6 +270,11 @@ class SharedInspectResponse(_StrictResponse):
 
     ``expires_at`` lets the frontend show "this link expires in N days"
     without re-decoding the token.
+
+    ``import_allowed`` says whether the link lets the recipient import the
+    pipeline into their own session; ``files`` lists the files that come
+    with it (names and sizes only, in manifest order). Legacy snapshots
+    report ``import_allowed=False`` and no files.
     """
 
     session_id: str
@@ -271,3 +287,5 @@ class SharedInspectResponse(_StrictResponse):
     created_by_username: str
     created_at: datetime
     expires_at: datetime
+    import_allowed: bool
+    files: list[SharedFileSummary]
