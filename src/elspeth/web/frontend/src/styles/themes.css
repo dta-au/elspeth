@@ -170,17 +170,12 @@
     border-color: HighlightText;
   }
 
-  /* Graph: the well and checksum pill are fill/inset-shadow only. */
-  .graph-view-canvas,
-  .graph-checksum-value {
+  /* Graph: the well is fill/inset-shadow only. */
+  .graph-view-canvas {
     border: 1px solid CanvasText;
   }
 
   :root .react-flow__controls {
-    border: 1px solid ButtonText;
-  }
-
-  .graph-checksum-actions > .btn-compact {
     border: 1px solid ButtonText;
   }
 
