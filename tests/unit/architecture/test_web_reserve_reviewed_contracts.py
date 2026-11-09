@@ -4,6 +4,7 @@ import ast
 from pathlib import Path
 
 import pytest
+from tests.helpers import web_recovery_producer_contract as recovery_producer
 from tests.helpers import web_reserve_compose_proposal_transfers as compose
 from tests.helpers import web_reserve_composer_receiver as receiver
 from tests.helpers import web_reserve_provider_mint_contract as provider
@@ -276,6 +277,8 @@ def test_reviewed_writer_recipes_match_live_source_and_refuse_recovery_drift(fau
         SERVICE,
         PROTOCOL,
         "src/elspeth/web/required_work.py",
+        "src/elspeth/web/async_workers.py",
+        "src/elspeth/web/required_executor.py",
         "src/elspeth/web/coordination/composer_operation_authority.py",
         "src/elspeth/web/sessions/composer_operation_errors.py",
         "src/elspeth/web/sessions/composer_operations.py",
@@ -305,6 +308,9 @@ def test_reviewed_source_guard_matches_live_source_and_refuses_changed_bytes(pat
     ("path", "old_digest"),
     (
         ("src/elspeth/web/required_work.py", "7d04c0cecccc6587da79b83ac8d290769f93fd46b19f06e021912d643592b5d1"),
+        # The pins that preceded the standalone-recovery ownership change (dc67bdd2f).
+        ("src/elspeth/web/async_workers.py", "40b670cb74242c59fa129fefb6cee2fcd6f1e03127a1128e484d651fadd7b034"),
+        ("src/elspeth/web/required_executor.py", "4ce38dc66023afa5696374adf59c26af9a0fe1465eb056d873f61934c14b45f9"),
         (SERVICE, "45f15a607b271ed709248984e4da55d6aaf6dd52f03a2293159d816fa830eca7"),
         (PROTOCOL, "175f6ad59656431748d5472fb7892915a9c247641da6944915b2a5d41d046083"),
         (
@@ -1007,3 +1013,127 @@ def test_provider_mint_callable_escape_remains_an_unclosed_common_premise() -> N
         if isinstance(node, ast.Name) and node.id == "ProviderInvocationOwner" and isinstance(node.ctx, ast.Load)
     )
     assert (carrier.path, id(escaped)) in receipt["unclosed_callable_carriers"]
+
+
+_RECOVERY_REGISTRATION_PATHS = (
+    "src/elspeth/web/app.py",
+    "src/elspeth/web/async_workers.py",
+    "src/elspeth/web/application_finalizers.py",
+    "src/elspeth/web/process_recovery.py",
+    "src/elspeth/composer_mcp/standalone.py",
+)
+_RECOVERY_WORKER = "src/elspeth/web/async_workers.py"
+_RECOVERY_STANDALONE = "src/elspeth/composer_mcp/standalone.py"
+_RECOVERY_UNIVERSE = "recovery registration call/escape universe changed"
+_RECOVERY_STANDALONE_UNIVERSE = "recovery standalone registration call/escape universe changed"
+_RECOVERY_STANDALONE_BODY = "recovery standalone registration unowned-process guard/forwarding contract changed"
+_RECOVERY_REGISTRATION_ARGUMENTS = (
+    "drain_seconds=1.0, instance_draining=threading.Event(), generation_unavailable=threading.Event(), recovery_callback=print"
+)
+
+
+def _recovery_registration_sources() -> dict[str, str]:
+    return {path: (ROOT / path).read_text() for path in _RECOVERY_REGISTRATION_PATHS}
+
+
+def _recovery_contract_failures(sources: dict[str, str]) -> list[str]:
+    units = tuple(fencing._parse_source(path, source) for path, source in sources.items())
+    failures, stores, globals_ = recovery_producer.recovery_cell_contract(units)
+    assert bool(failures) != (len(stores) == 2 and len(globals_) == 1)
+    return failures
+
+
+def test_recovery_registration_admits_exactly_the_web_owner_and_guarded_standalone_site() -> None:
+    failures, stores, globals_ = recovery_producer.recovery_cell_contract(fencing._production_units())
+    assert failures == [] and len(stores) == 2 and len(globals_) == 1
+    assert _recovery_contract_failures(_recovery_registration_sources()) == []
+
+
+@pytest.mark.parametrize(
+    ("module", "body", "expected"),
+    (
+        pytest.param(
+            "from elspeth.web.async_workers import configure_required_executor_recovery\n",
+            "    configure_required_executor_recovery(" + _RECOVERY_REGISTRATION_ARGUMENTS + ")\n",
+            [_RECOVERY_UNIVERSE],
+            id="third-direct-registration",
+        ),
+        pytest.param(
+            "from elspeth.web import async_workers\n",
+            "    async_workers.configure_required_executor_recovery(" + _RECOVERY_REGISTRATION_ARGUMENTS + ")\n",
+            [_RECOVERY_UNIVERSE],
+            id="third-qualified-registration",
+        ),
+        pytest.param(
+            "from elspeth.web.async_workers import configure_standalone_executor_recovery\n",
+            "    configure_standalone_executor_recovery(" + _RECOVERY_REGISTRATION_ARGUMENTS + ")\n",
+            [_RECOVERY_STANDALONE_UNIVERSE],
+            id="second-standalone-registration",
+        ),
+        pytest.param(
+            "from elspeth.web.async_workers import configure_standalone_executor_recovery\n",
+            "    return configure_standalone_executor_recovery\n",
+            ["recovery registration callable escape src/elspeth/web/unreviewed_recovery_site.py"],
+            id="standalone-registration-escape",
+        ),
+    ),
+)
+def test_recovery_registration_refuses_an_unreviewed_site(module: str, body: str, expected: list[str]) -> None:
+    sources = _recovery_registration_sources()
+    sources["src/elspeth/web/unreviewed_recovery_site.py"] = (
+        "from __future__ import annotations\nimport threading\n" + module + "def unreviewed():\n" + body
+    )
+    assert _recovery_contract_failures(sources) == expected
+
+
+def test_recovery_registration_refuses_removal_of_either_reviewed_site() -> None:
+    sources = _recovery_registration_sources()
+    del sources[_RECOVERY_STANDALONE]
+    assert _recovery_contract_failures(sources) == [_RECOVERY_STANDALONE_UNIVERSE]
+
+    call = "        configure_standalone_executor_recovery(\n"
+    sources = _recovery_registration_sources()
+    assert sources[_RECOVERY_STANDALONE].count(call) == 1
+    sources[_RECOVERY_STANDALONE] = sources[_RECOVERY_STANDALONE].replace(call, "        dict(\n")
+    assert _recovery_contract_failures(sources) == [_RECOVERY_STANDALONE_UNIVERSE]
+
+    forward = "    configure_required_executor_recovery(\n        drain_seconds=drain_seconds,\n"
+    sources = _recovery_registration_sources()
+    assert sources[_RECOVERY_WORKER].count(forward) == 1
+    sources[_RECOVERY_WORKER] = sources[_RECOVERY_WORKER].replace(forward, "    dict(\n        drain_seconds=drain_seconds,\n")
+    assert _recovery_contract_failures(sources) == [_RECOVERY_STANDALONE_BODY]
+
+    owner = "        configure_required_executor_recovery(\n            drain_seconds=resolved_settings.composer_async_drain_seconds,\n"
+    sources = _recovery_registration_sources()
+    assert sources["src/elspeth/web/app.py"].count(owner) == 1
+    sources["src/elspeth/web/app.py"] = sources["src/elspeth/web/app.py"].replace(
+        owner, "        dict(\n            drain_seconds=resolved_settings.composer_async_drain_seconds,\n"
+    )
+    assert _recovery_contract_failures(sources) == ["recovery caller complete executed producer/dominance/transfer contract changed"]
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    (
+        pytest.param(
+            "    if _RECOVERY_CALLBACK is not None or _SHARED_EXECUTOR is not None or _GENERATION_CUSTODIAN is not None:\n",
+            "    if _SHARED_EXECUTOR is not None or _GENERATION_CUSTODIAN is not None:\n",
+            id="existing-owner-guard-dropped",
+        ),
+        pytest.param(
+            '        raise RequiredGenerationUnavailable("Standalone executor requires an unowned process")\n',
+            "        pass\n",
+            id="refusal-dropped",
+        ),
+        pytest.param(
+            "        recovery_callback=recovery_callback,\n    )\n\n\ndef _retain_generation_recovery",
+            "        recovery_callback=recovery_callback,\n        application_finalizer_owner=None,\n    )\n\n\ndef _retain_generation_recovery",
+            id="forwarding-changed",
+        ),
+    ),
+)
+def test_recovery_standalone_registration_body_is_pinned(old: str, new: str) -> None:
+    sources = _recovery_registration_sources()
+    assert sources[_RECOVERY_WORKER].count(old) == 1
+    sources[_RECOVERY_WORKER] = sources[_RECOVERY_WORKER].replace(old, new)
+    assert _recovery_contract_failures(sources) == [_RECOVERY_STANDALONE_BODY]
