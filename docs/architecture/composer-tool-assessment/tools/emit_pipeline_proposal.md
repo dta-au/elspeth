@@ -11,7 +11,12 @@ execution command, or a success announcement to the user.
 
 Only the planner route exposes it. The ordinary canonical list and freeform
 loop do not; the latter uses `set_pipeline`. Composer MCP does not advertise it.
-The planner must have an admitted request, immutable capability/policy context,
+The planner, and therefore this tool, is selected only when the current
+composition state is structurally empty (no source, sources, nodes, edges or
+outputs) and a sessions service, session id and user message id are all present
+([route gate](../../../../src/elspeth/web/composer/service.py#L1234)). Every
+request against a non-empty pipeline goes to the freeform loop, so this tool is
+the authoring path for every first build and never for an edit. The planner must have an admitted request, immutable capability/policy context,
 provider invocation ownership, candidate finalizer/validator and session-backed
 custody for the eventual proposal. The tool is available on both dialects but
 explicitly non-strict even on `openai_strict` because its full-document schema
@@ -22,18 +27,49 @@ is not a strict-capable transport grammar.
 The root is closed and has one required field, `pipeline`, containing the
 canonical `set_pipeline` document schema. The complete schema is appended below.
 The inner document is validated again by `SetPipelineArgumentsModel`, so passing
-JSON Schema is necessary but not sufficient. The planner additionally rejects
-sourceless candidates. Omitted fields, explicit null and authored field presence
+JSON Schema is necessary but not sufficient. A sourceless candidate (or one
+supplying both `source` and `sources`) is rejected by the JSON Schema root
+`oneOf` precheck with `canonical_schema` feedback naming `rule: oneOf`; the
+Pydantic `_exactly_one_source_configuration` validator is a second gate. The
+dedicated `no_source_configured` missing-source branch after both is not
+reachable from provider input (see `emit_pipeline_proposal-N1`). Omitted fields, explicit null and authored field presence
 must retain their canonical meaning; the server must not infer missing topology
 as a substitute for provider authorship.
 
-The terminal must be alone. A terminal with discovery siblings gets rejecting
-tool feedback and consumes repair budget without dispatching siblings; multiple
-terminal calls are malformed. Successful admission runs the required-control
-finalizer, candidate validation and plan construction, yielding a `PipelinePlan`
+The terminal must be alone, and the consequence depends on the sibling type.
+With discovery siblings, every call gets `TERMINAL_CALL_NOT_ALONE` tool feedback,
+nothing is dispatched and one repair unit is spent. Two terminal calls in one
+turn are `MALFORMED_RESPONSE` and end planning. A terminal batched with a
+recovery control also ends planning as `MALFORMED_RESPONSE`, because the
+recovery-sibling check runs first (`emit_pipeline_proposal-N2`). Terminal
+arguments that are not a strict JSON object end planning with
+`MALFORMED_RESPONSE` too, unless the response hit the completion cap or reported
+`finish_reason="length"`; those cases are repaired as truncation. These fatal
+outcomes do not engage the escape hatch. Successful admission runs the required-control
+finalizer, candidate validation and plan construction, yielding a `PipelinePlanResult`
 with provider-authored/effective identity, validation and audit evidence. The
 application still stages/publishes the proposal and review; a validated plan is
-not proof of session commit, user approval or execution readiness.
+not proof of session commit or execution readiness. User approval is not always
+required. If the trust-mode snapshot and the current preference both say
+`auto_commit` and the Stage-2 preflight over the candidate state is green, staging
+mints a `PipelineCommitIntent`
+([auto-commit gate](../../../../src/elspeth/web/composer/planning_application.py#L855)).
+Turn settlement then commits without review, or downgrades to review if the
+authority was revoked meanwhile
+([settlement](../../../../src/elspeth/web/sessions/composer_turn.py#L1132)).
+
+Admission has one durable effect before any user decision. A candidate whose
+`source.inline_blob` passes validation is materialised as a session blob under
+the operation fence during plan construction. The blob id is deterministic and
+the write is idempotent ([custody](../../../../src/elspeth/web/composer/pipeline_planner.py#L3110),
+[reservation](../../../../src/elspeth/web/blobs/service.py#L2804)), so an
+unchanged resubmission reuses the blob. Whether a later refused or stale proposal
+releases that blob has not been traced. The model receives no user-visible reply
+channel: the staged turn's message is one of the fixed `PIPELINE_STAGED_*` server
+strings ([protocol](../../../../src/elspeth/web/composer/protocol.py#L209)), and
+any prose the model sends with the accepted terminal call is not delivered.
+Step `description` fields and `metadata.description` are the only explanatory
+text the model authors that reaches reviewers.
 
 Failures include wire/schema/Pydantic rejection, unavailable plugins/profiles,
 missing sources, semantic/runtime validation, invalid review references, repeated
@@ -50,13 +86,20 @@ fences and proposal authority own concurrent publication.
 - [Terminal payload/definition](../../../../src/elspeth/web/composer/pipeline_planner.py#L1569),
   [policy-selected planner exposure](../../../../src/elspeth/web/composer/pipeline_planner.py#L1647),
   [provider retry ownership](../../../../src/elspeth/web/composer/pipeline_planner.py#L1605).
-- [Provider response parsing](../../../../src/elspeth/web/composer/pipeline_planner.py#L1794),
+- [Provider response parsing](../../../../src/elspeth/web/composer/pipeline_planner.py#L1794)
+  (the terminal is excluded from wire decoding at
+  [L1869](../../../../src/elspeth/web/composer/pipeline_planner.py#L1869); a second
+  terminal is refused at [L1898](../../../../src/elspeth/web/composer/pipeline_planner.py#L1898)),
+  [recovery-sibling check](../../../../src/elspeth/web/composer/pipeline_planner.py#L4352),
   [terminal singleton protocol](../../../../src/elspeth/web/composer/pipeline_planner.py#L4401),
-  [schema, Pydantic and missing-source gates](../../../../src/elspeth/web/composer/pipeline_planner.py#L4454).
+  [terminal branch](../../../../src/elspeth/web/composer/pipeline_planner.py#L4454) with its
+  [root/schema/Pydantic gates](../../../../src/elspeth/web/composer/pipeline_planner.py#L4476)
+  and the unreachable [missing-source branch](../../../../src/elspeth/web/composer/pipeline_planner.py#L4515).
 - [Pydantic feedback](../../../../src/elspeth/web/composer/pipeline_planner.py#L2859),
-  [required-control finalization and plan construction](../../../../src/elspeth/web/composer/pipeline_planner.py#L4525),
+  [required-control finalizer call](../../../../src/elspeth/web/composer/pipeline_planner.py#L4531),
+  [plan construction](../../../../src/elspeth/web/composer/pipeline_planner.py#L4626),
   [plan assembly helper](../../../../src/elspeth/web/composer/pipeline_planner.py#L3041).
-- [Planner application](../../../../src/elspeth/web/composer/planning_application.py#L1035)
+- [Planner application](../../../../src/elspeth/web/composer/planning_application.py#L1017)
   bridges the plan into session-backed staging/review;
   [pipeline commit authority](../../../../src/elspeth/web/composer/pipeline_commit.py)
   binds authored/effective content to audit and durable publication.
@@ -64,6 +107,33 @@ fences and proposal authority own concurrent publication.
   handle user acceptance/refusal; [turn persistence](../../../../src/elspeth/web/sessions/composer_turn.py)
   owns terminal response. Browser workspace reads resulting state/proposals;
   it does not consume the private planner terminal as an execution receipt.
+
+### 3.1 Route inventory
+
+Measured by source trace and two read-only introspections (§7). Name searches
+were controlled: each file reported as having no mention of the tool does mention
+`set_pipeline`.
+
+| Route | Reaches / consumes | Gate | Evidence |
+|---|---|---|---|
+| Name authority | `PLANNER_TERMINAL_TOOL_NAME` | constant; the capability-manifest check requires the terminal last, after the two recovery controls | [capability_skill.py](../../../../src/elspeth/web/composer/capability_skill.py#L38), [order check](../../../../src/elspeth/web/composer/capability_skill.py#L216) |
+| Definition / stamping | `planner_terminal_tool_definition` → `stamp_planner_terminal` | `openai_strict` adds `strict: false`; `none` sends no `strict` key | [definition](../../../../src/elspeth/web/composer/pipeline_planner.py#L1577), [stamp](../../../../src/elspeth/web/composer/tools/wire_projection.py#L869) |
+| Planner palette, ordinary turns | discovery (policy-filtered) + recovery + terminal | `planner_tool_definitions(policy, dialect)`; discovery may be narrowed by the policy, terminal is never removed | [L1647](../../../../src/elspeth/web/composer/pipeline_planner.py#L1647) |
+| Planner selection | `compose()` → `_plan_and_stage_empty_pipeline` → `plan_pipeline` | structurally empty state + sessions service + session id + user message id | [service.py](../../../../src/elspeth/web/composer/service.py#L1234), [planning_application.py](../../../../src/elspeth/web/composer/planning_application.py#L1114) |
+| Escape hatch | same palette re-stamped for the hatch dialect, advisor model/endpoint | configured `escape_hatch_model`/provider; only after a repair/discovery/composition/prose exhaustion; one shot | [L4268](../../../../src/elspeth/web/composer/pipeline_planner.py#L4268) |
+| Boot probe | recovery controls + terminal for the hatch route | only when the hatch dialect is not `none`; reply capped, no planning | [boot_probe.py](../../../../src/elspeth/web/composer/boot_probe.py#L210) |
+| Required controls | `wire_required_controls` as `candidate_finalizer` | every schema-valid sourced candidate | [planning_application.py](../../../../src/elspeth/web/composer/planning_application.py#L159) |
+| Staging | `_stage_pipeline_plan` builds the summary and redaction as `set_pipeline`. The proposal row is inserted with `tool_name="set_pipeline"`, and the accepted evidence also carries `set_pipeline` | always after an accepted plan; auto-commit as in §2 | [L607](../../../../src/elspeth/web/composer/planning_application.py#L607), [L668](../../../../src/elspeth/web/composer/planning_application.py#L668), [row insert](../../../../src/elspeth/web/sessions/mutation_capabilities.py#L246), [accepted evidence](../../../../src/elspeth/web/sessions/service.py#L3893) |
+| Auto-commit settlement | turn settlement applies the `PipelineCommitIntent`, or downgrades to review when auto-commit authority was revoked | trust mode `auto_commit` (snapshot and current) + green Stage 2 | [composer_turn.py](../../../../src/elspeth/web/sessions/composer_turn.py#L1132), [downgrade](../../../../src/elspeth/web/sessions/composer_turn.py#L1155) |
+| REST accept / reject | canonical pipeline proposals (those with a pipeline authority, inferred from source naming) settle the sealed draft by `draft_hash` and are not re-dispatched through `execute_tool` | authenticated session, proposal lease, `draft_hash` required (422 without) | [accept](../../../../src/elspeth/web/sessions/routes/composer/proposals.py#L290), [settlement](../../../../src/elspeth/web/sessions/routes/composer/pipeline_settlement.py#L662), [reject](../../../../src/elspeth/web/sessions/routes/composer/proposals.py#L724) |
+| Recovery controls | `handoff_to_user` / `restore_parked_graph` end planning instead of a terminal | alone in the turn; a terminal sibling is fatal | [L4352](../../../../src/elspeth/web/composer/pipeline_planner.py#L4352) |
+| Audit consumers | private candidate capture, credential guard, provider-context re-encoding, diagnostic evidence | name-keyed branches for `emit_pipeline_proposal` | [capture](../../../../src/elspeth/web/composer/pipeline_planner.py#L3689), [credential_guard.py](../../../../src/elspeth/web/credential_guard.py#L264), [provider_context.py](../../../../src/elspeth/web/composer/provider_context.py#L116), [diagnostic_evidence.py](../../../../src/elspeth/web/composer/diagnostic_evidence.py#L469) |
+| Visible tool events | name-keyed custody projection exists, but no producer captures a terminal event | `VisibleToolEvent.capture` call sites are planner discovery dispatch and the freeform `turn_audit` only | [visible_tool_event.py](../../../../src/elspeth/web/composer/visible_tool_event.py#L116), [planner capture](../../../../src/elspeth/web/composer/pipeline_planner.py#L5013) |
+| Freeform loop / `tool_batch.py` | not advertised; an unadvertised call reaches the dispatcher's generic `Unknown tool` failure | — | [_dispatch.py](../../../../src/elspeth/web/composer/tools/_dispatch.py#L921) |
+| Composer MCP | absent | — | no mention in `composer_mcp/server.py` |
+| Frontend | no production consumer. The proposal is shown as a `set_pipeline` proposal; only an E2E harness reads `selected_tools` attempt data | — | `frontend/tests/e2e/harness/planner-efficiency.test.ts` |
+
+No tutorial-specific branch was found on any route above.
 
 ## 4. Alternative paths
 
@@ -74,7 +144,11 @@ identity is retained. This is an admission safeguard, not permission for the
 server to author a replacement pipeline.
 
 Mixed terminal/discovery replies reject the whole batch before dispatch, close
-the tool protocol with feedback and spend repair budget. Truncated responses
+the tool protocol with feedback and spend repair budget. Terminal/terminal and
+terminal/recovery replies, and terminal arguments that are not strict JSON
+below the output cap, end planning with `MALFORMED_RESPONSE` and get no repair
+or hatch. Calling a mutation tool such as `set_pipeline` from the planner
+ends planning with `DISCOVERY_ONLY`. Truncated responses
 discard even parseable candidate calls before validation. Exhausted ordinary
 repair can enter a configured independent model hatch; a hatch failure preserves
 the original exhaustion classification. Recovery controls remain available and
@@ -95,6 +169,142 @@ commit settlement. A terminal success cannot tell the orchestrator which later
 obligation remains unless it interprets these distinct outcomes correctly. No
 specific invalid commit or provider-bypass defect is demonstrated here; the
 focused protocol tests give counterevidence to those claims.
+
+**Provisional findings from the sheet review** (the coordinator will renumber them):
+
+- **`emit_pipeline_proposal-N1` — demonstrated by introspection, source-established
+  as dead code.** The missing-source branch
+  ([L4515](../../../../src/elspeth/web/composer/pipeline_planner.py#L4515)) cannot be
+  reached from provider input. Its helper's docstring says "Both `source` and
+  `sources` are optional on the terminal schema"
+  ([L2020](../../../../src/elspeth/web/composer/pipeline_planner.py#L2020)), but the
+  measured schema has a root `oneOf` that rejects both omission and duplication
+  first, and `SetPipelineArgumentsModel` rejects them again. The tests confirm this.
+  The sourceless fixture expects `canonical_schema`/`oneOf`, and the hatch test
+  maps `missing_source` to `expected_code = "canonical_schema"`
+  ([tests](../../../../tests/unit/web/composer/test_pipeline_planner.py#L4287)).
+  The test named `..._gets_bounded_no_source_repair` asserts schema feedback, not
+  `no_source_configured`. No incorrect behaviour reaches the planner. The
+  documentation and branch are stale.
+- **`emit_pipeline_proposal-N2` — source-established, intent unverified.** The same
+  model mistake, a terminal that is not alone, is repairable with a discovery
+  sibling but fatal with a recovery sibling. The recovery check at
+  [L4352](../../../../src/elspeth/web/composer/pipeline_planner.py#L4352) runs before
+  the terminal check at [L4401](../../../../src/elspeth/web/composer/pipeline_planner.py#L4401).
+  No test covers terminal plus recovery.
+  `test_mixed_recovery_batch_is_rejected_before_dispatch` uses `list_sources` with
+  `handoff_to_user`. The per-request instruction says only that "a mixed terminal batch
+  executes no calls" ([L1936](../../../../src/elspeth/web/composer/pipeline_planner.py#L1936)).
+- **`emit_pipeline_proposal-N3` — intended (test-pinned), undisclosed to the
+  model.** Two terminals in one turn, and terminal arguments that are not a
+  strict JSON object below the output cap, end planning as `MALFORMED_RESPONSE`
+  without repair or hatch. The tests are
+  `test_two_terminal_calls_in_one_turn_stay_malformed` and
+  `test_unparseable_arguments_below_cap_without_length_finish_stay_fatal`
+  ([tests](../../../../tests/unit/web/composer/test_pipeline_planner_protocol_rejections.py#L257)).
+  The tool description gives no hint that these mistakes are unrecoverable.
+- **`emit_pipeline_proposal-N4` — source-established effect-disclosure gap.**
+  Admitting a candidate with `inline_blob` writes a durable session blob before
+  user approval (§2). A planner proposal can also be auto-committed without
+  per-proposal review under `auto_commit` with a green preflight. Neither effect is
+  stated in the tool description or the skills. Cleanup of the blob after a
+  refused or stale proposal is **unverified**.
+- **`emit_pipeline_proposal-N5` — intended (test-pinned), audit consequence.** On a
+  `PlannerHandoff`, staging passes `private_candidates=()`
+  ([L1191](../../../../src/elspeth/web/composer/planning_application.py#L1191);
+  `test_application_handoff_defers_audit_and_omits_optional_candidate_capture`).
+  Rejected terminal candidates submitted before a handoff are therefore not retained
+  as private evidence. The decline, prompt-guard, error and success exits do retain
+  them. The asymmetry is deliberate ("optional") but undocumented in this sheet's
+  audit claims.
+- **`emit_pipeline_proposal-N6` — source-established usability limitation.** The
+  model has no channel to explain its design to the user. Terminal-turn prose
+  is discarded and the user receives a fixed server message (§2). Skill text that
+  asks for a "stage reply" (§5.1) cannot be satisfied on this surface.
+- **`emit_pipeline_proposal-N7` — hypothesis.** The `emit_pipeline_proposal` arms in
+  [visible_tool_event.py](../../../../src/elspeth/web/composer/visible_tool_event.py#L271)
+  (historical replay refusal) have no current producer; they may be defensive or
+  may cover rows written by an earlier version. This is unverified.
+- **`emit_pipeline_proposal-N8` — source-established schema gap, consequence
+  unverified.** Named `sources` entries exclude `blob_id`/`inline_blob`
+  ([model](../../../../src/elspeth/web/composer/redaction.py#L1777)), and the planner
+  palette has no blob-binding mutation. On the empty-state planner route, a
+  multi-source proposal therefore has no evident way to bind uploaded blobs. Whether
+  options such as a path can substitute was not traced. This belongs equally to the
+  `set_pipeline` sheet.
+
+### 5.1 Guidance parity
+
+The planner's system message is the same rendered `pipeline_composer.md` plus
+capability core that the freeform loop receives:
+`rendered_skill = self._composer_skill_text`
+([planning_application.py](../../../../src/elspeth/web/composer/planning_application.py#L1077)).
+The manifest check only requires the core as a prefix
+([capability_skill.py](../../../../src/elspeth/web/composer/capability_skill.py#L205)).
+The only planner-specific guidance is the per-request `instruction`
+([L1936](../../../../src/elspeth/web/composer/pipeline_planner.py#L1936)), the
+prose-nudge and hatch notices, and the tool description.
+
+- **Name coverage.** The tool name occurs 0 times in both skill files. As a grep
+  control, `set_pipeline` occurs 31 and 2 times. The capability core is
+  deliberately surface-neutral ("your surface's terminal authoring tool",
+  [pipeline_capabilities.md L41](../../../../src/elspeth/web/composer/skills/pipeline_capabilities.md#L41))
+  and says the interaction rules name the tool. `pipeline_composer.md` never does,
+  so only the per-request instruction names it. The autogenerated Tool Inventory
+  ([pipeline_composer.md L339](../../../../src/elspeth/web/composer/skills/pipeline_composer.md#L339))
+  lists the freeform build/edit/review tools and omits the terminal.
+- **Guidance that points at tools the planner does not have.** The planner handles
+  every new build, but the edit table says "Create a new pipeline → `set_pipeline`,
+  or bounded construction batches"
+  ([L175](../../../../src/elspeth/web/composer/skills/pipeline_composer.md#L175)).
+  Complex New Pipeline Batching prescribes `set_source`/`set_output`/`upsert_node`/`upsert_edge`
+  ([L189](../../../../src/elspeth/web/composer/skills/pipeline_composer.md#L189)).
+  None of these is in the planner palette (measured: 20 discovery, 2 recovery, 1
+  terminal), and obeying them ends planning with `DISCOVERY_ONLY` (§4). The code
+  already recognises this hazard for authoring aids
+  ([planner_authoring_aids.py](../../../../src/elspeth/web/composer/planner_authoring_aids.py#L947))
+  but the composer skill is unscoped. Source-established; how often models actually
+  follow this text is unmeasured.
+- **Unsatisfiable completion criteria.** "Done means … a valid preview"
+  ([L51](../../../../src/elspeth/web/composer/skills/pipeline_composer.md#L51)) and the
+  termination checklist ("matching request_interpretation_review call",
+  [L1330](../../../../src/elspeth/web/composer/skills/pipeline_composer.md#L1330);
+  "mentioned in my reply", [L1327](../../../../src/elspeth/web/composer/skills/pipeline_composer.md#L1327))
+  cannot be met on this surface. The proposal is not in session state while the
+  planner runs, so `preview_pipeline` previews the empty state, and no review tool
+  or reply exists. Partial carve-outs exist at
+  [L127](../../../../src/elspeth/web/composer/skills/pipeline_composer.md#L127),
+  [L149](../../../../src/elspeth/web/composer/skills/pipeline_composer.md#L149) and
+  [pipeline_capabilities.md L156](../../../../src/elspeth/web/composer/skills/pipeline_capabilities.md#L156),
+  and the schema's `options` descriptions carry the proposal-only review rule. The
+  checklist carries no carve-out.
+- **Wrong statement.** pipeline_capabilities.md says "Only the provider planner
+  authors the proposal through ordinary node/edge tools, then preview and diff it"
+  ([L416](../../../../src/elspeth/web/composer/skills/pipeline_capabilities.md#L416)).
+  The provider planner has no node/edge tools, and chain compaction applies to an
+  existing pipeline, which never routes to the planner.
+- **Undeliverable instruction.** "State the gate's condition and every route's
+  destination in your stage reply"
+  ([pipeline_capabilities.md L153](../../../../src/elspeth/web/composer/skills/pipeline_capabilities.md#L153),
+  [pipeline_composer.md L959](../../../../src/elspeth/web/composer/skills/pipeline_composer.md#L959))
+  cannot be followed here (N6).
+- **Schema-description references to absent tools.** `source.blob_id` ("resolved
+  exactly like set_source_from_blob"), source `options` ("Bind blobs through
+  set_source_from_blob, set_source_from_blobs …") and `inline_blob` ("Fields
+  mirror create_blob") name tools that are not in the planner palette. The `options`
+  text does carry an explicit proposal-only clause, so the risk is low.
+- **Description omissions.** The declaration description (alone, full-document
+  repair) is accurate as far as it goes. It does not say that a second terminal,
+  a recovery sibling or malformed JSON is fatal (N2, N3), that the reply is a fixed
+  server message (N6), or that inline sources and auto-commit have effects (N4).
+  The root `pipeline` property has no description.
+- **Accurate parity.** The instruction, the capability core
+  ([L46–48](../../../../src/elspeth/web/composer/skills/pipeline_capabilities.md#L46))
+  and the declaration agree that the terminal must be alone and that a rejected
+  proposal is repaired and resubmitted as a full document. Handoff/restore
+  availability in the planner and hatch
+  ([pipeline_composer.md L66](../../../../src/elspeth/web/composer/skills/pipeline_composer.md#L66))
+  matches the palette.
 
 ## 6. Structural remediation
 
@@ -120,18 +330,84 @@ terminal calls, truncation rejection before finalization, unchanged deadline
 through repair, one audit per physical provider attempt, stale approval refusal,
 and required-control/provider-authority provenance on both entry paths.
 
+### 6.1 Simple enhancements
+
+None of these is implemented. Each is bounded and keeps provider authorship.
+
+1. **Remove or correct the dead missing-source branch (N1).** Where:
+   [L2020](../../../../src/elspeth/web/composer/pipeline_planner.py#L2020),
+   [L4515](../../../../src/elspeth/web/composer/pipeline_planner.py#L4515). Why: the
+   docstring contradicts the measured `oneOf`, and the branch implies a
+   `no_source_configured` repair that never occurs. Acceptance: the sourceless and
+   both-source fixtures still get `canonical_schema`/`oneOf`, and no test or
+   comment claims a schema-legal sourceless candidate. Rename the misnamed
+   `test_freeform_sources_omitted_candidate_gets_bounded_no_source_repair`.
+2. **Make terminal/recovery mixing consistent with terminal/discovery mixing,
+   or disclose it (N2).** Where:
+   [L4352](../../../../src/elspeth/web/composer/pipeline_planner.py#L4352). Why: the
+   same "not alone" mistake has opposite consequences. Acceptance: a scripted
+   `emit_pipeline_proposal` + `handoff_to_user` turn either receives
+   `TERMINAL_CALL_NOT_ALONE` with no dispatch and one repair unit spent, or the
+   instruction and description state that it is fatal. A test pins whichever
+   behaviour is chosen.
+3. **Name root violations in schema feedback.** Where:
+   [L4476](../../../../src/elspeth/web/composer/pipeline_planner.py#L4476). Why: an extra
+   root key or a missing `pipeline` currently yields bare `canonical_schema` with no
+   `schema_violations`, unlike the inner precheck. Acceptance: `{"pipeline": …, "x": 1}`
+   feedback carries a value-free `additionalProperties`/`required` violation at path
+   `""` or `pipeline`.
+4. **Distinguish neither-source from both-source in the `oneOf` violation.** Why:
+   both give `{"path":"pipeline","rule":"oneOf"}` (measured), so the model cannot
+   tell what to fix. Acceptance: a value-free `detail` such as `source_xor_sources`
+   with `missing` or `both`, carrying no authored values.
+5. **Drop the impossible `payload.pipeline is None` arm.** Where:
+   [L4486](../../../../src/elspeth/web/composer/pipeline_planner.py#L4486). Why:
+   `_PlannerTerminalPayload` is `strict=True` with `pipeline: dict[str, Any]`
+   ([L1569](../../../../src/elspeth/web/composer/pipeline_planner.py#L1569)).
+   Acceptance: mypy and the existing tests pass unchanged.
+6. **Complete the declaration description.** Where:
+   [L1591](../../../../src/elspeth/web/composer/pipeline_planner.py#L1591). Add a root
+   `pipeline` description. State that a second terminal, a recovery sibling or
+   non-JSON arguments end planning (N3), that turn prose is not shown to the user,
+   and that step `description` and `metadata.description` reach reviewers (N6).
+   Acceptance: the boot-probe and capability-manifest hash tests are updated
+   deliberately, and the description stays true against the planner protocol tests.
+7. **Scope the composer skill's build guidance to the palette (§5.1).** Where:
+   pipeline_composer.md L51, L175, L189, L1327, L1330, L959, and
+   pipeline_capabilities.md L153, L416. Why: unconditional instructions to call
+   tools absent from the planner end it as `DISCOVERY_ONLY`. Acceptance: each rule
+   uses the existing "where your palette carries …" phrasing, and a parity test
+   rejects any planner-palette-absent tool named in an unconditional rule. Follow
+   the authoring-aids precedent at
+   [test_planner_authoring_aids.py](../../../../tests/unit/web/composer/test_planner_authoring_aids.py#L2369).
+8. **Add the missing terminal + recovery test.** Acceptance: one test asserting the
+   chosen N2 behaviour, with no discovery dispatch and no candidate construction.
+
 ## 7. Evidence, confidence, risk and limits
 
-Read and executed meaningful tests in
+The parent assessment executed a six-file recovery/planner selection that includes
 [planner protocol rejections](../../../../tests/unit/web/composer/test_pipeline_planner_protocol_rejections.py),
 [strict dialect](../../../../tests/unit/web/composer/test_planner_strict_dialect.py),
-and [planner recovery](../../../../tests/unit/web/composer/test_planner_graph_recovery.py)
-within the parent selection: **86 passed, exit 0**. Assertions cover invalid
+and [planner recovery](../../../../tests/unit/web/composer/test_planner_graph_recovery.py):
+**86 passed, exit 0** for the whole selection ([evidence](../evidence.md)), not
+for these three files alone. Assertions cover invalid
 batches without dispatch, classified budgets, discarded length-stopped calls,
 deadline preservation, physical-attempt audits and terminal non-strict stamps.
 The review located but did not independently execute all proposal-lifecycle and
 runtime acceptance tests. No live provider, PostgreSQL contention or browser
-execution was exercised. Source/local protocol confidence is high; a claim of
+execution was exercised.
+
+The sheet review ran no tests. It used two read-only introspections with both
+source roots on `PYTHONPATH`, and `elspeth.__file__` resolved into this checkout.
+(1) `Draft202012Validator(canonical_set_pipeline_schema())`: the known-good
+single-source document gave no errors. Omitting both sources and supplying both
+each gave only `oneOf` at `['oneOf']`, and `source: null` gave `type`.
+(2) `planner_tool_definitions(dialect=…)`: 23 names on both dialects, ending
+`handoff_to_user`, `restore_parked_graph`, `emit_pipeline_proposal`. The terminal
+carries `strict: False` on `openai_strict` and no `strict` key on `none`. Neither
+`set_pipeline` nor `request_interpretation_review` is in the discovery set.
+N2's fatal outcome and N4's blob-retention question are source traces only.
+Source/local protocol confidence is high; a claim of
 full end-to-end readiness would be unsupported. Unifying lifecycle receipts has
 high integrity/compatibility risk if authored identity, required controls,
 fencing or review evidence is weakened; proceed by bounded contract slices.
