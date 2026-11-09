@@ -263,6 +263,11 @@ class _ForkRowUnionAid(TypedDict):
     set_pipeline_exemplar: _SetPipelineProviderArguments
 
 
+class _GateRoutingAid(TypedDict):
+    rules: list[str]
+    set_pipeline_exemplar: _SetPipelineProviderArguments
+
+
 class _RulesAid(TypedDict):
     rules: list[str]
 
@@ -332,6 +337,7 @@ class _PlannerAuthoringAids(TypedDict, total=False):
     source_custody: _SourceCustodyAid
     fork_coalesce: _ForkCoalesceAid
     fork_row_union: _ForkRowUnionAid
+    gate_routing: _GateRoutingAid
     model_custody: _RulesAid
     llm_output_contract: _RulesAid
     llm_source_generation: _RulesAid
@@ -479,6 +485,19 @@ _FORK_COALESCE_RULES: Final[tuple[str, ...]] = (
 
 _FORK_EXEMPLAR_CONTENT: Final[str] = "ticket_id,body\nT-1001,Cannot log in since the update\nT-1002,Invoice totals look wrong\n"
 _ROW_UNION_EXEMPLAR_CONTENT: Final[str] = "case_id,variant_text\nC-1001,Control copy\nC-1002,Treatment copy\n"
+
+_GATE_ROUTING_EXEMPLAR_CONTENT: Final[str] = "parcel_id,weight_kg\nP-3001,4\nP-3002,31\n"
+
+# The commonest requested topology (one source, one conditional split, two
+# outputs) had no worked exemplar: the only gate the aids showed was the
+# condition 'True' fan-out, so a traced planner re-derived route labels, sink
+# schemas and source typing from scattered rules on every such request.
+_GATE_ROUTING_RULES: Final[tuple[str, ...]] = (
+    "A boolean condition (a comparison, and/or/not) routes on exactly the labels 'true' and 'false'. "
+    "Each route value is a sink_name or a downstream node's input connection.",
+    "Declare the compared field's type in the source schema so the source coerces it at ingestion; "
+    "an observed CSV cell is a string. Sinks never coerce: each sink declares the fields and types that arrive.",
+)
 
 _FORK_ROW_UNION_RULES: Final[tuple[str, ...]] = (
     "Use row_union for require_all N-to-N reconvergence: every fork branch contributes its original rows, "
@@ -2651,6 +2670,64 @@ def fork_row_union_exemplar_args(
     }
 
 
+def gate_routing_exemplar_args(
+    catalog: PolicyCatalogView,
+    *,
+    visible: Mapping[str, frozenset[str]] | None = None,
+) -> _SetPipelineExemplar | None:
+    """Complete ``set_pipeline`` args for one source split by a gate into two sinks."""
+    if visible is None:
+        visible = _visible_plugin_names(catalog, _plugin_summaries(catalog))
+    if "csv" not in visible["source"] or "json" not in visible["sink"]:
+        return None
+
+    fields = ["parcel_id: str", "weight_kg: int"]
+
+    def sink(sink_name: str) -> _ExemplarOutput:
+        return {
+            "sink_name": sink_name,
+            "plugin": "json",
+            "options": {
+                "path": f"outputs/{sink_name}_parcels.json",
+                "format": "json",
+                "schema": {"mode": "fixed", "fields": list(fields)},
+                "mode": "write",
+                "collision_policy": "auto_increment",
+            },
+            "on_write_failure": "discard",
+        }
+
+    return {
+        "source": {
+            "plugin": "csv",
+            "on_success": "parcels",
+            "options": {"schema": {"mode": "flexible", "fields": list(fields)}},
+            "on_validation_failure": "discard",
+            "inline_blob": {
+                "filename": "parcels.csv",
+                "mime_type": "text/csv",
+                "content": _GATE_ROUTING_EXEMPLAR_CONTENT,
+                "description": "Literal rows the user pasted into chat",
+            },
+        },
+        "nodes": [
+            {
+                "id": "route_by_weight",
+                "node_type": "gate",
+                "input": "parcels",
+                "condition": "row['weight_kg'] >= 20",
+                "routes": {"true": "freight", "false": "courier"},
+            },
+        ],
+        "edges": [],
+        "outputs": [sink("freight"), sink("courier")],
+        "metadata": {
+            "name": "Route parcels by weight",
+            "description": "Send parcels of 20 kg or more to the freight output and the rest to the courier output.",
+        },
+    }
+
+
 # Payload memo keyed by plugin-policy snapshot hash. Plugin classes are static
 # per process; visibility, profile aliases and control bindings are covered by
 # the snapshot. Model catalogs are discovered on demand and are not memoized
@@ -2716,6 +2793,12 @@ def _build_planner_authoring_aids(catalog: PolicyCatalogView) -> _PlannerAuthori
         aids["fork_row_union"] = {
             "rules": list(_FORK_ROW_UNION_RULES),
             "set_pipeline_exemplar": {"pipeline": fork_row_union},
+        }
+    gate_routing = gate_routing_exemplar_args(catalog, visible=visible)
+    if gate_routing is not None:
+        aids["gate_routing"] = {
+            "rules": list(_GATE_ROUTING_RULES),
+            "set_pipeline_exemplar": {"pipeline": gate_routing},
         }
     # Resolved before the llm aids because the on_error rule they carry is
     # control-mode conditional. ``_selected_control_profile`` returns None for

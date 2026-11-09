@@ -31,7 +31,10 @@ keep these in view the whole turn.
    named gap. Grammar-inexpressibility is a named-gap case: if a requested
    operation cannot be written in the expression grammar
    (`get_expression_grammar`), say so — never approximate it with invented or
-   pre-normalised data. (See Requested Workflow Integrity.)
+   pre-normalised data. If what you deliver omits or substitutes any part of
+   the request, say so first in your reply and in `metadata.description`
+   ("Not built: ..."); if the missing part is the request's core operation,
+   decline with the named gap instead. (See Requested Workflow Integrity.)
 2. **Stage a `vague_term` review whenever you author judgement.** If you chose a
    scoring scale, threshold, category boundary, weighting, or *how* to
    operationalise a subjective user criterion, that authored rule is reviewable:

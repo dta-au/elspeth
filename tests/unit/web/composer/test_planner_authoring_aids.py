@@ -930,6 +930,66 @@ class TestForkCoalesceExemplar:
         assert any(value < 6 for value in thresholds.values())
 
 
+class TestGateRoutingExemplar:
+    def test_exemplar_validates_and_routes_a_boolean_gate_to_two_declared_sinks(self, tmp_path: Path) -> None:
+        (tmp_path / "outputs").mkdir(exist_ok=True)
+        view, snapshot = _trained_view()
+        args = planner_authoring_aids.gate_routing_exemplar_args(view)
+        assert args is not None
+        content = args["source"]["inline_blob"]["content"]
+        context = _custody_context(tmp_path, content, view=view, snapshot=snapshot)
+
+        candidate = build_set_pipeline_candidate(args, _empty_state(), context)
+
+        rejection = None if candidate.acceptable else candidate.result.validation.errors[0].message
+        assert candidate.acceptable is True, f"gate routing exemplar rejected: {rejection}"
+        (gate,) = args["nodes"]
+        assert gate["node_type"] == "gate"
+        assert set(gate["routes"]) == {"true", "false"}
+        declared_sinks = {output["sink_name"] for output in args["outputs"]}
+        assert set(gate["routes"].values()) == declared_sinks
+        assert len(declared_sinks) == 2
+        # The compared field is typed at the source, and the storage binding is
+        # custody's: inline_blob sits beside options and no path is authored.
+        source = args["source"]
+        assert "weight_kg: int" in source["options"]["schema"]["fields"]
+        assert "path" not in source["options"]
+        assert "inline_blob" not in source["options"]
+        assert "interpretation_requirements" not in source["options"]
+        assert all(output["options"]["schema"]["mode"] == "fixed" for output in args["outputs"])
+
+    def test_a_non_boolean_label_pair_on_the_same_gate_is_rejected(self, tmp_path: Path) -> None:
+        """Negative control: the validator the exemplar passes does enforce the taught labels."""
+        (tmp_path / "outputs").mkdir(exist_ok=True)
+        view, snapshot = _trained_view()
+        args = planner_authoring_aids.gate_routing_exemplar_args(view)
+        assert args is not None
+        args["nodes"][0]["routes"] = {"heavy": "freight", "light": "courier"}
+        content = args["source"]["inline_blob"]["content"]
+        context = _custody_context(tmp_path, content, view=view, snapshot=snapshot)
+
+        candidate = build_set_pipeline_candidate(args, _empty_state(), context)
+
+        assert candidate.acceptable is False
+
+    def test_authoring_aids_publish_gate_routing_rules_and_exemplar(self) -> None:
+        view, _snapshot = _trained_view()
+        payload = build_planner_authoring_aids(view)
+
+        assert payload["gate_routing"]["set_pipeline_exemplar"] == {"pipeline": planner_authoring_aids.gate_routing_exemplar_args(view)}
+        rendered = " ".join(payload["gate_routing"]["rules"])
+        assert "'true' and 'false'" in rendered
+        assert "Sinks never coerce" in rendered
+
+    def test_exemplar_is_disjoint_from_the_threshold_acceptance_domain(self) -> None:
+        """The exemplar teaches the wiring, not the answer to a routing acceptance case."""
+        view, _snapshot = _trained_view()
+        rendered = json.dumps(planner_authoring_aids.gate_routing_exemplar_args(view)).lower()
+
+        for token in ("amount", "1000", "order", "approved", "high_value", "low_value"):
+            assert token not in rendered, f"acceptance-domain token {token!r} in gate routing exemplar"
+
+
 class TestForkRowUnionExemplar:
     def test_exemplar_validates_and_teaches_the_row_union_contract(self, tmp_path: Path) -> None:
         (tmp_path / "outputs").mkdir(exist_ok=True)
@@ -1868,11 +1928,13 @@ class TestAuthoringAidsPayload:
             source_custody_exemplar_args(view),
             fork_coalesce_exemplar_args(view),
             planner_authoring_aids.fork_row_union_exemplar_args(view),
+            planner_authoring_aids.gate_routing_exemplar_args(view),
         )
         prompt_exemplars = (
             payload["source_custody"]["set_pipeline_exemplar_inline_blob"],
             payload["fork_coalesce"]["set_pipeline_exemplar"],
             payload["fork_row_union"]["set_pipeline_exemplar"],
+            payload["gate_routing"]["set_pipeline_exemplar"],
         )
         provider_tool = next(
             tool for tool in composer_loop_tool_definitions(ToolContractDialect.NONE) if tool["function"]["name"] == "set_pipeline"
@@ -1881,7 +1943,7 @@ class TestAuthoringAidsPayload:
         validator = Draft202012Validator(provider_schema)
 
         assert all(exemplar is not None and "pipeline" not in exemplar for exemplar in semantic_exemplars)
-        assert len(prompt_exemplars) == len(semantic_exemplars) == 3
+        assert len(prompt_exemplars) == len(semantic_exemplars) == 4
         for prompt_args, semantic in zip(prompt_exemplars, semantic_exemplars, strict=True):
             assert prompt_args == {"pipeline": semantic}
             validator.validate(prompt_args)
