@@ -100,17 +100,25 @@ continues to expose only the public projection plus a recipient-safe file list
 
 - An expired link stops working for both inspect and import immediately, through
   the existing token verification.
-- Frozen bytes are reclaimed by the payload store's normal retention sweep.
-  Because storage is content-addressed, two shares of the same file share one
-  stored copy; a link never deletes "its" bytes directly.
-- **Constraint:** the retention that actually governs payload-store reaping must
-  be at least the maximum link lifetime, or a valid link can lose its files. The
-  server refuses to start when it is not. Note: `WebSettings.payload_store_retention_days`
-  is documented as informational only; the implementation plan must identify the
-  setting that drives the reaper and check that one. Defaults today: 90 days
-  retention, 30 days maximum lifetime.
+- **Known cost — storage growth (decided 2026-11-09).** Nothing in the web app
+  reclaims payload-store content: the only purge is the operator command
+  `elspeth purge`, which deletes payloads referenced by Landscape runs.
+  `WebSettings.payload_store_retention_days` drives nothing. Share snapshots
+  already accumulate; frozen files make that growth larger. Because storage is
+  content-addressed, two shares of the same file share one stored copy.
+  Reclamation is tracked in dta-au/elspeth#356. No startup retention check is
+  added: there is no setting that governs share content to check against.
+- **Edge case:** `elspeth purge` reclaiming a run whose payload has bytes
+  identical to a live share's frozen file deletes that file; import then returns
+  the handled 404. Also tracked in dta-au/elspeth#356.
+- **Re-minting keeps the chosen lifespan.** "Copy link again"
+  (`get_shareable_link`) currently re-mints with the global maximum; it must
+  instead reuse the original lifespan (`expires_at - created_at` from the
+  `mark_ready_for_review` row), so a 1-day link is not stretched to 30 days.
 - **Compatibility:** tokens minted before this release carry no import flag and
-  are treated as view-only. Existing snapshot blobs remain readable.
+  are treated as view-only. Existing snapshot blobs (the old 7-key shape) remain
+  readable as view-only; new snapshots use a 9-key shape adding `import_allowed`
+  and `files`.
 
 ### 2. Importing (Chris)
 
@@ -183,8 +191,8 @@ no migration pathway; a new column or event type would bump
 - **Tom's share:** the existing `mark_ready_for_review` completion-event row
   already records `payload_digest` and `expires_at`. `import_allowed` and the
   file manifest live inside the content-addressed snapshot, so the row's digest
-  binds them. Accepted gap: once payload retention reaps the snapshot, the row
-  still identifies what was shared but the manifest detail is gone.
+  binds them. Accepted gap: if the snapshot is ever reclaimed (dta-au/elspeth#356),
+  the row still identifies what was shared but the manifest detail is gone.
 - **Each import:** recorded on **Chris's** session as an `audit`-role session
   message (the mechanism the session fork uses for its blob plan) carrying the
   snapshot digest, Tom's user id, Tom's session and state ids, the file hashes,
@@ -201,10 +209,12 @@ so both non-negotiable composer invariants hold.
 
 ## Testing
 
-1. **Unit:** manifest construction (source and node bindings, nested and list
-   positions); token flag and expiry cap; retention-versus-lifetime startup
-   check; `node_blob_bindings` in the importer; quota pre-check; staged-publish
-   failure paths. Each test is watched failing before the implementation.
+1. **Unit:** manifest construction (source `blob_ref`, `blob_rows` source
+   `options.blobs[].blob_id`, and nested node markers); token flag and expiry
+   cap; re-mint preserving the chosen lifespan; old 7-key snapshots reading as
+   view-only; `node_blob_bindings` in the importer; quota pre-check;
+   staged-publish failure paths. Each test is watched failing before the
+   implementation.
 2. **Integration:** Tom shares a graph with a source file and a `reference_join`
    inline file; Chris imports; files arrive with identical hashes and every
    binding points at Chris's copy. Refusal paths: view-only, expired, tampered,
