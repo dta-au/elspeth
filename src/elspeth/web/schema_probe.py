@@ -19,10 +19,10 @@ from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.core.landscape.database import (
     LandscapeSchemaShape,
     SchemaCompatibilityError,
+    _create_landscape_tables,
     probe_schema_shape,
 )
 from elspeth.core.landscape.schema import SQLITE_SCHEMA_EPOCH
-from elspeth.core.landscape.schema import metadata as landscape_metadata
 from elspeth.core.landscape.schema import schema_identity_table as landscape_schema_identity_table
 from elspeth.core.schema_identity import insert_schema_identity
 from elspeth.web.sessions.models import metadata as session_metadata
@@ -348,7 +348,7 @@ def init_landscape_schema(engine: Engine) -> None:
         if state is SchemaState.CURRENT:
             return
         if state is SchemaState.MISSING:
-            landscape_metadata.create_all(bind=conn, checkfirst=True)
+            _create_landscape_tables(bind=conn, checkfirst=True)
             insert_schema_identity(
                 conn,
                 landscape_schema_identity_table,
