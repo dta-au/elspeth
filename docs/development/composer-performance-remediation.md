@@ -1058,6 +1058,14 @@ Record raw output, not summaries, in each fix's Evidence line.
   `tests/e2e/.harness-results/` that points Playwright at the pre-installed
   Chromium (`/opt/pw-browsers/chromium`). `NODE_TLS_REJECT_UNAUTHORIZED=0`
   and `STAGING_IGNORE_HTTPS=1` apply to the test process only.
+- Compose smoke run cost: ~$0.35–0.60 per run on the OpenRouter test models
+  (balance 12.44 → 11.44 over four runs; the first readings of ~$0.03 were
+  accounting lag). Batch 1 gate (fixes 14, 15, 11, 12 on top of 1, 10, 6,
+  7, 9): clean ledger, 3 provider / 3 planner calls in one run, 26.5 s
+  model time, zero violations. Keyless lint corpus after batch 1: 3,674
+  lines, 206 lines differ from the pre-batch corpus by line number only
+  (zero difference with line numbers normalised) — no findings added or
+  removed, no allowlist fingerprint drift. Architecture suite: see below.
 - The doctor warns `composer_turn_budget_underfunded`: 240 s funds ~16 turns
   against 34 configured. Left as supplied; revisit if runs time out.
 - Network: this session was moved onto a personal environment allowing
