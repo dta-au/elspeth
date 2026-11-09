@@ -47,7 +47,7 @@ from elspeth.contracts.enums import CreationModality, is_llm_authored_creation_m
 from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.session_operation import SessionOperationContext
-from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
+from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.web.blobs.protocol import (
     AllowedMimeType,
     BlobActiveRunError,
@@ -515,22 +515,6 @@ _BLOB_ID_UUID_ERROR = (
     "upload the source file, or use create_blob for inline content "
     "before calling this tool."
 )
-
-
-@observation_boundary(
-    tier=3,
-    source="LLM composer tool-call blob_id argument",
-    source_param="blob_id",
-    suppresses=("R5",),
-    invariant="returns a repairable error message for non-string or non-UUID blob_id and None for canonical input; never raises on blob_id",
-)
-def _blob_id_uuid_validation_error(blob_id: Any) -> str | None:
-    """Return a repairable boundary error when ``blob_id`` is not canonical."""
-    if not isinstance(blob_id, str):
-        return f"blob_id must be a UUID string, got {type(blob_id).__name__}."
-    if canonical_resource_uuid(blob_id) is None:
-        return _BLOB_ID_UUID_ERROR
-    return None
 
 
 def _sync_list_blobs(engine: Engine, session_id: str) -> list[BlobInventoryPayload]:
