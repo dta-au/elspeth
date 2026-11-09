@@ -1120,7 +1120,12 @@ Record raw output, not summaries, in each fix's Evidence line.
   model time, zero violations. Keyless lint corpus after batch 1: 3,674
   lines, 206 lines differ from the pre-batch corpus by line number only
   (zero difference with line numbers normalised) — no findings added or
-  removed, no allowlist fingerprint drift. Architecture suite: see below.
+  removed, no allowlist fingerprint drift. Architecture suite
+  (`tests/unit/architecture/ -n 3`): exit 0, 1,982 passed, 1 xfailed, 49.5
+  min. Caveat: the fix 3-T1 and 2C working trees (uncommitted) were edited
+  while the run was in progress, so this run is frozen evidence for the
+  batch 1 commits only, not for those two fixes; the batch 2 run covers
+  them.
 - The doctor warns `composer_turn_budget_underfunded`: 240 s funds ~16 turns
   against 34 configured. Left as supplied; revisit if runs time out.
 - Network: this session was moved onto a personal environment allowing
