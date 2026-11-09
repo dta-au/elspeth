@@ -184,6 +184,31 @@ def test_interpretation_requirement_guidance_uses_exact_public_shell() -> None:
     assert "`status` defaults to `pending`" not in interaction
 
 
+def test_invented_source_authorship_has_one_answer_across_skill_aids_and_schema_note() -> None:
+    # The server stages the invented_source row when it binds generated source
+    # rows (tools/sources.py::_options_with_source_blob_review, with
+    # replace_kind=INVENTED_SOURCE). The skill, the authoring aids and the tool
+    # schema note once gave three different answers on who authors that row.
+    from elspeth.web.composer import planner_authoring_aids as aids
+    from elspeth.web.composer.tools import _common
+
+    interaction = " ".join(load_skill("pipeline_composer").split())
+    assert "never author that row yourself on any surface" in interaction
+    assert "NEVER author this row on any surface" in interaction
+
+    rules = " ".join((*aids._SOURCE_CUSTODY_RULES, *aids._FORK_COALESCE_RULES, *aids._REVIEW_REGISTRY_RULES))
+    owned_kind_sentences = re.findall(r"planner-owned kinds[^.]*\.", rules)
+    assert len(owned_kind_sentences) == 2
+    assert all("invented_source" not in sentence for sentence in owned_kind_sentences)
+    assert rules.count("Never author invented_source: the server stages") == 2
+    assert "stage the invented_source interpretation review" not in rules
+
+    for note in (_common._INTERPRETATION_REVIEW_FOLLOWUP, _common._INTERPRETATION_REQUIREMENTS_OWNERSHIP_SCHEMA_NOTE):
+        assert "never author invented_source" in note
+        assert "the rows you author ride in the proposal" in note
+        assert "pending requirements" not in note
+
+
 def test_capability_coverage_is_exactly_derived_from_canonical_authorities() -> None:
     actual_fields = canonical_capability_fields(canonical_set_pipeline_schema())
 
