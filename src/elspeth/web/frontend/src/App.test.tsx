@@ -298,6 +298,7 @@ vi.mock("./api/shareableReviews", () => ({
   fetchSharedInspect: vi.fn().mockReturnValue(new Promise(() => {})),
   markReadyForReview: vi.fn(),
   fetchShareableLink: vi.fn(),
+  importSharedSnapshot: vi.fn(),
 }));
 
 // ── People directory API stub ────────────────────────────────────────────────
@@ -1646,6 +1647,51 @@ describe("App preferences bootstrap (Phase 1B)", () => {
 // short-circuit and renders Layout under a shared route would convert
 // every shared link into a full composer session for the reviewer — this
 // test pins the suppression so that regression is caught.
+describe("App shared-import provenance notice", () => {
+  const SID = "11111111-1111-4111-8111-111111111111";
+  function show(meta: Record<string, unknown> | null): void {
+    useSessionStore.setState({
+      activeSessionId: SID,
+      sessions: [{ id: SID, title: "Session 1" } as never],
+      compositionStateLoaded: true,
+      compositionState: { ...makeState(1), composer_meta: meta },
+    } as never);
+    window.history.replaceState(null, "", `#/${SID}`);
+  }
+
+  it("announces who shared an imported graph", async () => {
+    show({ shared_import: { shared_by_username: "alice" } });
+    render(<App />);
+    expect(
+      await screen.findByText("Imported from a link shared by alice."),
+    ).toBeInTheDocument();
+  });
+
+  it("renders the username as text, never markup", async () => {
+    show({ shared_import: { shared_by_username: "<b>mallory</b>" } });
+    const { container } = render(<App />);
+    expect(
+      await screen.findByText("Imported from a link shared by <b>mallory</b>."),
+    ).toBeInTheDocument();
+    expect(container.querySelector(".app-notice-center b")).toBeNull();
+  });
+
+  it.each([
+    ["no meta", null],
+    ["no shared_import", { other: 1 }],
+    ["shared_import not an object", { shared_import: "alice" }],
+    ["shared_import null", { shared_import: null }],
+    ["username missing", { shared_import: {} }],
+    ["username empty", { shared_import: { shared_by_username: "" } }],
+    ["username not a string", { shared_import: { shared_by_username: 7 } }],
+  ])("shows no notice for %s", async (_name, meta) => {
+    show(meta as Record<string, unknown> | null);
+    render(<App />);
+    await waitFor(() => expect(api.fetchSystemStatus).toHaveBeenCalled());
+    expect(screen.queryByText(/Imported from a link shared by/)).toBeNull();
+  });
+});
+
 describe("App shared-route Layout suppression (Phase 6B Task 8)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
