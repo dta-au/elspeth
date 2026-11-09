@@ -109,9 +109,13 @@ from elspeth.web.sessions._persist_payload import CommittedCheckpointWitness
 from elspeth.web.sessions.composer_operation_errors import project_composer_operation_error
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import (
+    blob_deletion_cleanups_table,
+    blob_replacement_cleanups_table,
     blobs_table,
     chat_messages_table,
     composition_states_table,
+    output_storage_reservations_table,
+    proposal_blob_effect_receipts_table,
     quota_provider_attempts_table,
     sessions_table,
     token_usage_ledger_table,
@@ -1053,6 +1057,25 @@ def _blob_content_for_test(engine: Any, blob_id: str) -> str | None:
     return Path(row.storage_path).read_text(encoding="utf-8")
 
 
+def _blob_mutation_resources_for_test(engine: Any, data_dir: Path) -> tuple[Any, ...]:
+    """Snapshot real blob authority, durable effects and exact stored bytes."""
+    with engine.connect() as connection:
+        rows = tuple(
+            tuple(connection.execute(select(table)))
+            for table in (
+                blobs_table,
+                blob_deletion_cleanups_table,
+                blob_replacement_cleanups_table,
+                proposal_blob_effect_receipts_table,
+                output_storage_reservations_table,
+            )
+        )
+    files = tuple(
+        sorted((str(path.relative_to(data_dir)), path.read_bytes()) for path in (data_dir / "blobs").rglob("*") if path.is_file())
+    )
+    return rows, files
+
+
 def test_effect_resolution_and_summaries_never_write_seeded_blob_storage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from elspeth.web.composer.redaction import SetPipelineArgumentsModel
 
@@ -1727,6 +1750,7 @@ class TestComposerSingleToolCall:
     async def test_explicit_approve_intercepts_update_blob_without_mutating_blob(
         self,
         tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """update_blob is a destructive blob-store mutation and must require approval."""
         engine, session_id = _session_engine_with_session()
@@ -1746,6 +1770,7 @@ class TestComposerSingleToolCall:
         )
         with engine.connect() as conn:
             blob_before = conn.execute(select(blobs_table).where(blobs_table.c.id == blob_id)).one()
+        resources_before = _blob_mutation_resources_for_test(engine, tmp_path)
         await sessions_service.update_composer_preferences(
             session_uuid,
             trust_mode="explicit_approve",
@@ -1776,10 +1801,24 @@ class TestComposerSingleToolCall:
         ) -> Any:
             return responses.pop(0)
 
-        await service._run_one_turn_for_test(
-            llm=_llm,
+        message = "Propose an update of the retained file."
+        message_id = _insert_user_message(engine, session_id, message)
+        source_path = tmp_path / "input.csv"
+        source_path.write_text("customer_id\n1\n")
+        state = replace(
+            _empty_state(),
+            sources={
+                "source": SourceSpec(plugin="csv", options={"path": str(source_path)}, on_success="rows", on_validation_failure="discard")
+            },
+        )
+        monkeypatch.setattr(service._provider_gateway, "_call_llm", _llm)
+        result = await service.compose(
+            message,
+            [],
+            state,
             session_id=session_id,
-            initial_state=_empty_state(),
+            user_id="test-user",
+            user_message_id=message_id,
         )
 
         proposals = await sessions_service.list_composition_proposals(session_uuid)
@@ -1787,9 +1826,18 @@ class TestComposerSingleToolCall:
         assert proposals[0].status == "pending"
         assert proposals[0].affects == ("blob_store",)
         assert proposals[0].summary.startswith("Overwrite session file")
+        assert proposals[0].user_message_id == UUID(message_id)
+        assert proposals[0].composer_model_identifier
+        assert proposals[0].composer_model_version
+        assert proposals[0].composer_provider
+        assert proposals[0].composer_skill_hash
+        assert proposals[0].tool_arguments_hash
+        assert result.state is state
+        assert [inv.tool_call_id for inv in result.tool_invocations] == ["call_update_blob"]
         with engine.connect() as conn:
             assert conn.execute(select(blobs_table).where(blobs_table.c.id == blob_id)).one() == blob_before
         assert _blob_content_for_test(engine, blob_id) == "original content"
+        assert _blob_mutation_resources_for_test(engine, tmp_path) == resources_before
 
     @pytest.mark.asyncio
     async def test_explicit_approve_intercepts_delete_blob_without_deleting_blob(

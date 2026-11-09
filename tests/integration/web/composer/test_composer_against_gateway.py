@@ -7,6 +7,11 @@ This is design acceptance criterion 8 and the criterion the whole
 other OpenAI-compatible provider call, and Composer's real compose loop must
 be able to drive a full turn against it.
 
+The successful local chat round trips use an explicit GPT-5.1 reasoning
+model. The shipped GPT-5.5 default selects LiteLLM's Responses bridge when
+hinted and this chat-only gateway refuses that route; the paired real HTTP
+control below pins this limitation without claiming default-model support.
+
 Harness: reuses the proven pattern from
 ``tests/integration/plugins/llm/test_gateway_provider_e2e.py`` -- a real
 ``uvicorn.Server`` on an ephemeral loopback port, hosting the real gateway
@@ -142,7 +147,10 @@ from elspeth.web.sessions.telemetry import build_sessions_telemetry  # noqa: E40
 _INBOUND_BEARER = "composer-gw-e2e-inbound-bearer-0123456789abcdef"  # secret-scan: allow-this-line
 _OAUTH_CLIENT_ID = "composer-gw-e2e-oauth-client"
 _OAUTH_CLIENT_SECRET = "composer-gw-e2e-oauth-client-secret-0123456789abcdef"  # secret-scan: allow-this-line
-_MODEL_ALIAS = "gpt-5.5"  # matches WebSettings.composer_model's default -- no override needed
+# This real gateway implements chat completions. GPT-5.4+ names plus the
+# mandatory effort hint select LiteLLM's Responses bridge instead; the local
+# unsupported-route control below preserves that distinction.
+_MODEL_ALIAS = "gpt-5.1"
 _SAMPLING_MODEL_ALIAS = "gpt-4.1"  # explicit model whose sampling contract admits temperature + seed
 _MODEL_TARGET = "composer-gw-e2e-target"
 _OAUTH_HOST = "oauth.composer-gw-e2e.mock"
@@ -320,6 +328,7 @@ def _settings(tmp_path: Path, *, endpoint_base_url: str, endpoint_api_key: str, 
         "shareable_link_signing_key": b"\x00" * 32,
         "composer_endpoint_base_url": endpoint_base_url,
         "composer_endpoint_api_key": endpoint_api_key,
+        "composer_model": _MODEL_ALIAS,
     }
     values.update(overrides)
     return WebSettings(**values)
@@ -1113,10 +1122,54 @@ async def test_gateway_rejects_tools_that_carry_function_strict(gateway_base_url
 
 
 @pytest.mark.asyncio
+async def test_default_responses_bridge_is_refused_by_chat_only_gateway(tmp_path: Path) -> None:
+    """The shipped GPT-5.5 name reaches a real unsupported local route."""
+    import litellm
+    from litellm.exceptions import NotFoundError
+
+    app = _build_gateway_app()
+    requests: list[tuple[str, dict[str, Any]]] = []
+
+    @app.middleware("http")
+    async def record_provider_request(request: Any, call_next: Any) -> Any:
+        if request.method == "POST":
+            requests.append((request.url.path, await request.json()))
+        return await call_next(request)
+
+    with _running_gateway_server(app) as base_url:
+        sessions = _build_sessions_service(tmp_path)
+        session_id = str(uuid4())
+        _insert_session_row(sessions, session_id)
+        service = _build_service(tmp_path, base_url, sessions, composer_model="gpt-5.5")
+        with pytest.raises(NotFoundError) as raised:
+            await _run_gateway_loop_turn(service, session_id=session_id, message="hello gateway")
+        reply = await litellm.acompletion(
+            model=_MODEL_ALIAS,
+            api_base=f"{base_url}/v1",
+            api_key=_INBOUND_BEARER,
+            messages=[{"role": "user", "content": "hello gateway"}],
+            reasoning_effort="low",
+            num_retries=0,
+            max_retries=0,
+        )
+        assert reply.choices[0].message.content == "MOCK:hello gateway"
+    assert raised.value.status_code == 404
+    assert len(requests) == 2
+    path, body = requests[0]
+    assert path == "/v1/responses"
+    assert body["model"] == "gpt-5.5"
+    assert body["reasoning"] == {"effort": "low"}
+    chat_path, chat_body = requests[1]
+    assert chat_path == "/v1/chat/completions"
+    assert chat_body["model"] == _MODEL_ALIAS
+    assert chat_body["reasoning_effort"] == "low"
+
+
+@pytest.mark.asyncio
 async def test_gateway_accepts_the_preferred_route_tool_list(gateway_base_url: str) -> None:
     """Characterization: under ``preferred`` the gateway route resolves to ``none`` and its list is accepted.
 
-    The route is the shipped default model with the gateway as its custom
+    The route is a chat-compatible reasoning model with the gateway as its custom
     endpoint (resolver row 8). Its list carries no ``strict`` key on any
     tool, and the gateway answers it.
     """

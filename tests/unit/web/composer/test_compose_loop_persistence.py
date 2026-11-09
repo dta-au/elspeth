@@ -19,6 +19,8 @@ from sqlalchemy import select, text, update
 
 from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus, ToolArgumentErrorCategory
 from elspeth.contracts.composer_interpretation import InterpretationChoice, InterpretationKind
+from elspeth.contracts.composer_llm_audit import ToolContractDialect
+from elspeth.contracts.composer_progress import ComposerProgressEvent
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.prompt_guard import PromptGuardContentPart, PromptGuardToolArgumentParts
@@ -37,6 +39,7 @@ from elspeth.web.composer.redaction import redact_tool_call_arguments, redact_to
 from elspeth.web.composer.service import ComposerServiceImpl, _ComposeLoopDiagnostics
 from elspeth.web.composer.state import CompositionState, NodeSpec, PipelineMetadata, ValidationSummary
 from elspeth.web.composer.tools._common import ToolResult
+from elspeth.web.composer.tools.wire_projection import encode_semantic_arguments
 from elspeth.web.composer.visible_tool_event import VisibleToolEvent
 from elspeth.web.coordination.contracts import SessionOperationContext, SessionOperationFence, SessionOperationKind
 from elspeth.web.credential_guard import CredentialMaterialRefused
@@ -182,6 +185,45 @@ def _record_real_tool_handlers(monkeypatch: pytest.MonkeyPatch) -> list[str]:
 
     monkeypatch.setattr(tool_batch_module, "execute_tool", _record)
     return handler_calls
+
+
+def _record_real_batch_progress(monkeypatch: pytest.MonkeyPatch) -> list[ComposerProgressEvent]:
+    """Observe actual producer events through the real emitter and a real sink."""
+    events: list[ComposerProgressEvent] = []
+    real_emit = tool_batch_module.emit_progress
+
+    async def capture(event: ComposerProgressEvent) -> None:
+        events.append(event)
+
+    async def record(sink: Any, event: ComposerProgressEvent) -> None:
+        await real_emit(capture, event)
+        await real_emit(sink, event)
+
+    monkeypatch.setattr(tool_batch_module, "emit_progress", record)
+    return events
+
+
+_REQUESTED_EDIT_PROGRESS = {
+    "phase": "using_tools",
+    "headline": "The model is updating the pipeline graph.",
+    "evidence": ["A pipeline-editing tool was requested."],
+    "likely_next": "ELSPETH will validate the result before saving it.",
+    "reason": None,
+}
+_STARTED_EDIT_PROGRESS = {
+    "phase": "using_tools",
+    "headline": "I'm updating the pipeline graph.",
+    "evidence": ["A pipeline-editing tool is running."],
+    "likely_next": "ELSPETH will validate the updated pipeline.",
+    "reason": None,
+}
+_VISIBLE_BLOCKER_PROGRESS = {
+    "phase": "using_tools",
+    "headline": "A composer tool reported a visible blocker.",
+    "evidence": ["The tool result was returned without exposing raw request values."],
+    "likely_next": "ELSPETH will ask the model to adjust the pipeline request.",
+    "reason": None,
+}
 
 
 @pytest.mark.asyncio
@@ -459,10 +501,17 @@ async def _capture_tool_batch_rejection(
     session_id: str,
     response: Any,
     current_state_id: str | None = None,
+    model_feedback: list[dict[str, Any]] | None = None,
 ) -> BaseException | None:
     responses = [response, _raw_text_response("Done.")]
 
     async def _raw_completion(**_kwargs: Any) -> Any:
+        if model_feedback is not None:
+            model_feedback.extend(
+                {"tool_call_id": message["tool_call_id"], "payload": json.loads(message["content"])}
+                for message in _kwargs["messages"]
+                if message["role"] == "tool"
+            )
         return responses.pop(0)
 
     try:
@@ -1303,7 +1352,7 @@ async def test_tool_batch_rejects_duplicate_ids_before_durable_proposal_creation
 
 @pytest.mark.parametrize("proposal_count", [10, 11])
 @pytest.mark.asyncio
-async def test_explicit_approval_batch_preflights_proposal_cap_before_creation(
+async def test_explicit_approval_batch_caps_after_first_ten_admitted_publications(
     composer_service_with_real_sessions: ComposerServiceImpl,
     result_session_id: str,
     monkeypatch: pytest.MonkeyPatch,
@@ -1313,15 +1362,7 @@ async def test_explicit_approval_batch_preflights_proposal_cap_before_creation(
     with sessions_service._engine.begin() as conn:  # type: ignore[attr-defined]
         conn.execute(update(sessions_table).where(sessions_table.c.id == result_session_id).values(trust_mode="explicit_approve"))
 
-    batch_progress_calls = 0
-    real_emit_progress = tool_batch_module.emit_progress
-
-    async def _record_batch_progress(*args: Any, **kwargs: Any) -> Any:
-        nonlocal batch_progress_calls
-        batch_progress_calls += 1
-        return await real_emit_progress(*args, **kwargs)
-
-    monkeypatch.setattr(tool_batch_module, "emit_progress", _record_batch_progress)
+    events = _record_real_batch_progress(monkeypatch)
     proposal_calls = 0
     real_create_proposal = sessions_service.create_composition_proposal
 
@@ -1347,18 +1388,25 @@ async def test_explicit_approval_batch_preflights_proposal_cap_before_creation(
     else:
         assert type(caught) is ComposerConvergenceError
         assert dict(caught.evidence) == {"observed": 11, "cap": 10, "cap_kind": "pending_proposals"}
-        expected_proposals = 0
+        assert [inv.tool_call_id for inv in caught.tool_invocations] == [f"call_proposal_{index}" for index in range(10)]
+        assert all(inv.version_before == inv.version_after == 1 for inv in caught.tool_invocations)
+        expected_proposals = 10
     with sessions_service._engine.connect() as conn:  # type: ignore[attr-defined]
         proposal_ids = conn.execute(
-            select(composition_proposals_table.c.id).where(composition_proposals_table.c.session_id == result_session_id)
+            select(composition_proposals_table.c.tool_call_id).where(composition_proposals_table.c.session_id == result_session_id)
         ).fetchall()
         proposal_event_ids = conn.execute(
             select(proposal_events_table.c.id).where(proposal_events_table.c.session_id == result_session_id)
         ).fetchall()
     assert len(proposal_ids) == expected_proposals
+    assert {row.tool_call_id for row in proposal_ids} == {f"call_proposal_{index}" for index in range(10)}
     assert len(proposal_event_ids) == expected_proposals
     assert proposal_calls == expected_proposals
-    assert (batch_progress_calls > 0) is (proposal_count == 10)
+    # This is request intent for the whole provider batch, not an applied
+    # change. Approval-only calls emit no started/completed event, including
+    # the denied eleventh candidate.
+    assert [event.model_dump(mode="json") for event in events] == [_REQUESTED_EDIT_PROGRESS]
+    assert await sessions_service.get_state_versions(UUID(result_session_id)) == []
 
     if proposal_count == 11:
         retry_caught = await _capture_tool_batch_rejection(
@@ -1366,33 +1414,40 @@ async def test_explicit_approval_batch_preflights_proposal_cap_before_creation(
             session_id=result_session_id,
             response=response,
         )
-        assert type(retry_caught) is ComposerConvergenceError
-        assert dict(retry_caught.evidence) == {"observed": 11, "cap": 10, "cap_kind": "pending_proposals"}
-        assert proposal_calls == 0
+        assert type(retry_caught) is AuditIntegrityError
+        assert "reuses a provider tool-call ID" in str(retry_caught)
+        assert proposal_calls == 10
+        assert [event.model_dump(mode="json") for event in events] == [_REQUESTED_EDIT_PROGRESS]
         with sessions_service._engine.connect() as conn:  # type: ignore[attr-defined]
             assert (
                 conn.execute(
-                    select(composition_proposals_table.c.id).where(composition_proposals_table.c.session_id == result_session_id)
+                    select(composition_proposals_table.c.tool_call_id).where(composition_proposals_table.c.session_id == result_session_id)
                 ).fetchall()
-                == []
+                == proposal_ids
             )
             assert (
                 conn.execute(select(proposal_events_table.c.id).where(proposal_events_table.c.session_id == result_session_id)).fetchall()
-                == []
+                == proposal_event_ids
             )
 
 
 @pytest.mark.asyncio
-async def test_proposal_attempt_cap_rejects_mixed_schema_and_semantic_invalid_calls_before_dispatch(
+async def test_proposal_cap_excludes_schema_errors_and_semantic_refusals(
     composer_service_with_real_sessions: ComposerServiceImpl,
     result_session_id: str,
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     sessions_service = composer_service_with_real_sessions._sessions_service  # type: ignore[attr-defined]
     with sessions_service._engine.begin() as conn:  # type: ignore[attr-defined]
         conn.execute(update(sessions_table).where(sessions_table.c.id == result_session_id).values(trust_mode="explicit_approve"))
 
     handler_calls = _record_real_tool_handlers(monkeypatch)
+    events = _record_real_batch_progress(monkeypatch)
+    source_path = tmp_path / "blobs" / result_session_id / "input.csv"
+    source_path.parent.mkdir(parents=True, exist_ok=True)
+    source_path.write_text("customer_id\n1\n")
+    model_feedback: list[dict[str, Any]] = []
     caught = await _capture_tool_batch_rejection(
         composer_service_with_real_sessions,
         session_id=result_session_id,
@@ -1402,30 +1457,71 @@ async def test_proposal_attempt_cap_rejects_mixed_schema_and_semantic_invalid_ca
             (
                 "call_semantic_invalid_attempt",
                 "set_pipeline",
-                {
-                    "source": None,
-                    "nodes": [],
-                    "edges": [],
-                    "outputs": [],
-                    "metadata": {"name": "semantically incomplete"},
-                },
+                encode_semantic_arguments(
+                    "set_pipeline",
+                    ToolContractDialect.NONE,
+                    {
+                        "source": {
+                            "plugin": "csv",
+                            "options": {"path": str(source_path), "schema": {"mode": "observed"}},
+                            "on_success": "rows",
+                            "on_validation_failure": "discard",
+                        },
+                        "nodes": [],
+                        "edges": [],
+                        "outputs": [],
+                        "metadata": {"name": "semantically incomplete"},
+                    },
+                ),
             ),
         ),
+        model_feedback=model_feedback,
     )
 
-    assert type(caught) is ComposerConvergenceError
-    assert dict(caught.evidence) == {"observed": 11, "cap": 10, "cap_kind": "pending_proposals"}
-    assert handler_calls == []
+    assert caught is None
+    # Schema validation fails before handler dispatch; only the nine admitted
+    # metadata handlers execute. The canonical refusal has its own builder.
+    assert handler_calls == ["set_metadata"] * 9
     with sessions_service._engine.connect() as conn:  # type: ignore[attr-defined]
-        assert (
+        assert set(
             conn.execute(
-                select(composition_proposals_table.c.id).where(composition_proposals_table.c.session_id == result_session_id)
-            ).fetchall()
-            == []
-        )
+                select(composition_proposals_table.c.tool_call_id).where(composition_proposals_table.c.session_id == result_session_id)
+            ).scalars()
+        ) == {f"call_valid_attempt_{index}" for index in range(9)}
         assert (
-            conn.execute(select(proposal_events_table.c.id).where(proposal_events_table.c.session_id == result_session_id)).fetchall() == []
+            len(conn.execute(select(proposal_events_table.c.id).where(proposal_events_table.c.session_id == result_session_id)).all()) == 9
         )
+        feedback = conn.execute(
+            select(chat_messages_table.c.tool_call_id, chat_messages_table.c.content)
+            .where(chat_messages_table.c.session_id == result_session_id)
+            .where(chat_messages_table.c.role == "tool")
+            .order_by(chat_messages_table.c.sequence_no)
+        ).all()
+    assert [row.tool_call_id for row in feedback] == [
+        *(f"call_valid_attempt_{index}" for index in range(9)),
+        "call_schema_invalid_attempt",
+        "call_semantic_invalid_attempt",
+    ]
+    assert json.loads(feedback[-2].content)["error_class"] == "ToolArgumentError"
+    assert json.loads(feedback[-2].content)["error_category"] == "missing_required_path"
+    assert [item["tool_call_id"] for item in model_feedback] == [row.tool_call_id for row in feedback]
+    refusal = model_feedback[-1]["payload"]
+    assert refusal["success"] is True
+    assert refusal["data"]["status"] == "PREVALIDATION_REJECTED"
+    assert refusal["data"]["applied"] is False
+    assert refusal["version"] == 1
+    assert refusal["affected_nodes"] == []
+    stored_refusal = json.loads(feedback[-1].content)
+    assert stored_refusal["success"] is True
+    assert stored_refusal["version"] == 1
+    assert stored_refusal["affected_nodes"] == []
+    assert stored_refusal["validation"]["is_valid"] is False
+    assert [event.model_dump(mode="json") for event in events] == [
+        _REQUESTED_EDIT_PROGRESS,
+        _STARTED_EDIT_PROGRESS,
+        _VISIBLE_BLOCKER_PROGRESS,
+    ]
+    assert await sessions_service.get_state_versions(UUID(result_session_id)) == []
 
 
 @pytest.mark.asyncio
@@ -1469,35 +1565,105 @@ async def test_proposal_attempt_cap_excludes_discovery_and_immediate_create_blob
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("blob_case", ("invalid-at-cap", "admitted-tenth", "admitted-eleventh"))
 async def test_proposal_attempt_cap_includes_approval_required_blob_only_mutation(
     composer_service_with_real_sessions: ComposerServiceImpl,
     result_session_id: str,
+    tmp_path: Path,
+    blob_case: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from elspeth.web.blobs.service import BlobServiceImpl
+    from tests.helpers.session_fences import fenced_operation_context
+    from tests.unit.web.composer.test_service import _blob_mutation_resources_for_test
+
     sessions_service = composer_service_with_real_sessions._sessions_service  # type: ignore[attr-defined]
+    monkeypatch.setattr(composer_service_with_real_sessions, "_session_engine", sessions_service._engine)
     with sessions_service._engine.begin() as conn:  # type: ignore[attr-defined]
         conn.execute(update(sessions_table).where(sessions_table.c.id == result_session_id).values(trust_mode="explicit_approve"))
+
+    arguments: dict[str, Any] = {}
+    if blob_case != "invalid-at-cap":
+        with fenced_operation_context(sessions_service._engine, result_session_id, operation_kind=SessionOperationKind.CREATE) as context:
+            blob = await BlobServiceImpl(sessions_service._engine, tmp_path).create_blob(
+                UUID(result_session_id), "retained.txt", b"must remain untouched", "text/plain", session_operation_context=context
+            )
+        arguments = {"blob_id": str(blob.id)}
+    resources_before = _blob_mutation_resources_for_test(sessions_service._engine, tmp_path)
+    events = _record_real_batch_progress(monkeypatch)
+    change_count = 9 if blob_case == "admitted-tenth" else 10
+    model_feedback: list[dict[str, Any]] = []
 
     caught = await _capture_tool_batch_rejection(
         composer_service_with_real_sessions,
         session_id=result_session_id,
         response=_tool_batch_response(
-            *((f"call_blob_boundary_proposal_{index}", "set_metadata", {"patch": {"name": f"proposal {index}"}}) for index in range(10)),
-            ("call_approval_required_blob_only", "delete_blob", {}),
+            *(
+                (f"call_blob_boundary_proposal_{index}", "set_metadata", {"patch": {"name": f"proposal {index}"}})
+                for index in range(change_count)
+            ),
+            ("call_approval_required_blob_only", "delete_blob", arguments),
         ),
+        model_feedback=model_feedback,
     )
 
-    assert type(caught) is ComposerConvergenceError
-    assert dict(caught.evidence) == {"observed": 11, "cap": 10, "cap_kind": "pending_proposals"}
+    expected_ids = {f"call_blob_boundary_proposal_{index}" for index in range(change_count)}
+    if blob_case == "admitted-eleventh":
+        assert type(caught) is ComposerConvergenceError
+        assert dict(caught.evidence) == {"observed": 11, "cap": 10, "cap_kind": "pending_proposals"}
+        assert [inv.tool_call_id for inv in caught.tool_invocations] == [f"call_blob_boundary_proposal_{index}" for index in range(10)]
+        assert all(inv.version_before == inv.version_after == 1 for inv in caught.tool_invocations)
+    else:
+        assert caught is None
+        if blob_case == "admitted-tenth":
+            expected_ids.add("call_approval_required_blob_only")
     with sessions_service._engine.connect() as conn:  # type: ignore[attr-defined]
         assert (
-            conn.execute(
-                select(composition_proposals_table.c.id).where(composition_proposals_table.c.session_id == result_session_id)
-            ).fetchall()
-            == []
+            set(
+                conn.execute(
+                    select(composition_proposals_table.c.tool_call_id).where(composition_proposals_table.c.session_id == result_session_id)
+                ).scalars()
+            )
+            == expected_ids
         )
         assert (
-            conn.execute(select(proposal_events_table.c.id).where(proposal_events_table.c.session_id == result_session_id)).fetchall() == []
+            len(conn.execute(select(proposal_events_table.c.id).where(proposal_events_table.c.session_id == result_session_id)).all()) == 10
         )
+        blob_feedback = conn.execute(
+            select(chat_messages_table.c.content).where(
+                chat_messages_table.c.session_id == result_session_id,
+                chat_messages_table.c.role == "tool",
+                chat_messages_table.c.tool_call_id == "call_approval_required_blob_only",
+            )
+        ).all()
+    if blob_case == "admitted-eleventh":
+        assert blob_feedback == []
+    else:
+        assert len(blob_feedback) == 1
+        payload = json.loads(blob_feedback[0].content)
+        if blob_case == "invalid-at-cap":
+            assert payload["error_class"] == "ToolArgumentError"
+            assert payload["error_category"] == "missing_required_path"
+            assert model_feedback[-1]["tool_call_id"] == "call_approval_required_blob_only"
+            assert model_feedback[-1]["payload"] == {"error": "Tool 'delete_blob' missing required argument(s): blob_id"}
+        else:
+            assert payload["success"] is True
+            assert payload["version"] == 1
+            assert payload["affected_nodes"] == []
+            assert payload["_unknown_response"] == "<redacted-unknown-response-key>"
+            proposals = await sessions_service.list_composition_proposals(UUID(result_session_id))
+            deletion = next(proposal for proposal in proposals if proposal.tool_call_id == "call_approval_required_blob_only")
+            assert deletion.tool_name == "delete_blob"
+            assert deletion.status == "pending"
+            assert model_feedback[-1]["tool_call_id"] == "call_approval_required_blob_only"
+            approval = model_feedback[-1]["payload"]
+            assert approval["success"] is True
+            assert approval["data"]["status"] == "APPROVAL_REQUIRED"
+            assert approval["data"]["proposal_id"] == str(deletion.id)
+            assert approval["data"]["tool_name"] == "delete_blob"
+    assert await sessions_service.get_state_versions(UUID(result_session_id)) == []
+    assert _blob_mutation_resources_for_test(sessions_service._engine, tmp_path) == resources_before
+    assert [event.model_dump(mode="json") for event in events] == [_REQUESTED_EDIT_PROGRESS]
 
 
 @pytest.mark.parametrize(
