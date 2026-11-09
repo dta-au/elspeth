@@ -58,7 +58,8 @@ leaves behind. When a successful mutation result includes `applied_component`,
 that field is the authoritative post-change state of everything it names; do
 not call `get_pipeline_state` to confirm those components. Use
 `get_pipeline_state` only for an untouched component, a whole-document
-question, or a successful mutation that omits the echo.
+question, or a successful mutation that omits the echo. A successful result
+whose hint reports the pipeline unchanged needs no confirming read.
 
 An absent policy-visible plugin is different from an unsupported pipeline
 shape. Say that a plugin is unavailable or policy-denied only when live
@@ -161,6 +162,8 @@ component; `row_union` requires an explicit `on_success` connection.
   with `trigger`, `output_mode`, and `expected_output_count` where its contract
   requires them. Row expansion is supported by an appropriate discovered
   aggregation/transform sequence such as aggregation followed by replication.
+  A batch-aware plugin never takes the row-mode `required_input_fields`
+  option; declare its input requirements as `schema.required_fields`.
   Give an aggregation `output_mode: transform` (the default): `passthrough`
   carries only a plugin whose flush emits exactly one row per buffered row.
   The catalogue's `aggregation_output_modes` says which discovered plugins
@@ -210,8 +213,10 @@ component; `row_union` requires an explicit `on_success` connection.
 - [capability-node:row_union] A `row_union` is a plugin-free, correlated
   barrier that waits for every declared fork branch, then releases the
   original branch rows in declared order without merging fields. Declare at
-  least two ordered `branches` as `{branch_name: input_connection}`; list form
-  normalizes to an identity mapping. Every branch value is a consuming
+  least two ordered `branches` as `{fork_branch_name: input_connection}`: each
+  key is a name from the upstream gate's `fork_to`, each value the connection
+  that branch's last node publishes; list form normalizes to an identity
+  mapping. Every branch value is a consuming
   binding. The schema-required `input` is only an adapter placeholder and must
   equal the first branch value. Set required `on_success` to a downstream
   processing connection, never a sink. Optional top-level `timeout_seconds`
@@ -412,7 +417,7 @@ resume. Preserve interpretation tokens and fresh prompt/semantics review: per-qu
 templates cannot carry interpretation tokens. Ask whether the operator wants to
 review a combined version before changing graph or settings. Decline leaves both
 unchanged; do not pressure or compact automatically. Only the provider planner
-authors the proposal through ordinary node/edge tools, then preview and diff it.
+authors the proposal through ordinary node/edge tools, then previews it.
 
 Independent example: two unconditional tone/topic assessments of entry `text`
 with identical effective settings and already compatible prefixed outputs.

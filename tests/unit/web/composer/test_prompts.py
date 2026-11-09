@@ -1530,6 +1530,54 @@ class TestReplyRegisterRule:
         assert "no tool-argument keys, validation fields, or enum values in prose" in checklist
 
 
+class TestSkillFollowsCurrentToolBehaviour:
+    """Skill sentences that had drifted from what the tools now do."""
+
+    def test_approval_required_is_not_reported_as_validated(self) -> None:
+        # tool_batch.py builds the APPROVAL_REQUIRED result with the unchanged
+        # state and that state's validation; proposals.py refuses a proposal
+        # whose base_state_id is no longer current.
+        flattened = " ".join(SYSTEM_PROMPT.split())
+
+        assert "describes the unchanged saved graph, not the proposed change" in flattened
+        assert "never report the proposal as validated" in flattened
+        assert "make the whole requested change in ONE mutation call" in flattened
+
+    def test_unchanged_result_and_hints_are_taught_as_the_server_sends_them(self) -> None:
+        # tool_batch._unapplied_admission appends a server-authored hint to a
+        # no-op result, so hints are not only plugin-authored.
+        from elspeth.web.composer import tool_batch
+
+        flattened = " ".join(SYSTEM_PROMPT.split())
+
+        assert "`post_call_hints` are plugin-authored next steps" not in flattened
+        assert "advisory next-step notes from the plugin or the server" in flattened
+        assert "saying the pipeline is unchanged and no proposal was submitted" in flattened
+        assert "The pipeline is unchanged; no proposal was submitted for approval." in Path(tool_batch.__file__).read_text()
+
+    def test_edit_table_does_not_send_an_edgeless_pipeline_to_splice(self) -> None:
+        flattened = " ".join(SYSTEM_PROMPT.split())
+
+        assert "it refuses a pipeline whose `edges` is empty" in flattened
+        assert "use `upsert_node` for the new node and re-point the successor's `input`" in flattened
+
+    def test_preview_and_diff_limits_are_stated(self) -> None:
+        flattened = " ".join(SYSTEM_PROMPT.split())
+
+        assert "`preview_pipeline` reports structure and contract verdicts, never row data" in flattened
+        assert "never tell the user that earlier versions do not exist" in flattened
+        assert "then preview and diff it" not in flattened
+
+    def test_stale_claims_stay_removed(self) -> None:
+        flattened = " ".join(SYSTEM_PROMPT.split())
+
+        assert "Landscape/run-analysis tools" not in flattened
+        assert "Recipes accelerate common builds" not in flattened
+        assert "Every authoring surface receives these exact bytes" not in flattened
+        assert "each key is a name from the upstream gate's `fork_to`" in flattened
+        assert "declare its input requirements as `schema.required_fields`" in flattened
+
+
 class TestMutationEchoOperatingContract:
     """The high-salience freeform contract prevents post-success reread loops."""
 
