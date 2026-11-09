@@ -894,7 +894,28 @@ the executable graph still validates the changed representation.
 add a walk-count assertion with identity check and a negative control where
 lowering changes the graph and a third walk is still performed.
 
-**Evidence.** _(fill in)_
+**Evidence (landed).** Simpler than planned: walk 2 (the provisional
+`new_state.validate()` inside `_mutation_result`, `tools/_common.py`) was
+never read — `normalize_tool_result_validation` returns an envelope unchanged
+only when its `_validation_snapshot_hash` matches, and otherwise discards the
+provisional validation and re-validates through the request-scoped profile
+authority. `_mutation_result` now takes `catalog=`; the `set_pipeline`
+candidate builder (`tools/sessions.py`) passes `context.catalog`, so the
+envelope is built from the authority's validation and stamped with its
+snapshot hash, and normalization returns it as-is. Policy lowering still
+validates its own executable representation. Full walks per build **3 → 2**
+at 1/10/40 nodes (probes unchanged 2/11/41); one walk = 1.5 / 4.7 / 11.9 ms
+saved. Byte identity vs HEAD on 9 fixtures (7 trained-operator, 1
+profile-lowered, 1 final-reject): `composition_content_hash`, validation
+payload and `to_dict()` identical. 15 new tests; against HEAD source 8 fail
+(`3 == 2`, same object id on the last two walks); a lowering mutant turns the
+lowering control red. Scoped composer suite 13090 passed; the 12 failures
+were fix 14's then-uncommitted tests importing names not yet present. ruff,
+mypy, `check_contracts` clean. Per the batch ruling, architecture and lint
+corpus deferred to the batch gate. **Interaction:** once fix 14 makes
+reconcile return the input object on no change, walk 1 validates the same
+object as the authority walk and the identity assertion in the walk-count
+test will need relaxing — handle when 14 lands.
 
 ---
 

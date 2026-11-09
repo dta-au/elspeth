@@ -1717,6 +1717,7 @@ def _mutation_result(
     data: Any = None,
     post_call_hints: tuple[str, ...] = (),
     full_replacement: bool = False,
+    catalog: PolicyCatalogView | None = None,
 ) -> ToolResult:
     """Build a ToolResult for a successful mutation.
 
@@ -1736,8 +1737,26 @@ def _mutation_result(
     is affected, so the echo would be the whole-state read it exists to
     replace, and the model already holds those bytes verbatim in the call it
     just made.
+
+    ``catalog`` is for a caller that normalizes the result through
+    :func:`normalize_tool_result_validation` immediately (the set_pipeline
+    candidate builder). Without it the envelope carries the provisional
+    ``new_state.validate()``, which normalization unconditionally discards and
+    replaces with the request-scoped profile authority's result — a whole-graph
+    walk whose output no one reads. With it the envelope is built from that
+    authority directly and stamped with its snapshot hash, so normalization
+    returns it unchanged: one authoritative walk instead of a discarded
+    provisional walk plus the authoritative one. Policy lowering is unaffected:
+    the authority still validates its own executable representation.
+    Equivalent to normalizing the provisional envelope because a successful
+    mutation's validation never carries ``rejected_mutation`` entries.
     """
-    validation = new_state.validate()
+    validation_snapshot_hash: str | None = None
+    if catalog is None:
+        validation = new_state.validate()
+    else:
+        validation = catalog.validate_composition_state(new_state).validation
+        validation_snapshot_hash = catalog.snapshot.snapshot_hash
     return ToolResult(
         success=True,
         updated_state=new_state,
@@ -1747,6 +1766,7 @@ def _mutation_result(
         data=data,
         post_call_hints=post_call_hints,
         applied_component=None if full_replacement else _applied_component_echo(new_state, affected),
+        _validation_snapshot_hash=validation_snapshot_hash,
     )
 
 
