@@ -74,6 +74,12 @@ let previousWasPendingReview = false;
 let unsubscribeExecution: (() => void) | null = null;
 
 const lastValidatedVersionBySession = new Map<string, number>();
+// Versions whose verdict came from a /validate POST that LANDED (applied, not
+// superseded). Narrower than lastValidatedVersionBySession, which also holds
+// versions whose verdict was carried forward from content-equal predecessors
+// without a POST. Only this map proves a POST observed the server state as it
+// stands after a mutation that minted the version.
+const lastPostedValidateVersionBySession = new Map<string, number>();
 interface ValidateTarget {
   sessionId: string;
   version: number;
@@ -221,6 +227,7 @@ function resetPerUserState(): void {
   previousWasPendingReview = false;
   previousSessionIds = new Set();
   lastValidatedVersionBySession.clear();
+  lastPostedValidateVersionBySession.clear();
   pendingValidateTarget = null;
   // Pre-run disclosure opt-outs are per user: the ack map survives
   // executionStore.reset() (session switches) by design, so the identity
@@ -317,6 +324,7 @@ export function initStoreSubscriptions(): void {
       if (!currentIds.has(prevId)) {
         useAuditReadinessStore.getState().clearSession(prevId);
         lastValidatedVersionBySession.delete(prevId);
+        lastPostedValidateVersionBySession.delete(prevId);
       }
     }
     previousSessionIds = currentIds;
@@ -550,6 +558,10 @@ async function fireValidateLoop(): Promise<void> {
           .validate(target.sessionId, { expectedVersion: target.version });
         if (validationApplied !== false) {
           lastValidatedVersionBySession.set(target.sessionId, target.version);
+          lastPostedValidateVersionBySession.set(
+            target.sessionId,
+            target.version,
+          );
         }
       } finally {
         inflightValidateTarget = null;
@@ -606,7 +618,8 @@ function enqueueForcedValidate(sessionId: string, version: number): void {
  * has that version in flight. A request for a version the resolve itself
  * minted can only have been issued after the resolve committed, so its
  * verdict already reflects the resolved review — forcing a repeat is the
- * duplicate POST this path exists to avoid. When it is NOT in flight (the
+ * duplicate POST this path exists to avoid (likewise once such a POST has
+ * landed; see mintedVersionAlreadyValidated). When it is NOT in flight (the
  * subscriber carried a content-equal verdict forward, or it is merely
  * pending behind another version) the forced entry still queues it, so the
  * Run gate is re-checked against the post-resolve server state.
@@ -622,14 +635,52 @@ function requestValidateAfterResolve({
   mintedVersion,
 }: ResolveValidateRequest): void {
   if (!forcedValidateAllowed()) return;
+  if (mintedVersion && mintedVersionAlreadyValidated(sessionId, version)) {
+    return;
+  }
+  enqueueForcedValidate(sessionId, version);
+}
+
+/**
+ * True when a /validate POST for a version minted by a committed server
+ * mutation (resolve accept/amend, YAML import) is in flight or has landed.
+ * Such a POST can only have been issued after the mutation committed, so its
+ * verdict already reflects it; forcing another is a duplicate. A verdict that
+ * was merely CARRIED to this version (content-equal predecessor, no POST) is
+ * not covered — it predates the mutation.
+ */
+function mintedVersionAlreadyValidated(
+  sessionId: string,
+  version: number,
+): boolean {
   if (
-    mintedVersion &&
     inflightValidateTarget !== null &&
     inflightValidateTarget.sessionId === sessionId &&
     inflightValidateTarget.version === version
   ) {
-    return;
+    return true;
   }
+  return lastPostedValidateVersionBySession.get(sessionId) === version;
+}
+
+/**
+ * Post-import validate request (ImportYamlModal). Call once the import's
+ * session refetch (selectSession) has published the imported head. The
+ * import minted that version server-side, so this is the minted-version
+ * entry: a POST the auto-validate subscriber already has in flight (or has
+ * landed) for it covers the import; otherwise — the import's content equals
+ * the previous head's and the subscriber carried that verdict forward — it
+ * is queued forced so the post-import banner reflects the server's verdict.
+ * Same guards as requestValidate. A no-op when the user has moved to another
+ * session or the refetch published no composition.
+ */
+export function requestValidateAfterImport(sessionId: string): void {
+  const sessionState = useSessionStore.getState();
+  if (sessionState.activeSessionId !== sessionId) return;
+  const version = sessionState.compositionState?.version ?? null;
+  if (version === null) return;
+  if (!forcedValidateAllowed()) return;
+  if (mintedVersionAlreadyValidated(sessionId, version)) return;
   enqueueForcedValidate(sessionId, version);
 }
 
@@ -658,6 +709,7 @@ export function _resetSubscriptionsForTesting(): void {
   previousWasPendingReview = false;
   previousSessionIds = new Set();
   lastValidatedVersionBySession.clear();
+  lastPostedValidateVersionBySession.clear();
   pendingValidateTarget = null;
   validateInflight = false;
   inflightValidateTarget = null;

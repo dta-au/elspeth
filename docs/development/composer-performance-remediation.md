@@ -334,13 +334,41 @@ same coordinator. Tests affected:
 `test/inlineSourceIntegration.test.tsx:151-160, 374-385, 525`,
 `stores/auditReadinessStore.test.ts:73-222, 499-630`.
 
-**Deferred (2C).** A short-lived backend memo on `ExecutionService` keyed by
-`(state_id, user_id, binding_generation_fingerprint)` would collapse the
-readiness recompute. Only pursue if profiling after 2A/2B still shows the
-duplicate; `tests/unit/web/audit_readiness/test_service.py:766-787` pins
-`validate_state.assert_awaited_once`.
+**Evidence (2B, partial — frontend landed; readiness skip STOPPED).**
+Option (ii) is not implementable client-side without degrading the product:
+`/validate` returns no readiness rows, and the always-visible Checks badge
+needs the five non-validation rows (`plugin_trust`, `provenance`,
+`retention`, `llm_interpretations`, `secrets`) for the current version.
+Skipping the ambient GET (emulated in a measurement test) left the badge on
+"Checking" until the user acted, and would have required rewriting the
+ambient-badge contract pinned at `ArtifactWorkspace.test.tsx:1657`. The
+agent stopped as briefed. Readiness GET counts are therefore unchanged
+(version advance 1 POST + 1 GET; Retry 0 + 1; content-only bump 0 + 0;
+session switch 1 + 1, new session only). What did land: `ImportYamlModal`
+no longer calls `validate()` directly — `requestValidateAfterImport` queues
+it after `selectSession` publishes the imported version (import **2 → 1
+POST**; an import whose head fails to load now issues no validate and the
+load error is what the user sees); `subscriptions.ts` tracks
+`lastPostedValidateVersionBySession` (versions a queue POST actually landed
+for, separate from carried verdicts) and `mintedVersionAlreadyValidated`
+skips a server-minted version when a POST for it is in flight **or has
+landed** — needed for import, where the subscriber's POST can land before
+`selectSession` settles; a no-op for 2A's resolve, which now shares the
+helper. Scoped vitest 476 passed; eslint, `tsc` exit 0; full `vitest run`
+4,431 passed (one test pinning the old direct import call was updated).
 
-**Evidence.** _(fill in)_
+**2C — backend memo (promoted from deferred, 2026-11-09).** The only route
+that removes the duplicate server-side `validate_state` without degrading
+the badge: a short-lived, bounded memo inside `ExecutionService.validate_state`
+keyed on `(state_id, user_id, binding_generation_fingerprint)` plus the
+policy inputs it consumes, so `/audit-readiness`'s `compute_snapshot` reuses
+the result `/validate` just computed for the same state. Kept inside
+`validate_state` so `compute_snapshot` still awaits it and
+`tests/unit/web/audit_readiness/test_service.py:766-787`
+(`validate_state.assert_awaited_once`) stays valid. Invalidate on any input
+the key names; never cross users.
+
+**Evidence (2C).** _(fill in)_
 
 Lane notes: `.claude/lanes/perf-eval/02-validation.md`.
 

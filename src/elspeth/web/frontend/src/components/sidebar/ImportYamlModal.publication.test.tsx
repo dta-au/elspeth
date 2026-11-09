@@ -3,6 +3,7 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { ImportYamlModal } from "./ImportYamlModal";
 import { useSessionStore } from "@/stores/sessionStore";
 import { useExecutionStore } from "@/stores/executionStore";
+import { _resetSubscriptionsForTesting } from "@/stores/subscriptions";
 import { advanceAuthGeneration } from "@/api/authSession";
 import { compositionStateAuthorityFields } from "@/test/composerFixtures";
 vi.mock("@/api/client", () => ({ importCompositionYaml: vi.fn(), listBlobs: vi.fn(), uploadBlob: vi.fn(), getPluginSchema: vi.fn() }));
@@ -11,7 +12,7 @@ const sid = "11111111-1111-4111-8111-111111111111", other = "22222222-2222-4222-
 const select = vi.fn(), validate = vi.fn();
 const result = { ...compositionStateAuthorityFields, id: other, session_id: sid, version: 2, sources: {}, nodes: [], edges: [], outputs: [], metadata: { name: null, description: null } };
 const yaml = "sources:\n  source:\n    plugin: csv\n    on_success: result\nsinks:\n  result:\n    plugin: json\n    on_write_failure: fail\n";
-beforeEach(() => { vi.resetAllMocks(); useSessionStore.getState().reset(); useSessionStore.setState({ activeSessionId: sid, compositionState: null, compositionStateLoaded: true, selectSession: select }); useExecutionStore.setState({ validate }); vi.mocked(api.listBlobs).mockResolvedValue([]); });
+beforeEach(() => { vi.resetAllMocks(); _resetSubscriptionsForTesting(); useSessionStore.getState().reset(); useSessionStore.setState({ activeSessionId: sid, compositionState: null, compositionStateLoaded: true, selectSession: select }); useExecutionStore.setState({ validate }); vi.mocked(api.listBlobs).mockResolvedValue([]); });
 afterEach(cleanup);
 async function submit(): Promise<void> {
   render(<ImportYamlModal onClose={vi.fn()} />);
@@ -22,7 +23,14 @@ async function submit(): Promise<void> {
 }
 it("same-session import refreshes its current session and validation", async () => {
   vi.mocked(api.importCompositionYaml).mockResolvedValue(result);
-  await submit(); expect(select).toHaveBeenCalledWith(sid); expect(validate).toHaveBeenCalledWith(sid);
+  // The refetch publishes the imported head; validation then runs through the
+  // auto-validation queue for that version, not as a direct validate() call.
+  const head = { ...result, sources: { source: { plugin: "csv", options: {} } } };
+  select.mockImplementation(async () => { useSessionStore.setState({ compositionState: head as never }); });
+  validate.mockResolvedValue(true);
+  await submit(); expect(select).toHaveBeenCalledWith(sid);
+  await waitFor(() => expect(validate).toHaveBeenCalledWith(sid, { expectedVersion: 2 }));
+  expect(validate).toHaveBeenCalledTimes(1);
 });
 it.each(["session", "auth"])("a held import cannot publish or reselect after %s ownership changes", async (change) => {
   let release!: (value: typeof result) => void;
