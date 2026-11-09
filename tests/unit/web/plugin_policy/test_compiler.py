@@ -26,6 +26,7 @@ from elspeth.web.plugin_policy.profiles import RuntimeWebPluginConfig
 def _settings(**overrides: object) -> WebSettings:
     values: dict[str, object] = {
         "composer_max_composition_turns": 4,
+        "composer_context_max_prompt_tokens": 200_000,
         "composer_max_discovery_turns": 4,
         # 8 configured turns need >= 120s at the 15s/turn planning floor, or the
         # composer_turn_budget_underfunded disclosure fires and breaks this
