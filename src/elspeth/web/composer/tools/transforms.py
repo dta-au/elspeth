@@ -629,6 +629,9 @@ def _execute_upsert_queue_node(
         expected_output_count=validated.expected_output_count,
         timeout_seconds=validated.timeout_seconds,
         description=validated.description,
+        scope_name=validated.scope_name,
+        scope_opener=validated.scope_opener,
+        scope_policy=validated.scope_policy,
     )
     contract_error = queue_node_contract_error(node)
     if contract_error is not None:

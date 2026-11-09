@@ -13,6 +13,7 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy import func, select
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 from tests.unit.web.composer.test_planner_authoring_aids import _empty_state, _guardrail_profile_view
+from tests.unit.web.composer.test_queue_scope_admission import QUEUE, SCOPE, complete_queue, private_snapshot, scope_message
 from tests.unit.web.composer.test_required_control_autowire import _bare_llm_candidate
 from tests.unit.web.sessions.routes.composer.test_proposal_accept_preflight_failure import _set_pipeline_arguments
 from tests.unit.web.sessions.test_blob_proposal_accept import _save_composition_state
@@ -62,6 +63,76 @@ def _proposal(
             tool_arguments_hash=stable_hash(arguments),
         )
     )
+
+
+@pytest.mark.parametrize("override", [*({key: value} for key, value in SCOPE.items()), SCOPE, {"scope_policy": []}])
+def test_legacy_queue_scope_replay_terminalizes_without_changing_private_composition(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    override: dict[str, Any],
+) -> None:
+    app, service = _make_app(tmp_path)
+    client = TestClient(app)
+    session_id = UUID(client.post("/api/sessions", json={"title": "Queue replay"}).json()["id"])
+    _, built, _ = complete_queue(tmp_path, session_id=str(session_id))
+    data = built.to_dict()
+    saved = asyncio.run(
+        _save_composition_state(
+            service,
+            session_id,
+            CompositionStateData(
+                sources=data["sources"], nodes=data["nodes"], edges=data["edges"], outputs=data["outputs"], metadata_=data["metadata"]
+            ),
+            provenance="session_seed",
+        )
+    )
+    before = private_snapshot(state_from_record(saved))
+    proposal = _proposal(service, session_id, "upsert_node", {**QUEUE, "description": "Do not apply", **override}, saved.id)
+    real_dispatch = routes.execute_tool
+    results = []
+    attempts = []
+
+    def observe(*args: Any, **kwargs: Any) -> Any:
+        attempts.append(True)
+        result = real_dispatch(*args, **kwargs)
+        results.append(result)
+        return result
+
+    monkeypatch.setattr(routes, "execute_tool", observe)
+    endpoint = f"/api/sessions/{session_id}/proposals/{proposal.id}/accept"
+    response = client.post(endpoint)
+    assert response.status_code == 422, response.text
+    malformed = override == {"scope_policy": []}
+    assert response.json()["detail"]["error_type"] == "proposal_validation_failed"
+    assert len(attempts) == 1
+    if not malformed:
+        (result,) = results
+        assert not result.success and result.affected_nodes == () and result.applied_component is None
+        error = result.validation.errors[0]
+        assert (error.component, error.error_code, error.rejected_component) == (
+            "rejected_mutation",
+            "queue_config_invalid",
+            "node:inbound",
+        )
+        assert error.message == scope_message(override)
+        assert private_snapshot(result.updated_state) == before
+    else:
+        assert len(results) == 1 and not results[0].success
+        assert results[0].validation.errors[0].error_code != "queue_config_invalid"
+        assert private_snapshot(results[0].updated_state) == before
+    current = asyncio.run(service.get_current_state(session_id))
+    assert current is not None and current.id == saved.id
+    assert private_snapshot(state_from_record(current)) == before
+    with service._engine.connect() as conn:
+        assert conn.execute(select(func.count()).select_from(composition_states_table)).scalar_one() == 1
+    assert (
+        asyncio.run(service.get_authoritative_composition_proposal(session_id=session_id, proposal_id=proposal.id)).row.status == "rejected"
+    )
+    events = [event for event in asyncio.run(service.list_proposal_events(session_id)) if event.proposal_id == proposal.id]
+    assert [event.event_type for event in events] == ["proposal.created", "proposal.rejected"]
+    assert client.post(endpoint).status_code == 409
+    assert len(attempts) == 1
+    assert [event for event in asyncio.run(service.list_proposal_events(session_id)) if event.proposal_id == proposal.id] == events
 
 
 @pytest.mark.parametrize(
