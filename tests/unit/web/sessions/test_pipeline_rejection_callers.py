@@ -456,6 +456,226 @@ async def test_actual_planner_creation_cancel_retains_nonzero_child_rejection_sc
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "required,trust_modes,cancel_creation,fault",
+    [
+        (required, modes, cancel, "pending")
+        for required in (False, True)
+        for modes in (
+            ("explicit_approve", "explicit_approve"),
+            ("auto_commit", "auto_commit"),
+            ("auto_commit", "explicit_approve"),
+            ("explicit_approve", "auto_commit"),
+        )
+        for cancel in (False, True)
+    ]
+    + [
+        (required, ("auto_commit", "auto_commit"), False, fault)
+        for required in (False, True)
+        for fault in ("missing", "error", "corrupt", "ValueError", "SQL", "group", "telemetry")
+    ],
+)
+async def test_actual_planner_resource_race_retains_receipts_and_original_cancellation(
+    operation_store, tmp_path, monkeypatch, required, trust_modes, cancel_creation, fault
+):
+    from dataclasses import replace
+
+    from sqlalchemy import delete, update
+
+    from elspeth.web.blobs.service import BlobServiceImpl
+    from elspeth.web.composer.pipeline_proposal import PipelineProposal
+    from elspeth.web.sessions.models import blobs_table, composition_states_table, sessions_table
+    from tests.integration.web.composer.test_freeform_proposal_prevalidation import _harness, _valid_pipeline_args
+    from tests.unit.web.composer.test_audit_cohort_settlement import _chat_rows, _discovery_invocation, _invocation_occurrences
+
+    engine, repository, _authority, service, sid = operation_store
+    expected, running = await prepared_rejection(operation_store)
+    planner = _harness(tmp_path / "planner").service._planning_application
+    planner._sessions_service_optional = service
+    prior_occurrences = _invocation_occurrences(_chat_rows(service, str(sid)))
+    assert prior_occurrences == {expected.authority.row.tool_call_id: 1}
+    blob = await BlobServiceImpl(engine, tmp_path).create_blob(
+        sid, "input.csv", b"value\n1\n", "text/csv", session_operation_context=running.session_operation_context
+    )
+    pipeline = _valid_pipeline_args(tmp_path)
+    pipeline["source"]["blob_id"] = str(blob.id)
+    proposal = PipelineProposal.create(pipeline=pipeline, base=expected.authority.proposal.base, repair_count=0, skill_hash="a" * 64)
+    plan = PipelinePlanResult(
+        proposal=proposal,
+        tool_call_id="raced-planner",
+        custody_result="not_required",
+        model_identifier="model",
+        model_version="version",
+        provider="test",
+    )
+    # The same authority passed admission; the resource changes only afterward.
+    from elspeth.web.sessions.proposal_blob_refs import validate_proposal_blob_references
+
+    with engine.begin() as conn:
+        validate_proposal_blob_references(conn, session_id=str(sid), tool_name="set_pipeline", arguments=pipeline)
+        if fault == "missing":
+            conn.execute(delete(blobs_table).where(blobs_table.c.id == str(blob.id)))
+        elif fault in {"pending", "error", "corrupt"}:
+            if fault == "corrupt":
+                conn.exec_driver_sql("PRAGMA ignore_check_constraints=ON")
+            conn.execute(
+                update(blobs_table).where(blobs_table.c.id == str(blob.id)).values(status="unknown" if fault == "corrupt" else fault)
+            )
+            if fault == "corrupt":
+                conn.exec_driver_sql("PRAGMA ignore_check_constraints=OFF")
+        conn.execute(update(sessions_table).where(sessions_table.c.id == str(sid)).values(trust_mode=trust_modes[1]))
+    preferences = replace(await service.get_composer_preferences(sid), trust_mode=trust_modes[0])
+    parent = RequiredWorkCoordinator(
+        RequiredWorkAuthority(
+            RequiredAuthorityKind.DURABLE_COMPOSE, running.session_operation_context, running.claim.operation_id, running.claim.attempt
+        )
+    )
+    binding = RequiredWorkBinding(parent, 7, 12, RequiredWorkRole.TURN, running) if required else None
+    entered, release = threading.Event(), threading.Event()
+    deliveries = []
+    actual_shield = asyncio.shield
+    injected = {
+        "ValueError": ValueError("private parser detail"),
+        "SQL": OperationalError("private SQL detail", {}, RuntimeError("driver detail")),
+        "group": ExceptionGroup("private grouped failures", [ValueError("parser"), RuntimeError("other")]),
+        "telemetry": RuntimeError("post-SQL telemetry detail"),
+    }
+    if fault == "telemetry":
+        from elspeth.web.sessions import service as service_module
+
+        class FailedCounter:
+            def add(self, amount, attributes):
+                raise injected["telemetry"]
+
+        monkeypatch.setattr(service_module, "_PIPELINE_PLANNER_COUNTER", FailedCounter())
+
+    async def observe_shield(awaitable):
+        try:
+            return await actual_shield(awaitable)
+        except asyncio.CancelledError as delivery:
+            deliveries.append(delivery)
+            raise
+
+    from elspeth.web import async_workers
+
+    actual_retain = async_workers._retain_cancellation
+
+    def observe_retain(cancellations, cancellation):
+        deliveries.append(cancellation)
+        actual_retain(cancellations, cancellation)
+
+    def park_validator(_conn, _cursor, statement, _parameters, _context, _many):
+        if statement.startswith("SELECT blobs.session_id, blobs.status"):
+            entered.set()
+            assert release.wait(5)
+            if fault in {"ValueError", "SQL", "group"}:
+                raise injected[fault]
+
+    monkeypatch.setattr(asyncio, "shield", observe_shield)
+    monkeypatch.setattr(async_workers, "_retain_cancellation", observe_retain)
+    event.listen(engine, "before_cursor_execute", park_validator)
+    state = _initial_composition_state()
+    planner_invocation = _discovery_invocation("completed-planner-evidence")
+    task = asyncio.create_task(
+        planner._stage_pipeline_plan(
+            plan=plan,
+            state=state,
+            session_id=sid,
+            current_state_id=None,
+            user_message_id=expected.authority.row.user_message_id,
+            user_id="alice",
+            session_operation_context=running.session_operation_context,
+            preferences=preferences,
+            recorder=BufferingRecorder(),
+            planner_llm_calls=(),
+            planner_private_candidates=(),
+            planner_attempts=(),
+            planner_invocations=(planner_invocation,),
+            planner_withheld_replies=(),
+            required_work=binding,
+        )
+    )
+    try:
+        async with asyncio.timeout(5):
+            while not entered.is_set():
+                if task.done():
+                    await task
+                await asyncio.sleep(0.01)
+        if cancel_creation:
+            task.cancel("original failed creation cancellation")
+            async with asyncio.timeout(5):
+                while not deliveries:
+                    await asyncio.sleep(0)
+            assert not task.done()
+        release.set()
+        if cancel_creation:
+            with pytest.raises(BaseException) as caught:
+                await task
+            leaves = originals(caught.value)
+            assert any(leaf is deliveries[0] for leaf in leaves)
+            if not required:
+                assert caught.value is deliveries[0]
+                assert type(caught.value.__cause__).__name__ == "ProposalResourceUnavailableError"
+        elif fault in {"corrupt", "ValueError", "SQL", "group", "telemetry"}:
+            with pytest.raises(BaseException) as caught:
+                await task
+            if fault == "corrupt":
+                assert type(caught.value) is AuditIntegrityError
+            elif fault == "group":
+                assert originals(caught.value) == originals(injected[fault])
+            elif fault == "telemetry" and required:
+                assert any(leaf is injected[fault] for leaf in originals(caught.value))
+            else:
+                assert caught.value is injected[fault]
+        else:
+            result = await task
+            assert result.state is state
+            assert result.raw_assistant_content == ""
+            assert result.pipeline_commit_intent is None and result.runtime_preflight is None
+            assert result.tool_invocations == () and result.llm_calls == ()
+            assert "no longer available" in result.message
+            assert str(blob.id) not in result.message
+        if required:
+            parent.assert_completed()
+            sql = next(ticket for ticket in parent.tickets if ticket.key.source is RequiredWorkSource.PROPOSAL_CREATION_SQL)
+            projection = next(ticket for ticket in parent.tickets if ticket.key.source is RequiredWorkSource.PROPOSAL_CREATION_PROJECTION)
+            assert sql.complete and projection.complete
+            if fault == "telemetry":
+                assert sql.errors == ()
+                assert any(
+                    any(leaf is injected[fault] for leaf in originals(receipt.original_root)) for receipt in parent.failure_receipts()
+                )
+            else:
+                assert len(sql.errors) == 1
+                if fault in {"pending", "missing", "error"}:
+                    assert type(sql.errors[0]).__name__ == "ProposalResourceUnavailableError"
+                elif fault != "corrupt":
+                    assert sql.errors[0] is injected[fault]
+                assert any(receipt.original_root is sql.errors[0] for receipt in parent.failure_receipts())
+            assert not parent._child_registrations
+            if cancel_creation:
+                assert any(leaf is sql.errors[0] for leaf in originals(caught.value))
+        with engine.connect() as conn:
+            assert len(
+                conn.execute(
+                    select(composition_proposals_table.c.id).where(composition_proposals_table.c.tool_call_id == plan.tool_call_id)
+                ).all()
+            ) == int(fault == "telemetry")
+            assert conn.execute(select(composition_states_table.c.id)).all() == []
+            assert len(
+                conn.execute(
+                    select(proposal_events_table.c.id).where(proposal_events_table.c.proposal_id != str(expected.authority.row.id))
+                ).all()
+            ) == int(fault == "telemetry")
+        assert _invocation_occurrences(_chat_rows(service, str(sid))) == {**prior_occurrences, planner_invocation.tool_call_id: 1}
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+        event.remove(engine, "before_cursor_execute", park_validator)
+        repository.release(running.session_operation_context)
+
+
+@pytest.mark.asyncio
 async def test_mounted_manual_body_sql_and_close_failures_retain_originals_and_reduce_priority(operation_store, tmp_path, monkeypatch):
     engine, repository, _authority, _service, sid = operation_store
     expected, running = await prepared_rejection(operation_store)

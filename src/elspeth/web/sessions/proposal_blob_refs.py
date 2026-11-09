@@ -9,7 +9,7 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.engine import Connection
 
-from elspeth.contracts.blobs import BLOB_REF_PATH_PREFIX
+from elspeth.contracts.blobs import BLOB_REF_PATH_PREFIX, BLOB_STATUSES
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer.pipeline_proposal import is_owned_composition_state_authority
 from elspeth.web.sessions.models import blobs_table, composition_proposals_table
@@ -25,6 +25,15 @@ _TOP_LEVEL_BLOB_TOOLS = frozenset(
 _BLOB_REFERENCE_TOOLS = _TOP_LEVEL_BLOB_TOOLS | {"set_pipeline", "set_source_from_blobs"}
 
 _BLOB_SENTINEL_OPTION_KEYS = frozenset({"path", "file"})
+
+PROPOSAL_RESOURCE_UNAVAILABLE_MESSAGE = (
+    "I couldn't prepare this proposal because a referenced file is no longer available for this session. "
+    "Please choose the file again and retry."
+)
+
+
+class ProposalResourceUnavailableError(Exception):
+    """A queried proposal resource is missing, foreign, or known not ready."""
 
 
 def _canonical_sentinel_blob_id(value: str, *, position: str) -> str:
@@ -173,11 +182,13 @@ def validate_proposal_blob_references(
     for blob_id in proposal_blob_reference_ids(tool_name, arguments):
         row = conn.execute(select(blobs_table.c.session_id, blobs_table.c.status).where(blobs_table.c.id == blob_id)).first()
         if row is None:
-            raise ValueError(f"Proposal references blob {blob_id!r}, but that blob does not exist")
+            raise ProposalResourceUnavailableError(PROPOSAL_RESOURCE_UNAVAILABLE_MESSAGE)
         if row.session_id != session_id:
-            raise ValueError(f"Proposal references blob {blob_id!r}, but it is not owned by this session")
+            raise ProposalResourceUnavailableError(PROPOSAL_RESOURCE_UNAVAILABLE_MESSAGE)
+        if type(row.status) is not str or row.status not in BLOB_STATUSES:
+            raise AuditIntegrityError("Tier 1: owned proposal blob has invalid persisted status")
         if row.status != "ready":
-            raise ValueError(f"Proposal references blob {blob_id!r}, but its status is {row.status!r}, not 'ready'")
+            raise ProposalResourceUnavailableError(PROPOSAL_RESOURCE_UNAVAILABLE_MESSAGE)
 
 
 def pending_proposal_reference_id(

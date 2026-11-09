@@ -2347,3 +2347,135 @@ async def test_auto_commit_set_pipeline_uses_candidate_builder_once(tmp_path: Pa
     assert builder.call_count == 1
     assert result.state.version == state.version + 1
     assert await harness.sessions.list_composition_proposals(UUID(harness.session_id)) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("publisher", ["canonical", "ordinary", "promoted"])
+@pytest.mark.parametrize("repair_batch", ["later", "same"])
+async def test_publication_resource_race_refuses_once_then_allows_valid_repair(tmp_path: Path, publisher: str, repair_batch: str) -> None:
+    from sqlalchemy import update
+
+    from tests.helpers.session_fences import fenced_operation_context
+
+    harness = _harness(tmp_path)
+    state = _incremental_base_state(tmp_path)
+    if publisher == "canonical":
+        tool_name, arguments = "set_pipeline", _inline_pipeline_args(tmp_path)
+    elif publisher == "ordinary":
+        with fenced_operation_context(harness.engine, harness.session_id, operation_kind=SessionOperationKind.CREATE) as operation:
+            blob = await BlobServiceImpl(harness.engine, tmp_path).create_blob(
+                UUID(harness.session_id), "retained.txt", b"original", "text/plain", session_operation_context=operation
+            )
+        tool_name, arguments = "delete_blob", {"blob_id": str(blob.id)}
+    else:
+        from tests.integration.web.composer.test_freeform_required_controls import _incremental_textract_state, _required_textract_policy
+
+        view, snapshot = _required_textract_policy(tmp_path)
+        state, output = await _incremental_textract_state(tmp_path, harness=harness, view=view, snapshot=snapshot)
+        completed = real_execute_tool(
+            "set_output",
+            output,
+            state,
+            view,
+            plugin_snapshot=snapshot,
+            data_dir=str(tmp_path),
+            session_engine=harness.engine,
+            session_id=harness.session_id,
+            user_id="proposal-prevalidation-user",
+            validate_arguments=True,
+            require_data_dir_for_paths=True,
+            raise_schema_argument_errors=True,
+        )
+        assert completed.success and completed.validation.is_valid
+        state = completed.updated_state
+        tool_name, arguments = "set_metadata", {"patch": {}}
+
+    api = harness.sessions.create_composition_proposal if publisher == "ordinary" else harness.sessions.create_pipeline_composition_proposal
+    calls = []
+
+    async def change_resource_then_create(**kwargs: Any) -> Any:
+        calls.append(kwargs)
+        with harness.engine.begin() as conn:
+            assert conn.execute(select(func.count()).select_from(blobs_table)).scalar_one() > 0
+            conn.execute(update(blobs_table).values(status="pending" if len(calls) == 1 else "ready"))
+        return await api(**kwargs)
+
+    repair_count = 10 if repair_batch == "same" else 1
+    repair_calls = tuple(
+        {"id": f"call_repaired_{index}", "name": "set_metadata", "arguments": {"patch": {"name": f"repair-{index}"}}}
+        for index in range(repair_count)
+    )
+    repair_ids = tuple(call["id"] for call in repair_calls)
+    if repair_batch == "same":
+        # The refusal and all ten admitted proposals must share one counter.
+        responses = (_fake_llm_response(tool_calls=({"id": "call_raced", "name": tool_name, "arguments": arguments}, *repair_calls)),)
+    else:
+        responses = (_tool_turn("call_raced", tool_name, arguments), _fake_llm_response(tool_calls=repair_calls))
+    llm = _ScriptedLLM(*responses, _fake_llm_response(content="The repair awaits approval."))
+    dispatches = []
+    dispatch = harness.service._dispatch_tool_batch
+
+    async def record_dispatch(**kwargs: Any) -> Any:
+        dispatched = await dispatch(**kwargs)
+        dispatches.append(dispatched[0])
+        return dispatched
+
+    with (
+        patch.object(harness.service._provider_gateway, "_call_llm", new=llm),
+        patch.object(
+            harness.sessions,
+            "create_composition_proposal" if publisher == "ordinary" else "create_pipeline_composition_proposal",
+            new=change_resource_then_create,
+        ),
+        patch.object(harness.service, "_dispatch_tool_batch", new=record_dispatch),
+        patch("elspeth.web.composer.tool_batch.execute_tool", wraps=real_execute_tool) as handlers,
+    ):
+        if publisher == "promoted":
+            with patch.object(harness.service._policy_context, "build", return_value=(snapshot, view)):
+                result = await harness.service.compose(
+                    "Prepare this change.",
+                    [],
+                    state,
+                    session_id=harness.session_id,
+                    user_id="proposal-prevalidation-user",
+                    user_message_id=harness.user_message_id,
+                )
+        else:
+            result = await harness.service.compose(
+                "Prepare this change.",
+                [],
+                state,
+                session_id=harness.session_id,
+                user_id="proposal-prevalidation-user",
+                user_message_id=harness.user_message_id,
+            )
+    assert len(calls) == (1 if publisher == "canonical" else 1 + repair_count)
+    assert [call.args[0] for call in handlers.call_args_list] == ["set_metadata"] * (repair_count + int(publisher == "promoted"))
+    assert [len(dispatched.tool_outcomes) for dispatched in dispatches] == ([11] if repair_batch == "same" else [1, 1])
+    assert dispatches[0].mutation_success_observed is False
+    feedback = [message for message in llm.message_snapshots[1] if message.get("tool_call_id") == "call_raced"]
+    assert len(feedback) == 1
+    payload = json.loads(feedback[0]["content"])
+    assert payload["success"] is False
+    assert payload["validation"]["errors"][0]["error_code"] == "proposal_resource_unavailable"
+    persisted = _persisted_tool_content(harness, "call_raced")
+    assert json.loads(persisted)["validation"]["errors"][0]["error_code"] == "proposal_resource_unavailable"
+    assert payload["version"] == state.version
+    assert payload["affected_nodes"] == []
+    assert "validation_delta" not in payload
+    assert [inv.tool_call_id for inv in result.tool_invocations] == ["call_raced", *repair_ids]
+    assert len(result.tool_invocations) == 1 + repair_count
+    with harness.engine.connect() as conn:
+        persisted_invocation_ids = (
+            conn.execute(select(chat_messages_table.c.tool_call_id).where(chat_messages_table.c.role == "tool")).scalars().all()
+        )
+    assert len(persisted_invocation_ids) == 1 + repair_count
+    assert set(persisted_invocation_ids) == {"call_raced", *repair_ids}
+    assert result.tool_invocations[0].status is ComposerToolStatus.SUCCESS
+    assert len([outcome for dispatched in dispatches for outcome in dispatched.tool_outcomes if outcome.call.id == "call_raced"]) == 1
+    proposals = await harness.sessions.list_composition_proposals(UUID(harness.session_id))
+    assert len(proposals) == repair_count
+    assert {proposal.tool_call_id for proposal in proposals} == set(repair_ids)
+    assert _count_rows(harness.engine, proposal_events_table) == repair_count
+    assert _count_rows(harness.engine, composition_states_table) == 0
+    assert result.state is state
