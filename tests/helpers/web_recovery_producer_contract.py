@@ -2,6 +2,14 @@
 
 This helper proves a source transition and returns its exact AST identities.
 Physical watchdog/event/member suppliers remain common-certificate premises.
+
+Exactly two registration sites are admitted, each by name and whole body:
+``create_app`` (the Web owner, which supplies the retained cells) and the
+``configure_standalone_executor_recovery`` wrapper, whose pinned first
+statement refuses any process that already has a recovery owner, a shared
+executor or a generation custodian, so it cannot replace a Web registration.
+That wrapper has exactly one caller, the standalone MCP serving root. Any
+other call, alias or escape of either callable fails the contract.
 """
 
 import ast
@@ -10,6 +18,8 @@ WORKER = "elspeth.web.async_workers"
 APP = "elspeth.web.app"
 OWNER = "elspeth.web.application_finalizers.ApplicationFinalizerOwner"
 RECOVERY = "elspeth.web.process_recovery.ProcessRecovery"
+STANDALONE = "elspeth.composer_mcp.standalone"
+STANDALONE_REGISTRATION = WORKER + ".configure_standalone_executor_recovery"
 CELLS = {"_APPLICATION_FINALIZER_OWNER", "_INSTANCE_DRAINING"}
 PROTECTED_MODULES = {WORKER, APP, "elspeth.web.application_finalizers", "elspeth.web.process_recovery", "threading"}
 PROTECTED_BINDINGS = {
@@ -19,6 +29,8 @@ PROTECTED_BINDINGS = {
     "threading.Event",
     "threading.Lock",
     APP + ".configure_required_executor_recovery",
+    STANDALONE_REGISTRATION,
+    STANDALONE + ".configure_standalone_executor_recovery",
     APP + ".ApplicationFinalizerOwner",
     APP + ".ProcessRecovery",
     APP + ".threading",
@@ -50,6 +62,24 @@ def configure_required_executor_recovery(
     _INSTANCE_DRAINING = instance_draining
     _GENERATION_UNAVAILABLE = generation_unavailable
     _CAPTURED_DRAIN_SECONDS = drain_seconds
+"""
+
+# The unowned-process guard is the whole reason a second site is admissible:
+# with it, this path can only ever be the first registration in a process.
+STANDALONE_CONFIGURE = """
+def configure_standalone_executor_recovery(
+    *, drain_seconds: float, instance_draining: threading.Event,
+    generation_unavailable: threading.Event,
+    recovery_callback: Callable[[RequiredGenerationDrainExpired], None],
+) -> None:
+    if _RECOVERY_CALLBACK is not None or _SHARED_EXECUTOR is not None or _GENERATION_CUSTODIAN is not None:
+        raise RequiredGenerationUnavailable("Standalone executor requires an unowned process")
+    configure_required_executor_recovery(
+        drain_seconds=drain_seconds,
+        instance_draining=instance_draining,
+        generation_unavailable=generation_unavailable,
+        recovery_callback=recovery_callback,
+    )
 """
 
 OWNER_CONSTRUCTOR = """
@@ -353,11 +383,12 @@ def _module(unit):
     return module.removesuffix(".__init__")
 
 
-def _namespace_effects(units, configured_function):
+def _namespace_effects(units, configured_function, standalone_function=None):
     """Narrow source-visible namespace mutations; not a universal effect proof."""
     failures = []
     references = {}
     configure_calls = []
+    standalone_calls = []
     for unit in units:
         module = _module(unit)
         if module is None:
@@ -377,7 +408,7 @@ def _namespace_effects(units, configured_function):
                 original = module + "." + name
                 if original not in PROTECTED_BINDINGS:
                     continue
-                canonical = node is configured_function
+                canonical = node is configured_function or (standalone_function is not None and node is standalone_function)
                 canonical |= (
                     scope is unit.tree and isinstance(node, ast.ClassDef) and original in {OWNER, RECOVERY} and node in unit.tree.body
                 )
@@ -394,6 +425,7 @@ def _namespace_effects(units, configured_function):
                         APP + ".ApplicationFinalizerOwner": OWNER,
                         APP + ".ProcessRecovery": RECOVERY,
                         APP + ".configure_required_executor_recovery": WORKER + ".configure_required_executor_recovery",
+                        STANDALONE + ".configure_standalone_executor_recovery": STANDALONE_REGISTRATION,
                         APP + ".threading": "threading",
                         "elspeth.web.application_finalizers.threading": "threading",
                         "elspeth.web.process_recovery.threading": "threading",
@@ -592,6 +624,8 @@ def _namespace_effects(units, configured_function):
                 failures.append("recovery cell outside producer declaration " + unit.path)
             if isinstance(node, ast.Call) and WORKER + ".configure_required_executor_recovery" in qualify(node.func, env):
                 configure_calls.append((unit, node, scope))
+            if isinstance(node, ast.Call) and STANDALONE_REGISTRATION in qualify(node.func, env):
+                standalone_calls.append((unit, node, scope))
 
         for statement in unit.tree.body:
             scan(statement, module_env, unit.tree, set())
@@ -602,7 +636,13 @@ def _namespace_effects(units, configured_function):
                 or any(qualified == WORKER + "." + cell or qualified.startswith(WORKER + "." + cell + ".") for cell in CELLS)
                 or any(
                     qualified.startswith(owner + ".")
-                    for owner in {OWNER, RECOVERY, "threading.Event", WORKER + ".configure_required_executor_recovery"}
+                    for owner in {
+                        OWNER,
+                        RECOVERY,
+                        "threading.Event",
+                        WORKER + ".configure_required_executor_recovery",
+                        STANDALONE_REGISTRATION,
+                    }
                 )
             )
 
@@ -633,7 +673,7 @@ def _namespace_effects(units, configured_function):
             if (
                 isinstance(node, (ast.Name, ast.Attribute))
                 and isinstance(node.ctx, ast.Load)
-                and WORKER + ".configure_required_executor_recovery" in qualify(node, env)
+                and {WORKER + ".configure_required_executor_recovery", STANDALONE_REGISTRATION} & qualify(node, env)
             ):
                 parent = parents.get(id(node))
                 if not isinstance(parent, ast.Call) or parent.func is not node:
@@ -659,7 +699,7 @@ def _namespace_effects(units, configured_function):
                     and node.func.attr not in {"get", "items", "keys", "values", "copy"}
                 ):
                     failures.append("recovery protected namespace mutation/unsupported effect " + unit.path)
-    return failures, references, configure_calls
+    return failures, references, configure_calls, standalone_calls
 
 
 def recovery_cell_contract(units):
@@ -682,6 +722,9 @@ def recovery_cell_contract(units):
     function = _named(worker.tree.body, "configure_required_executor_recovery", ast.FunctionDef)
     if not _function_contract(function, CONFIGURE):
         return ["recovery registration complete argument/guard/store contract changed"], frozenset(), frozenset()
+    standalone_function = _named(worker.tree.body, "configure_standalone_executor_recovery", ast.FunctionDef)
+    if not _function_contract(standalone_function, STANDALONE_CONFIGURE):
+        return ["recovery standalone registration unowned-process guard/forwarding contract changed"], frozenset(), frozenset()
     owner = _named(owned_unit.tree.body, "ApplicationFinalizerOwner", ast.ClassDef)
     recovery = _named(recovery_unit.tree.body, "ProcessRecovery", ast.ClassDef)
     if not _owned_class(owner) or not _owned_class(recovery):
@@ -734,7 +777,7 @@ def recovery_cell_contract(units):
             return ["recovery caller retained producer scope changed"], frozenset(), frozenset()
     if any(isinstance(node, ast.Nonlocal) and set(node.names) & protected_locals for node in ast.walk(caller)):
         return ["recovery caller retained producer captured for rebinding"], frozenset(), frozenset()
-    failures, references, calls = _namespace_effects(units, function)
+    failures, references, calls, standalone_calls = _namespace_effects(units, function, standalone_function)
     parents = {id(child): node for node in ast.walk(caller) for child in ast.iter_child_nodes(node)}
     for node in own_nodes:
         if not isinstance(node, ast.Name) or not isinstance(node.ctx, ast.Load) or node.id not in protected_locals - {"watchdog"}:
@@ -789,8 +832,24 @@ def recovery_cell_contract(units):
     lock_call = _body(_named(owner.body, "__init__", ast.FunctionDef))[0].value
     if references.get(id(lock_call.func)) != frozenset({"threading.Lock"}):
         failures.append("recovery owner physical lock supplier origin changed")
-    if len(calls) != 1 or calls[0][0] is not app or calls[0][1] is not call or calls[0][2] is not caller:
+    # Exactly the Web owner's call and the guarded standalone forward; the
+    # latter's node identity is the last statement of its pinned body.
+    forward = standalone_function.body[-1].value
+    if (
+        len(calls) != 2
+        or not any(unit is app and node is call and scope is caller for unit, node, scope in calls)
+        or not any(unit is worker and node is forward and scope is standalone_function for unit, node, scope in calls)
+    ):
         failures.append("recovery registration call/escape universe changed")
+    standalone_unit = by_module.get(STANDALONE)
+    standalone_root = None if standalone_unit is None else _named(standalone_unit.tree.body, "run_standalone", ast.AsyncFunctionDef)
+    if (
+        standalone_root is None
+        or len(standalone_calls) != 1
+        or standalone_calls[0][0] is not standalone_unit
+        or standalone_calls[0][2] is not standalone_root
+    ):
+        failures.append("recovery standalone registration call/escape universe changed")
     module_initializers = {
         cell: [
             node
@@ -830,7 +889,7 @@ def recovery_dependency_roles(units):
     by_module = {_module(unit): unit for unit in units if _module(unit) is not None}
     worker = by_module[WORKER]
     configured = _named(worker.tree.body, "configure_required_executor_recovery", ast.FunctionDef)
-    _, references, _ = _namespace_effects(units, configured)
+    _, references, _, _ = _namespace_effects(units, configured)
     regions = [(by_module[APP], _named(by_module[APP].tree.body, "create_app", ast.FunctionDef)), (worker, configured)]
     for qualified, members in [(OWNER, ("__init__",)), (RECOVERY, ("__init__", "required_generation_expired", "_begin"))]:
         unit = by_module[qualified.rpartition(".")[0]]
