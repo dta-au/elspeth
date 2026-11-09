@@ -38,6 +38,8 @@ const _validReadinessSnapshot = {
   },
 };
 
+const OPTS = { allowImport: false, lifetimeSeconds: 2592000 } as const;
+
 describe("shareableReviews API client", () => {
   beforeEach(() => {
     globalThis.fetch = vi.fn();
@@ -68,7 +70,7 @@ describe("shareableReviews API client", () => {
         }),
       );
 
-      const response = await markReadyForReview(SESSION_ID);
+      const response = await markReadyForReview(SESSION_ID, OPTS);
       expect(response.token).toBe("ZmFrZS10b2tlbg");
       expect(response.payload_digest.startsWith("sha256:")).toBe(true);
 
@@ -94,7 +96,7 @@ describe("shareableReviews API client", () => {
         { status: 200, headers: { "content-type": "application/json" } },
       ),
     );
-    await expect(markReadyForReview(SESSION_ID)).rejects.toMatchObject({
+    await expect(markReadyForReview(SESSION_ID, OPTS)).rejects.toMatchObject({
       detail: expect.stringContaining("mark-ready-for-review"),
     });
   });
@@ -500,13 +502,6 @@ describe("shareableReviews API client", () => {
     expect(JSON.parse(init?.body as string)).toEqual({ allow_import: true, lifetime_seconds: 86400 });
     const headers = init?.headers as Record<string, string> | undefined;
     expect(headers?.["Content-Type"]).toBe("application/json");
-  });
-
-  it("markReadyForReview without options sends no body", async () => {
-    _mockJsonResponse(MARK_READY_BODY);
-    await markReadyForReview(SESSION_ID);
-    const [, init] = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
-    expect(init?.body).toBeUndefined();
   });
 
   it("fetchSharedInspect rejects a missing import_allowed", async () => {

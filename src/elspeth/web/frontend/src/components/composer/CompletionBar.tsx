@@ -59,7 +59,7 @@ const SAVE_FOR_REVIEW_DISABLED_TITLE =
 export function CompletionBar(): JSX.Element | null {
   const activeSessionId = useSessionStore((s) => s.activeSessionId);
   const validationResult = useExecutionStore((s) => s.validationResult);
-  const openAndMark = useShareableReviewStore((s) => s.openAndMark);
+  const openConfigure = useShareableReviewStore((s) => s.openConfigure);
   const inFlight = useShareableReviewStore((s) => s.inFlight);
   const showAdvanced = useShowAdvanced();
 
@@ -86,9 +86,9 @@ export function CompletionBar(): JSX.Element | null {
         className="completion-bar-save-for-review"
         onClick={() => {
           if (!isCompletionReady || inFlight) return;
-          // openAndMark resolves asynchronously and persists outcome in the
-          // store; no need to await here at the click site.
-          void openAndMark(activeSessionId);
+          // openConfigure opens the dialog on its configure step and loads the
+          // file list; nothing is minted until the owner confirms there.
+          void openConfigure(activeSessionId);
         }}
         disabled={saveDisabled}
         aria-disabled={saveDisabled || undefined}

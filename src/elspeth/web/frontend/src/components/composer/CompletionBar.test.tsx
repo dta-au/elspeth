@@ -202,7 +202,7 @@ describe("CompletionBar", () => {
   });
 
   it("blocks Save on completion readiness while leaving Run admitted", () => {
-    const openAndMark = vi.fn();
+    const openConfigure = vi.fn();
     useSessionStore.setState({ activeSessionId: "sess-1" });
     useExecutionStore.setState({
       validationResult: {
@@ -212,7 +212,7 @@ describe("CompletionBar", () => {
       isExecuting: false,
       progress: null,
     });
-    useShareableReviewStore.setState({ openAndMark });
+    useShareableReviewStore.setState({ openConfigure });
 
     render(<CompletionBar />);
     const save = screen.getByTestId(
@@ -228,11 +228,11 @@ describe("CompletionBar", () => {
       "Advisor sign-off is required before sharing for review.",
     );
     fireEvent.click(save);
-    expect(openAndMark).not.toHaveBeenCalled();
+    expect(openConfigure).not.toHaveBeenCalled();
     expect(run).not.toBeDisabled();
   });
 
-  it("clicking Share inspect link invokes openAndMark with the active session id", () => {
+  it("clicking Share inspect link invokes openConfigure with the active session id", () => {
     useSessionStore.setState({ activeSessionId: "sess-XYZ" });
     useExecutionStore.setState({
       validationResult: _validValidation(),
@@ -240,12 +240,12 @@ describe("CompletionBar", () => {
       progress: null,
       execute: vi.fn(),
     });
-    const openAndMarkSpy = vi.fn();
-    useShareableReviewStore.setState({ openAndMark: openAndMarkSpy });
+    const openConfigureSpy = vi.fn();
+    useShareableReviewStore.setState({ openConfigure: openConfigureSpy });
 
     render(<CompletionBar />);
     fireEvent.click(screen.getByTestId("completion-bar-save-for-review"));
-    expect(openAndMarkSpy).toHaveBeenCalledWith("sess-XYZ");
+    expect(openConfigureSpy).toHaveBeenCalledWith("sess-XYZ");
   });
 
   it("disables Share inspect link while a mark request is in flight", () => {

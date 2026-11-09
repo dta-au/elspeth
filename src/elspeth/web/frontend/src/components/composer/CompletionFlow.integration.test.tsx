@@ -3,13 +3,15 @@
  *
  * Phase 6B Task 11. The unit tests for CompletionBar / SaveForReviewDialog /
  * shareableReviewStore cover each piece in isolation. This test exercises
- * the full chain: click Share inspect link in the bar → store dispatches
- * markReadyForReview → dialog opens, shows the spinner, then the success
+ * the full chain: click Share inspect link in the bar → dialog opens on the
+ * configure step (no mint) → Create link → store dispatches
+ * markReadyForReview with the chosen options → spinner, then the success
  * panel with the share URL → user copies the URL → dialog closes.
  *
  * Mocked surfaces:
  *
  * * `api/shareableReviews.markReadyForReview` — returns a fixed response.
+ * * `api/shareableReviews.fetchShareableFiles` — returns an empty file list.
  * * `navigator.clipboard.writeText` — succeeds, captures the argument.
  *
  * NOT mocked:
@@ -96,6 +98,16 @@ function _invalidValidation(): ValidationResult {
   };
 }
 
+const _FILES = { files: [], importable: true, not_importable_reason: null };
+
+/** Open the configure step from the bar and (optionally) confirm it. */
+async function _openConfigure() {
+  fireEvent.click(screen.getByTestId("completion-bar-save-for-review"));
+  await waitFor(() =>
+    expect(screen.getByTestId("save-for-review-configure")).toBeInTheDocument(),
+  );
+}
+
 function _withOrigin(origin: string, fn: () => void) {
   const original = window.location;
   Object.defineProperty(window, "location", {
@@ -133,6 +145,7 @@ describe("Phase 6B completion-flow (CompletionBar + Dialog + store)", () => {
       expires_at: "2026-06-19T00:00:00+00:00",
       payload_digest: "sha256:" + "11".repeat(32),
     };
+    vi.spyOn(api, "fetchShareableFiles").mockResolvedValue(_FILES);
     const apiSpy = vi
       .spyOn(api, "markReadyForReview")
       .mockResolvedValueOnce(apiResponse);
@@ -150,15 +163,19 @@ describe("Phase 6B completion-flow (CompletionBar + Dialog + store)", () => {
     expect(screen.getByTestId("completion-bar")).toBeInTheDocument();
     expect(screen.queryByTestId("save-for-review-dialog")).toBeNull();
 
-    // Click Share inspect link.
-    fireEvent.click(screen.getByTestId("completion-bar-save-for-review"));
-
-    // Immediately: dialog mounted, spinner visible.
+    // Click Share inspect link: the dialog opens on the configure step and
+    // nothing is minted yet.
+    await _openConfigure();
     expect(screen.getByTestId("save-for-review-dialog")).toBeInTheDocument();
-    expect(screen.getByTestId("save-for-review-spinner")).toBeInTheDocument();
+    expect(apiSpy).not.toHaveBeenCalled();
 
-    // API was called with the active session id.
-    expect(apiSpy).toHaveBeenCalledWith("sess-integration");
+    // Create link: spinner, then the API is called with the chosen options.
+    fireEvent.click(screen.getByRole("button", { name: "Create link" }));
+    expect(screen.getByTestId("save-for-review-spinner")).toBeInTheDocument();
+    expect(apiSpy).toHaveBeenCalledWith("sess-integration", {
+      allowImport: false,
+      lifetimeSeconds: 2592000,
+    });
 
     // After the API resolves: success panel visible.
     await waitFor(() =>
@@ -182,6 +199,7 @@ describe("Phase 6B completion-flow (CompletionBar + Dialog + store)", () => {
   });
 
   it("end-to-end: 409 from backend renders the error panel with retry", async () => {
+    vi.spyOn(api, "fetchShareableFiles").mockResolvedValue(_FILES);
     vi.spyOn(api, "markReadyForReview").mockRejectedValueOnce({
       status: 409,
       detail: "composition validation failed",
@@ -194,7 +212,8 @@ describe("Phase 6B completion-flow (CompletionBar + Dialog + store)", () => {
       </>,
     );
 
-    fireEvent.click(screen.getByTestId("completion-bar-save-for-review"));
+    await _openConfigure();
+    fireEvent.click(screen.getByRole("button", { name: "Create link" }));
 
     await waitFor(() =>
       expect(screen.getByTestId("save-for-review-error")).toBeInTheDocument(),
@@ -265,6 +284,7 @@ describe("Phase 6B completion-flow (CompletionBar + Dialog + store)", () => {
       expires_at: "2026-06-19T00:00:00+00:00",
       payload_digest: "sha256:" + "aa".repeat(32),
     };
+    vi.spyOn(api, "fetchShareableFiles").mockResolvedValue(_FILES);
     vi.spyOn(api, "markReadyForReview").mockResolvedValueOnce(respA);
 
     render(
@@ -273,7 +293,8 @@ describe("Phase 6B completion-flow (CompletionBar + Dialog + store)", () => {
         <SaveForReviewDialog />
       </>,
     );
-    fireEvent.click(screen.getByTestId("completion-bar-save-for-review"));
+    await _openConfigure();
+    fireEvent.click(screen.getByRole("button", { name: "Create link" }));
     await waitFor(() =>
       expect(screen.getByTestId("save-for-review-success")).toBeInTheDocument(),
     );
@@ -285,7 +306,7 @@ describe("Phase 6B completion-flow (CompletionBar + Dialog + store)", () => {
       useSessionStore.setState({ activeSessionId: "sess-B" } as never);
     });
     fireEvent.click(screen.getByTestId("completion-bar-save-for-review"));
-    // While inFlight: success panel from session A should NOT be visible.
+    // While B's configure step loads: A's success panel must NOT be visible.
     expect(screen.queryByText("/#/shared/tk-A")).toBeNull();
   });
 });

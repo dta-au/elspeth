@@ -53,9 +53,9 @@ export type RequestPhase =
       files: ShareableFilesResponse | null;
       filesError: string | null;
     }
-  | { kind: "pending"; sessionId: string; epoch: number }
+  | { kind: "pending"; sessionId: string; epoch: number; options: MarkReadyOptions }
   | { kind: "resolved"; sessionId: string; response: MarkReadyForReviewResponse }
-  | { kind: "error"; sessionId: string; message: string };
+  | { kind: "error"; sessionId: string; message: string; options: MarkReadyOptions };
 
 export interface ShareableReviewState {
   /** Whether the SaveForReviewDialog is mounted (orthogonal to request phase). */
@@ -76,10 +76,10 @@ export interface ShareableReviewState {
   error: string | null;
 
   // ── Mutators ──
-  openAndMark: (sessionId: string) => Promise<void>;
   /** Open the dialog in the configure phase and load the shareable files. Does not mint. */
   openConfigure: (sessionId: string) => Promise<void>;
-  /** Mint from the configure phase's session with the chosen options. */
+  /** Mint with the chosen options, from the configure phase's session. Also
+   *  accepted from the error phase so a failed mint can be retried. */
   confirmMark: (options: MarkReadyOptions) => Promise<void>;
   close: () => void;
   clearForSession: (sessionId: string) => void;
@@ -112,7 +112,7 @@ function _isApiError(value: unknown): value is ApiError {
 /** Project canonical InternalState onto the public flat-field surface. */
 function _project(internal: InternalState): Omit<
   ShareableReviewState,
-  "openAndMark" | "openConfigure" | "confirmMark" | "close" | "clearForSession" | "reset"
+  "openConfigure" | "confirmMark" | "close" | "clearForSession" | "reset"
 > {
   const inFlight = internal.request.kind === "pending";
   const error = internal.request.kind === "error" ? internal.request.message : null;
@@ -168,13 +168,13 @@ export const useShareableReviewStore = create<ShareableReviewState>((set, _get) 
   return {
     ..._project(_internal),
 
-    async openAndMark(sessionId: string) {
-      await _mint(sessionId, undefined);
-    },
-
     async openConfigure(sessionId: string) {
       // Never disturb a mint already in flight for this session.
       if (_internal.request.kind === "pending" && _internal.request.sessionId === sessionId) {
+        // The dialog may have been closed meanwhile; reopen it on the pending mint.
+        if (!_internal.dialogOpen) {
+          _commit({ ..._internal, dialogOpen: true });
+        }
         return;
       }
       const myEpoch = _nextEpoch();
@@ -213,7 +213,7 @@ export const useShareableReviewStore = create<ShareableReviewState>((set, _get) 
     },
 
     async confirmMark(options: MarkReadyOptions) {
-      if (_internal.request.kind !== "configure") {
+      if (_internal.request.kind !== "configure" && _internal.request.kind !== "error") {
         return;
       }
       await _mint(_internal.request.sessionId, options);
@@ -242,7 +242,7 @@ export const useShareableReviewStore = create<ShareableReviewState>((set, _get) 
     },
   };
 
-  async function _mint(sessionId: string, options: MarkReadyOptions | undefined): Promise<void> {
+  async function _mint(sessionId: string, options: MarkReadyOptions): Promise<void> {
       // Double-click guard: if a POST is already in-flight for the same
       // session, drop the re-entrant call. Audit rows are append-only —
       // minting a second token would create a duplicate audit row.
@@ -250,7 +250,7 @@ export const useShareableReviewStore = create<ShareableReviewState>((set, _get) 
         return;
       }
 
-      // Capture this call's epoch BEFORE awaiting. The next openAndMark
+      // Capture this call's epoch BEFORE awaiting. The next confirmMark
       // (same or different session) will bump the epoch when it sets its
       // own pending phase; on resume we re-check our captured epoch against
       // the live one. Mismatch ⇒ we were superseded; drop our late response.
@@ -266,15 +266,13 @@ export const useShareableReviewStore = create<ShareableReviewState>((set, _get) 
       _commit({
         ..._internal,
         dialogOpen: true,
-        request: { kind: "pending", sessionId, epoch: myEpoch },
+        request: { kind: "pending", sessionId, epoch: myEpoch, options },
         lastSuccess: sessionSwitch ? null : _internal.lastSuccess,
       });
 
       try {
-        const response = options === undefined
-          ? await markReadyForReview(sessionId)
-          : await markReadyForReview(sessionId, options);
-        // Stale-epoch check: a later openAndMark superseded us while we
+        const response = await markReadyForReview(sessionId, options);
+        // Stale-epoch check: a later confirmMark superseded us while we
         // were awaiting. Our response must NOT clobber the new pending /
         // resolved state. The server-side audit row was minted regardless;
         // we just suppress the late client-side surfacing.
@@ -320,7 +318,7 @@ export const useShareableReviewStore = create<ShareableReviewState>((set, _get) 
           // a lower layer (e.g. a `throw "string"` from a fetch wrapper).
           // eslint-disable-next-line no-console
           console.warn(
-            "shareableReviewStore: openAndMark failed with unexpected exception shape:",
+            "shareableReviewStore: mint failed with unexpected exception shape:",
             exc,
           );
         }
@@ -329,7 +327,7 @@ export const useShareableReviewStore = create<ShareableReviewState>((set, _get) 
           // Cached lastSuccess is wiped on error to match the previous
           // store's behaviour (the original code set
           // `latestResponse: null` on the error path).
-          request: { kind: "error", sessionId, message },
+          request: { kind: "error", sessionId, message, options },
           lastSuccess: null,
         });
       }

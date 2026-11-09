@@ -231,25 +231,21 @@ function validateSharedImportResponse(body: unknown, status: number): SharedImpo
 /**
  * POST /api/sessions/{session_id}/mark-ready-for-review.
  *
- * ``options`` is optional while the dialog still mints with the server
- * defaults: absent sends no body (the legacy request).
+ * ``options`` is required: the share dialog's configure step always chooses
+ * whether recipients may import and how long the link lives.
  */
 export async function markReadyForReview(
   sessionId: string,
-  options?: MarkReadyOptions,
+  options: MarkReadyOptions,
   signal?: AbortSignal,
 ): Promise<MarkReadyForReviewResponse> {
   const response = await authFetch(`/api/sessions/${sessionId}/mark-ready-for-review`, {
     method: "POST",
-    headers: authHeaders(options === undefined ? undefined : "application/json"),
-    ...(options === undefined
-      ? {}
-      : {
-          body: JSON.stringify({
-            allow_import: options.allowImport,
-            lifetime_seconds: options.lifetimeSeconds,
-          }),
-        }),
+    headers: authHeaders("application/json"),
+    body: JSON.stringify({
+      allow_import: options.allowImport,
+      lifetime_seconds: options.lifetimeSeconds,
+    }),
     signal,
   });
   return validateMarkReadyResponse(await parseResponse<unknown>(response), response.status);
