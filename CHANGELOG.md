@@ -108,14 +108,56 @@ establish qualification, a published tag or an image.
   the export's redaction account names each affected node and option
   (`stripped_node_options`, `# redacted-node:` header lines), and YAML import
   refuses a leftover fragment with guidance to re-attach the file. Re-importing
-  such an export reports the missing option; attaching files to transforms on
-  import is not yet supported.
+  such an export reports the missing option unless the request re-attaches the
+  file (see YAML import below).
 - **Shared, published and exported graphs no longer carry a `blob_rows`
   source's file entries.** The public projection previously dropped only each
   entry's `blob_id`, leaving the file's digest (`payload_ref`), filename, MIME
   type and size, and reported nothing. The whole `blobs` list is now removed
   and the redaction account names it (`blobs`, labelled `blob-linkage` in the
   export header); such sources also count as reading uploaded files.
+- **A shared link can let recipients import a copy, files included.** The
+  "Share inspect link" dialog now has a configure step: "Let recipients import
+  a copy" (off by default), which lists the files that would travel, and "Link
+  expires after" 1 day, 7 days or 30 days. Nothing is minted until "Create
+  link". The deployment's `shareable_link_lifetime_seconds` is now the maximum;
+  a longer lifespan is refused with 422, and "copy link again" keeps the chosen
+  lifespan, clamped to the current maximum. When import is allowed, every
+  uploaded file the graph is attached to (source `blob_ref`, `blob_rows`
+  entries, transform inline-content markers) is frozen into the share at
+  creation, so later edits or deletion on the sharer's side do not break the
+  link. A recipient opening an import link sees "Import a copy into my
+  workspace" and the file list; importing creates a new session, "Copy of
+  ‹name›", with its own copy of each file and every attachment pointing at the
+  copy, and records the share's digest and sharer as `shared_import`
+  provenance in the new state. Links minted before this release, and links
+  without the opt-in, stay view-only (403 on import). Secrets never travel,
+  and output file locations do not travel either: the copy must have its sink
+  paths set before it validates. A graph using a plugin the recipient's policy
+  disallows is refused with 422 and the new session is archived.
+- **Files written by the assistant cannot be shared for import.** If the graph
+  is attached to a file the assistant created rather than one the user
+  uploaded, creating an import link is refused with 409 naming the file, and
+  the dialog says so before the link is created. View-only links to the same
+  graph are unaffected.
+- **Known cost: share snapshots and frozen files are not reclaimed.** Nothing
+  in the web app deletes payload-store content, so every share, and every file
+  frozen into an import link, stays on disk after the link expires. Identical
+  bytes are stored once. Reclamation is tracked in
+  [#356](https://github.com/dta-au/elspeth/issues/356).
+- **Accepted gaps in import.** There is no staged session and no server-side
+  idempotency (neither is possible without a sessions-schema change), so a
+  process that dies mid-import can leave a half-built "Copy of …" session for
+  the recipient to delete, and a deliberate retry after a network failure can
+  create a second copy. The Import button is disabled while its request is in
+  flight.
+- **YAML import can re-attach files to transforms and multi-file sources.**
+  `POST /api/sessions/{id}/state/yaml` accepts `inline_blob_bindings`, keyed by
+  component and option path, which rebuilds an inline-content file marker
+  from a ready blob of the session (its `sha256` is that blob's content
+  hash), and
+  `source_blob_rows`, which re-binds a `blob_rows` source's file entries. The
+  Import YAML dialog does not offer these fields yet.
 
 ### LLM gateway
 

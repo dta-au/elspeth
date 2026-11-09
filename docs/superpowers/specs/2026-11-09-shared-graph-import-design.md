@@ -1,6 +1,7 @@
 # Shared graph import — design
 
-**Status:** design approved in conversation 2026-11-09; awaiting written-spec review.
+**Status:** implemented on this branch for 0.8.10 (2026-11-09). §2 records where the
+implementation departs from the approved design.
 **Target release:** 0.8.10.
 **Branch:** `claude/brave-albattani-yjqujo` (built on `claude/vibrant-euler-tora25`).
 
@@ -117,9 +118,11 @@ continues to expose only the public projection plus a recipient-safe file list
   identical to a live share's frozen file deletes that file; import then returns
   the handled 404. Also tracked in dta-au/elspeth#356.
 - **Re-minting keeps the chosen lifespan.** "Copy link again"
-  (`get_shareable_link`) currently re-mints with the global maximum; it must
-  instead reuse the original lifespan (`expires_at - created_at` from the
-  `mark_ready_for_review` row), so a 1-day link is not stretched to 30 days.
+  (`get_shareable_link`) previously re-minted with the global maximum; it now
+  reuses the original lifespan (`expires_at - created_at` from the
+  `mark_ready_for_review` row), clamped to the current maximum: the new link
+  lives for min(original lifespan, `shareable_link_lifetime_seconds`), so a
+  1-day link is not stretched to 30 days and a lowered maximum is honoured.
 - **Compatibility:** tokens minted before this release carry no import flag and
   are treated as view-only. Existing snapshot blobs (the old 7-key shape) remain
   readable as view-only; new snapshots use a 9-key shape adding `import_allowed`
@@ -140,19 +143,28 @@ would need a sessions-schema change. Order of operations:
 1. **Verify the token and read everything first:** valid and unexpired (else
    401), `import_allowed` (else 403), snapshot and every frozen file present in
    the payload store with matching sha256 (else 404 "ask the sender for a fresh
-   link"). Nothing is created until all reads succeed.
+   link"). The import request built from the snapshot is also validated here,
+   apart from the new blob ids: a public YAML over the import size cap is
+   refused with 422 and no session is created. Nothing is created until all
+   reads and that validation succeed.
 2. **Create Chris's session** (live), titled "Copy of ‹pipeline name›".
 3. **Copy each frozen file** into it as an ordinary blob (`create_blob`), which
    enforces the session and user storage quotas. A quota refusal surfaces as the
    existing quota error.
 4. **Seed the graph** from the snapshot's public projection through the ordinary
    YAML importer (the library-fork seeder), attaching every manifest binding to
-   Chris's copy: sources via the existing `source_blob_ids`, nodes via a new
-   `node_blob_bindings` that rebuilds each widened marker in full (`blob_ref`,
-   `mode`, `sha256`, `encoding`) and checks the copy's hash against the
-   manifest.
-5. **Re-author sink output locations** for Chris's session, as YAML import does
-   today; RAG `persist_directory` gets a fresh location.
+   Chris's copy: single-file sources via the existing `source_blob_ids`,
+   multi-file (`blob_rows`) sources via a new `source_blob_rows`, and inline
+   markers via a new `inline_blob_bindings` keyed by component and option path
+   (any component, not only nodes; the design called this `node_blob_bindings`).
+   Each inline binding rebuilds the widened marker in full (`blob_ref`, `mode`,
+   `sha256`, `encoding`) through the canonical marker writer's checks, and the
+   copy's hash must equal the manifest sha256.
+5. **Sink output locations do not travel.** The public projection strips them
+   and the seeder does not re-author them, so a file sink in the copy lands
+   without a `path` and the copy fails validation until Chris (or the composer)
+   sets one — the same result as importing a public YAML export. RAG
+   `persist_directory` is likewise not copied.
 6. **Record provenance** in the seeded state's `composer_meta` as
    `shared_import` (see §4). Respond with the new `session_id` and `state_id`.
 7. **On any error after step 2**, archive the new session, as library fork does.
@@ -167,9 +179,18 @@ The Import button is disabled while its request is in flight.
 *references* arrive unresolved; Chris's readiness panel shows them as missing
 until he adds his own.
 
-**Graphs that do not validate for Chris** (missing secrets, a plugin his policy
-disallows) still import; the readiness panel reports the problems, as with a
-library fork.
+**Graphs that do not validate for Chris** (missing secrets, sink locations to
+set) still import; the readiness panel reports the problems, as with a library
+fork. **A graph using a plugin Chris's policy disallows is refused**: the seeder
+answers 422 and the new session is archived, as library fork does (the design
+said such graphs would still import).
+
+**Files written by the assistant cannot be shared for import.** Only files whose
+bytes the user uploaded verbatim travel. If the graph is attached to a file the
+assistant wrote (any non-verbatim creation modality), creating an import link
+is refused with 409 naming the file ("'‹name›' was written by the assistant and
+cannot be shared for import"), and the dialog's file preview says so before the
+owner confirms. View-only sharing of the same graph is unaffected.
 
 ### 3. Failure handling
 
@@ -219,7 +240,8 @@ so both non-negotiable composer invariants hold.
 1. **Unit:** manifest construction (source `blob_ref`, `blob_rows` source
    `options.blobs[].blob_id`, and nested node markers); token flag and expiry
    cap; re-mint preserving the chosen lifespan; old 7-key snapshots reading as
-   view-only; `node_blob_bindings` in the importer; all-reads-before-create;
+   view-only; `inline_blob_bindings` and `source_blob_rows` in the importer;
+   all-reads-before-create;
    archive-on-failure. Each test is watched failing before the implementation.
 2. **Integration:** Tom shares a graph with a source file and a `reference_join`
    inline file; Chris imports; files arrive with identical hashes and every
@@ -238,6 +260,7 @@ so both non-negotiable composer invariants hold.
 - Early link revocation.
 - Importing into, replacing, or merging with an existing session.
 - Copying RAG vector indexes or past run outputs.
-- Node re-binding for ordinary pasted-YAML import (the `node_blob_bindings`
-  mechanism makes this a small follow-up, but it is not part of this feature).
+- A user interface for re-binding files on ordinary pasted-YAML import. The
+  `inline_blob_bindings` and `source_blob_rows` request fields are available
+  to `POST /state/yaml` callers; the Import YAML dialog does not offer them.
 - Changing the same-user session fork, which keeps copying every ready blob.
