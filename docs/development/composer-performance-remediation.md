@@ -324,7 +324,11 @@ should the dedupe go?
   readiness refetch when `/validate` has just completed for the same version.
   Keeps the repair pass; readiness panel updates one hop later.
 
-Until answered, 2B does not start. Tests affected either way:
+**Ruling (maintainer, 2026-11-09): option (ii).** `/validate` wins: the
+forced POST stays, the readiness refetch is skipped when `/validate` has
+just completed for the same version, and the repair pass is preserved. The
+remaining direct `validate()` call in `ImportYamlModal.tsx` folds into the
+same coordinator. Tests affected:
 `components/audit/AuditReadinessPanel.test.tsx` (`:193, :439, :453, :545,
 :586, :846`), `components/workspace/ArtifactWorkspace.test.tsx:1657-1675`,
 `test/inlineSourceIntegration.test.tsx:151-160, 374-385, 525`,
