@@ -23,6 +23,10 @@ import {
   pendingControlsInstruction,
 } from "@/components/chat/acknowledgementLabels";
 import { useInterpretationEventsStore } from "./interpretationEventsStore";
+import {
+  registerResolveValidateRequester,
+  type ResolveValidateRequest,
+} from "./validationRequests";
 
 let previousVersion: number | null = null;
 let previousSessionIds: Set<string> = new Set();
@@ -252,6 +256,7 @@ function resetPerUserState(): void {
 export function initStoreSubscriptions(): void {
   if (initialized) return;
   initialized = true;
+  registerResolveValidateRequester(requestValidateAfterResolve);
 
   // Seed previousSessionIds from the current store state. Otherwise the first
   // removal of any session that was already in sessionStore before
@@ -570,14 +575,62 @@ async function fireValidateLoop(): Promise<void> {
  * but content is empty).
  */
 export function requestValidate(sessionId: string, version: number): void {
+  if (!forcedValidateAllowed()) return;
+  enqueueForcedValidate(sessionId, version);
+}
+
+/** Guards shared by every forced entry: content present, no live run. */
+function forcedValidateAllowed(): boolean {
   if (!hasCompositionContent(useSessionStore.getState().compositionState)) {
-    return;
+    return false;
   }
   const exec = useExecutionStore.getState();
-  if (exec.isExecuting || exec.progress?.status === "running") return;
+  return !(exec.isExecuting || exec.progress?.status === "running");
+}
+
+function enqueueForcedValidate(sessionId: string, version: number): void {
   pendingValidateTarget = { sessionId, version, force: true };
   if (validateInflight) return;
   void fireValidateLoop();
+}
+
+/**
+ * Post-resolve validate request, registered with validationRequests.ts so
+ * sessionStore.applyResolvedInterpretation can reach the queue without
+ * importing this module. Same guards as requestValidate (an empty
+ * composition has nothing to gate; a resolve during a live run does not
+ * re-validate mid-run, matching the auto-validate subscriber).
+ *
+ * Accept/amend (`mintedVersion`): the backend always mints `version += 1`,
+ * and publishing it already fired the auto-validate subscriber above, which
+ * has that version in flight. A request for a version the resolve itself
+ * minted can only have been issued after the resolve committed, so its
+ * verdict already reflects the resolved review — forcing a repeat is the
+ * duplicate POST this path exists to avoid. When it is NOT in flight (the
+ * subscriber carried a content-equal verdict forward, or it is merely
+ * pending behind another version) the forced entry still queues it, so the
+ * Run gate is re-checked against the post-resolve server state.
+ *
+ * Opt-out (`!mintedVersion`): no state is minted and the version is
+ * unchanged, so the same-version cache would skip; `force` overrides it.
+ * An in-flight request for this version may predate the opt-out, so it is
+ * never treated as covering it.
+ */
+function requestValidateAfterResolve({
+  sessionId,
+  version,
+  mintedVersion,
+}: ResolveValidateRequest): void {
+  if (!forcedValidateAllowed()) return;
+  if (
+    mintedVersion &&
+    inflightValidateTarget !== null &&
+    inflightValidateTarget.sessionId === sessionId &&
+    inflightValidateTarget.version === version
+  ) {
+    return;
+  }
+  enqueueForcedValidate(sessionId, version);
 }
 
 /**
@@ -608,5 +661,6 @@ export function _resetSubscriptionsForTesting(): void {
   pendingValidateTarget = null;
   validateInflight = false;
   inflightValidateTarget = null;
+  registerResolveValidateRequester(null);
   initialized = false;
 }

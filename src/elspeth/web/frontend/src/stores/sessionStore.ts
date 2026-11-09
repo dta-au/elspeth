@@ -31,6 +31,7 @@ import {
 import { useBlobStore } from "./blobStore";
 import { useExecutionStore } from "./executionStore";
 import { useInterpretationEventsStore } from "./interpretationEventsStore";
+import { requestValidateAfterResolve } from "./validationRequests";
 import {
   acquireSessionOperationRetry,
   clearAllSessionOperationRetries,
@@ -2042,15 +2043,27 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       }));
     }
 
-    // Gate clearing: re-validate explicitly. The run-gate (ExecuteButton) and
-    // the validation system message are driven by validationResult, which goes
-    // stale after a resolve — the auto-validate subscription only fires on a
-    // composition-version bump, which a resolve does not guarantee (and
-    // newState may be null). Without this the user resolves every review and
-    // the Run button stays disabled with no signal of what changed. validate()
-    // re-checks server-side pending interpretations, so once the last review is
-    // resolved the gate opens.
-    void getExecutionStore().validate(activeSessionId);
+    // Gate clearing: the run-gate (ExecuteButton) and the validation system
+    // message are driven by validationResult, which goes stale after a
+    // resolve. validate re-checks server-side pending interpretations, so once
+    // the last review is resolved the gate opens. Route it through the
+    // auto-validation queue (subscriptions.ts), never validate() directly:
+    // - accept/amend: the backend always mints version += 1, so the set()
+    //   above already queued that version; the queue coalesces this request
+    //   with it into one POST /validate.
+    // - opt-out (newState === null): no state is minted and the version is
+    //   unchanged, so the queue's same-version cache would skip; this request
+    //   is forced, which is what re-checks the gate on that path.
+    const version = newState?.version ?? get().compositionState?.version;
+    if (version === undefined) return;
+    const queued = requestValidateAfterResolve({
+      sessionId: activeSessionId,
+      version,
+      mintedVersion: newState !== null,
+    });
+    // No queue registered (initStoreSubscriptions() never ran): there is
+    // nothing to bypass, so validate directly rather than leave the gate shut.
+    if (!queued) void getExecutionStore().validate(activeSessionId);
   },
 
   clearError() {

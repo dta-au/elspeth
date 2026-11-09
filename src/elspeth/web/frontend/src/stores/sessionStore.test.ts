@@ -19,6 +19,7 @@ import type {
 import type { InterpretationEvent } from "@/types/interpretation";
 import { compositionStateAuthorityFields } from "@/test/composerFixtures";
 import { clearAllSessionOperationRetries } from "./sessionOperationRetry";
+import { registerResolveValidateRequester } from "./validationRequests";
 
 const clearValidationMock = vi.hoisted(() => vi.fn());
 const validateMock = vi.hoisted(() => vi.fn());
@@ -2747,6 +2748,19 @@ describe("sessionStore", () => {
   });
 
   describe("applyResolvedInterpretation", () => {
+    // The resolve path reaches the auto-validation queue through the
+    // validationRequests seam (sessionStore cannot import subscriptions).
+    // These tests register a spy requester in the queue's place; the queue's
+    // own coalescing is pinned in subscriptions.test.ts.
+    const resolveRequestMock = vi.fn();
+    beforeEach(() => {
+      resolveRequestMock.mockReset();
+      registerResolveValidateRequester(resolveRequestMock);
+    });
+    afterEach(() => {
+      registerResolveValidateRequester(null);
+    });
+
     it("guards delayed approval publication across activation changes", async () => {
       const api = await import("@/api/client");
       vi.mocked(api.fetchMessages).mockResolvedValue([]);
@@ -2759,21 +2773,28 @@ describe("sessionStore", () => {
       validateMock.mockClear();
       resolve(makeCompositionState(3));
       expect(useSessionStore.getState().compositionState).toBe(destination);
+      expect(resolveRequestMock).not.toHaveBeenCalled();
       expect(validateMock).not.toHaveBeenCalled();
       await useSessionStore.getState().selectSession("20000000-0000-4000-8000-000000000001");
       const reactivated = useSessionStore.getState().compositionState;
       validateMock.mockClear();
       resolve(makeCompositionState(3));
       expect(useSessionStore.getState().compositionState).toBe(reactivated);
+      expect(resolveRequestMock).not.toHaveBeenCalled();
       expect(validateMock).not.toHaveBeenCalled();
       const currentResolve = createInterpretationResolutionHandler("20000000-0000-4000-8000-000000000001");
       const accepted = makeCompositionState(4);
       currentResolve(accepted);
       expect(useSessionStore.getState().compositionState).toBe(accepted);
-      expect(validateMock).toHaveBeenCalledWith("20000000-0000-4000-8000-000000000001");
+      expect(resolveRequestMock).toHaveBeenCalledExactlyOnceWith({
+        sessionId: "20000000-0000-4000-8000-000000000001",
+        version: 4,
+        mintedVersion: true,
+      });
+      expect(validateMock).not.toHaveBeenCalled();
     });
 
-    it("applies the patched composition state and re-validates so the run-gate can reopen", () => {
+    it("applies the patched composition state and queues validation for the minted version", () => {
       const newState = makeCompositionState(3, ["analyze_colors"]);
       useSessionStore.setState({
         activeSessionId: "20000000-0000-4000-8000-000000000001",
@@ -2784,13 +2805,17 @@ describe("sessionStore", () => {
 
       // Display sync: the resolved interpretation's patched pipeline is shown.
       expect(useSessionStore.getState().compositionState).toBe(newState);
-      // Gate clearing: an explicit re-validate runs (the auto-validate
-      // subscription only fires on a version bump, which a resolve can't
-      // guarantee).
-      expect(validateMock).toHaveBeenCalledWith("20000000-0000-4000-8000-000000000001");
+      // Gate clearing goes through the queue for the minted version, never
+      // a direct validate() that would race the subscriber's own POST.
+      expect(resolveRequestMock).toHaveBeenCalledExactlyOnceWith({
+        sessionId: "20000000-0000-4000-8000-000000000001",
+        version: 3,
+        mintedVersion: true,
+      });
+      expect(validateMock).not.toHaveBeenCalled();
     });
 
-    it("re-validates even when the resolve returns no new state (null)", () => {
+    it("queues validation of the unchanged version when the resolve returns no new state (null)", () => {
       useSessionStore.setState({
         activeSessionId: "20000000-0000-4000-8000-000000000001",
         compositionState: makeCompositionState(2),
@@ -2798,9 +2823,29 @@ describe("sessionStore", () => {
 
       useSessionStore.getState().applyResolvedInterpretation(null);
 
-      // No state to apply, but the gate must still be re-checked.
+      // Opt-out: no state to apply, but the gate must still be re-checked —
+      // against the current version, flagged as not minted so the queue
+      // forces past its same-version cache.
       expect(useSessionStore.getState().compositionState?.version).toBe(2);
-      expect(validateMock).toHaveBeenCalledWith("20000000-0000-4000-8000-000000000001");
+      expect(resolveRequestMock).toHaveBeenCalledExactlyOnceWith({
+        sessionId: "20000000-0000-4000-8000-000000000001",
+        version: 2,
+        mintedVersion: false,
+      });
+      expect(validateMock).not.toHaveBeenCalled();
+    });
+
+    it("validates directly only when no queue is registered", () => {
+      registerResolveValidateRequester(null);
+      useSessionStore.setState({
+        activeSessionId: "20000000-0000-4000-8000-000000000001",
+        compositionState: makeCompositionState(2),
+      });
+
+      useSessionStore.getState().applyResolvedInterpretation(null);
+
+      expect(resolveRequestMock).not.toHaveBeenCalled();
+      expect(validateMock).toHaveBeenCalledExactlyOnceWith("20000000-0000-4000-8000-000000000001");
     });
 
     it("is a no-op without an active session", () => {
@@ -2810,6 +2855,7 @@ describe("sessionStore", () => {
         .getState()
         .applyResolvedInterpretation(makeCompositionState(3));
 
+      expect(resolveRequestMock).not.toHaveBeenCalled();
       expect(validateMock).not.toHaveBeenCalled();
     });
   });

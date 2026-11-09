@@ -285,7 +285,30 @@ Null resolve → exactly one POST, Run gate clears. Rapid successive resolves �
 one in-flight at a time, no stale result applied. Session switch mid-flight →
 no cross-session application (existing `:2750-2777` pin).
 
-**Evidence.** _(fill in)_
+**Evidence (landed).** Correction to the change text above: a plain forced
+`requestValidate` would still have produced two POSTs on accept/amend
+(mutation-confirmed), because the forced entry re-queues the version the
+subscriber already has in flight. The landed shape: new late-binding seam
+`stores/validationRequests.ts` (imports no store, so no new import-graph
+edge); `subscriptions.ts` registers `requestValidateAfterResolve` at init and
+unregisters on teardown; `applyResolvedInterpretation` calls through it with
+`{sessionId, version, mintedVersion}`. For a minted version (accept/amend)
+the request is skipped when that exact `(session, version)` is already in
+flight — its verdict necessarily post-dates the resolve — and otherwise
+queued forced; for opt-out (`newState === null`) it is always forced, since
+an in-flight request may predate the opt-out. Guards are `requestValidate`'s
+(no POST on an empty composition; none during a live run — the latter is a
+deliberate behaviour change from the old direct call, accepted 2026-11-09 as
+consistent with the auto-validate subscriber). If no queue is registered
+(`initStoreSubscriptions` never ran) the store falls back to the direct
+call, so the Run gate cannot be left shut. POST counts: accept/amend
+**2 → 1**; opt-out 1 → 1 with the gate clearing; rapid resolves coalesce.
+Tests: `applyResolvedInterpretation` suite rewritten to assert the queue
+path; 9 queue-routing tests added to `subscriptions.test.ts`; mutations
+restoring the direct call or breaking the in-flight skip go red. Scoped
+vitest 345 passed; eslint and `tsc --noEmit` exit 0; full frontend
+`vitest run` 4,426 passed. `ImportYamlModal.tsx:965` makes the same direct
+call and is left for 2B's coordinator.
 
 ### 2B — Share validation with readiness (decision needed first)
 
