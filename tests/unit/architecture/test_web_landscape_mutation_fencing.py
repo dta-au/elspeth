@@ -14361,9 +14361,11 @@ def _raw_attribute_collector(unit: SourceUnit, units: tuple[SourceUnit, ...]) ->
 # Exact non-run initialization effect: the supplied sources bind the locked
 # callback, EMPTY-only admission, and its shared occupancy implementation.
 # These are source bindings, not permissions granted by a filename alone.
+# Landscape creation now serializes and restores SQLAlchemy's transient DDL
+# rules. The EMPTY-only admission, locked callback and stamp are unchanged.
 _NEW_LANDSCAPE_STAMP_SOURCES = {
-    "src/elspeth/web/schema_probe.py": "c0f27e271e6128ea96a4cb345f32ef4c61bbcdd338aba0a9eaaf1db34447851d",
-    "src/elspeth/core/landscape/database.py": "b8da4ed519bbe887140a0a72f040ce264fc4910724c56ca0f55065c2a89653cf",
+    "src/elspeth/web/schema_probe.py": "0e4ba641686cba00c9b459e3cc241ce686847211197c2563a4991f5a5d31c4cd",
+    "src/elspeth/core/landscape/database.py": "099a5bff4fa162b87119cadbd5fc10109938cff4d6c4d2a1e8ac2e5d3f31f1ed",
     "src/elspeth/core/schema_shape.py": "5b32f7faf09a03a7c482b48a092eb0f7cf5811eb927302ad72820fde81ceccb0",
 }
 
@@ -21465,6 +21467,8 @@ def _new_landscape_stamp_control_call(unit: SourceUnit) -> ast.Call:
             "return LandscapeSchemaShape.EMPTY if database_target_is_empty(bind) else LandscapeSchemaShape.DIVERGENT",
             "return LandscapeSchemaShape.EMPTY",
         ),
+        ("src/elspeth/core/landscape/database.py", "with _LANDSCAPE_METADATA_CREATE_LOCK:", "if True:"),
+        ("src/elspeth/core/landscape/database.py", "constraint._create_rule = rule", "constraint._create_rule = None"),
         ("src/elspeth/core/schema_shape.py", 'and bind.exec_driver_sql("PRAGMA application_id").scalar_one() == 0', "and True"),
         ("src/elspeth/core/schema_shape.py", 'and bind.exec_driver_sql("PRAGMA user_version").scalar_one() == 0', "and True"),
     ],

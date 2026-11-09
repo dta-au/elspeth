@@ -4922,7 +4922,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         fingerprint="701a4d03f32ac0d4",
         ordinal=1,
         authority=None,
-        line=935,
+        line=955,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -5933,12 +5933,14 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
 _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
     # This initializer holds the Landscape target lock and stamps only its
     # proven empty Landscape store, never the separate Sessions database.
+    # Table creation now uses the shared constraint-rule restoration helper;
+    # its same-Connection forwarding grants no additional mutation authority.
     WriterIdentity(
         path="src/elspeth/web/schema_probe.py",
         symbol="init_landscape_schema.body",
         table="elspeth_schema_identity",
         operation="stamp_sqlite_sentinel",
-        fingerprint="73db976a22a18557",
+        fingerprint="b887ed3ea6657001",
         ordinal=1,
         authority=None,
         line=359,
@@ -5984,6 +5986,8 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
     # check-constraint table above the same later sites (a05cfb2a9): a
     # source-only shift of two, fingerprints, domains, escape flags and
     # acquisition counts unchanged.
+    # The Landscape metadata helper adds twenty lines above these sites;
+    # their acquisition bodies, domains and escape flags remain identical.
     WriterIdentity(
         "src/elspeth/core/landscape/database.py",
         "verify_sqlite_tier1_pragmas",
@@ -5992,7 +5996,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "4e9098161956fab6",
         1,
         None,
-        line=131,
+        line=151,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/database.py",
@@ -6002,7 +6006,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "1084a431b73718a3",
         1,
         None,
-        line=879,
+        line=899,
     ),
     # Re-pinned by P4-D6 step 5 (cross-module rule): the connection is handed
     # to ``read_schema_identities`` behind a plain import, whose body executes
@@ -6015,7 +6019,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "54f25c9b2650a66b",
         1,
         None,
-        line=904,
+        line=924,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/database.py",
@@ -6025,7 +6029,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "f95bb339c5816e92",
         1,
         None,
-        line=1010,
+        line=1030,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/database.py",
@@ -6035,7 +6039,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "7b14f45607d6611f",
         1,
         None,
-        line=1230,
+        line=1250,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/database.py",
@@ -6045,7 +6049,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "bc4b6272008ed6ec",
         1,
         None,
-        line=1375,
+        line=1395,
         connection_escape=True,
     ),
     # Re-pinned by P4-D6 step 5 (cross-module rule): same shape as
@@ -6058,7 +6062,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "bca7301699f0abd0",
         1,
         None,
-        line=1396,
+        line=1416,
     ),
     # ``with begin_write(self._engine) as conn`` inside LandscapeDB: the
     # in-file wrapper hop is transparent and ``self`` carries the declared
@@ -6071,7 +6075,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "dc8b3ee57e650e2d",
         1,
         None,
-        line=1409,
+        line=1429,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -6082,7 +6086,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "4644a6cc893b4d09",
         1,
         None,
-        line=1436,
+        line=1456,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/database.py",
@@ -6092,7 +6096,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "2cfb5322571d6d44",
         1,
         None,
-        line=1693,
+        line=1713,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/database.py",
@@ -6102,7 +6106,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "44c4543542ceeb85",
         1,
         None,
-        line=2243,
+        line=2263,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -6113,7 +6117,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "222b5f4b0d258dbe",
         1,
         None,
-        line=2225,
+        line=2245,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -6231,7 +6235,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "40f92c2195132323",
         1,
         None,
-        line=1959,
+        line=1979,
     ),
     # The reference schema exists only in a private sqlite3 :memory: store.
     WriterIdentity(
@@ -20713,7 +20717,7 @@ def test_live_connection_domain_classification_is_exact() -> None:
             "145b5590f940eae3",
             1,
             None,
-            line=1448,
+            line=1468,
         ),
         WriterIdentity(
             "src/elspeth/core/schema_shape.py",
