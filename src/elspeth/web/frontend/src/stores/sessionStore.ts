@@ -1416,16 +1416,14 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         await reconcileProposalConflict(activeSessionId, proposalId, err as ApiError, isCurrent);
       } else {
         const apiErr = err as ApiError;
-        // proposal_validation_failed (HTTP 422) carries structured
-        // validation entries plus a server-side auto-reject side effect.
-        // Reload proposals so the now-rejected one drops off the pending
-        // banner; surface the entries as bullet points in the error
-        // banner via `errorDetails`. Without this, the toast renders the
-        // Pydantic-flattened message as one wall-of-text line and the
-        // banner keeps showing the proposal as actionable until refresh.
+        // These refusals terminally reject the proposal. Refresh the pending
+        // banner, keeping validation entries available for the error banner.
         const isProposalValidationFailure =
           apiErr.error_type === "proposal_validation_failed";
-        if (isProposalValidationFailure) {
+        const isTerminalProposalRefusal = isProposalValidationFailure ||
+          apiErr.error_type === "proposal_argument_invalid" ||
+          apiErr.error_type === "proposal_no_change";
+        if (isTerminalProposalRefusal && isCurrent()) {
           await get().loadCompositionProposals(activeSessionId);
         }
         if (isCurrent()) {
