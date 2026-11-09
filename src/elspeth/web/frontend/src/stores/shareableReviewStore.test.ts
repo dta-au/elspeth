@@ -194,4 +194,75 @@ describe("shareableReviewStore", () => {
     expect(state.inFlight).toBe(snapshot.inFlight);
     expect(state.sessionIdForResponse).toBe(snapshot.sessionIdForResponse);
   });
+
+  // ── configure phase ─────────────────────────────────────────────────
+
+  const FILES = {
+    files: [{ filename: "a.csv", size_bytes: 3, used_by: ["source"] }],
+    importable: true,
+    not_importable_reason: null,
+  };
+  const OPTIONS = { allowImport: true, lifetimeSeconds: 86400 } as const;
+
+  it("openConfigure loads files and opens the dialog without minting", async () => {
+    const mint = vi.spyOn(api, "markReadyForReview");
+    vi.spyOn(api, "fetchShareableFiles").mockResolvedValueOnce(FILES);
+    await useShareableReviewStore.getState().openConfigure(SESSION_A);
+    const state = useShareableReviewStore.getState();
+    expect(mint).not.toHaveBeenCalled();
+    expect(state.dialogOpen).toBe(true);
+    expect(state.request).toMatchObject({ kind: "configure", sessionId: SESSION_A, files: FILES });
+    expect(state.inFlight).toBe(false);
+  });
+
+  it("openConfigure records a files-load failure in the configure phase", async () => {
+    vi.spyOn(api, "fetchShareableFiles").mockRejectedValueOnce({ status: 404 });
+    await useShareableReviewStore.getState().openConfigure(SESSION_A);
+    expect(useShareableReviewStore.getState().request).toMatchObject({
+      kind: "configure",
+      files: null,
+      filesError: "Session not found.",
+    });
+  });
+
+  it("confirmMark mints with the options from the configure phase", async () => {
+    vi.spyOn(api, "fetchShareableFiles").mockResolvedValueOnce(FILES);
+    const mint = vi.spyOn(api, "markReadyForReview").mockResolvedValueOnce(validResponseFor("1"));
+    await useShareableReviewStore.getState().openConfigure(SESSION_A);
+    await useShareableReviewStore.getState().confirmMark(OPTIONS);
+    expect(mint).toHaveBeenCalledWith(SESSION_A, OPTIONS);
+    const state = useShareableReviewStore.getState();
+    expect(state.request.kind).toBe("resolved");
+    expect(state.latestResponse?.token).toBe("tk-1");
+  });
+
+  it("confirmMark surfaces a 409 file-naming detail as the error", async () => {
+    vi.spyOn(api, "fetchShareableFiles").mockResolvedValueOnce(FILES);
+    vi.spyOn(api, "markReadyForReview").mockRejectedValueOnce({ status: 409, detail: "a.csv cannot be shared" });
+    await useShareableReviewStore.getState().openConfigure(SESSION_A);
+    await useShareableReviewStore.getState().confirmMark(OPTIONS);
+    expect(useShareableReviewStore.getState().error).toBe("a.csv cannot be shared");
+  });
+
+  it("confirmMark is a no-op outside the configure phase", async () => {
+    const mint = vi.spyOn(api, "markReadyForReview");
+    await useShareableReviewStore.getState().confirmMark(OPTIONS);
+    expect(mint).not.toHaveBeenCalled();
+    expect(useShareableReviewStore.getState().request.kind).toBe("idle");
+  });
+
+  it("a late files response for a superseded configure is dropped", async () => {
+    let resolveA: (v: typeof FILES) => void = () => {};
+    vi.spyOn(api, "fetchShareableFiles")
+      .mockReturnValueOnce(new Promise((resolve) => { resolveA = resolve; }))
+      .mockResolvedValueOnce({ ...FILES, importable: false });
+    const first = useShareableReviewStore.getState().openConfigure(SESSION_A);
+    await useShareableReviewStore.getState().openConfigure(SESSION_B);
+    resolveA(FILES);
+    await first;
+    expect(useShareableReviewStore.getState().request).toMatchObject({
+      kind: "configure",
+      sessionId: SESSION_B,
+    });
+  });
 });

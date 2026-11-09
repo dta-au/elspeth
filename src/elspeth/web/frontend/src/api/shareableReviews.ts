@@ -24,8 +24,13 @@ import type {
   ApiError,
   CompositionState,
   MarkReadyForReviewResponse,
+  MarkReadyOptions,
   PipelineMetadata,
+  ShareableFile,
+  ShareableFilesResponse,
   ShareableLinkResponse,
+  SharedFileSummary,
+  SharedImportResponse,
   SharedInspectResponse,
 } from "../types/api";
 import { validateAuditReadinessSnapshot } from "./auditReadiness";
@@ -144,7 +149,10 @@ function validateSharedInspectResponse(body: unknown, status: number): SharedIns
     typeof body.created_by_username !== "string" ||
     body.created_by_username.trim().length === 0 ||
     typeof body.created_at !== "string" ||
-    typeof body.expires_at !== "string"
+    typeof body.expires_at !== "string" ||
+    typeof body.import_allowed !== "boolean" ||
+    !Array.isArray(body.files) ||
+    !body.files.every(isSharedFileSummary)
   ) {
     throw unexpectedShape(status, "shared-inspect");
   }
@@ -173,17 +181,75 @@ function validateSharedInspectResponse(body: unknown, status: number): SharedIns
     created_by_username: body.created_by_username,
     created_at: body.created_at,
     expires_at: body.expires_at,
+    import_allowed: body.import_allowed,
+    files: body.files.map((file) => ({ filename: file.filename, size_bytes: file.size_bytes })),
   };
 }
 
-/** POST /api/sessions/{session_id}/mark-ready-for-review. */
+function isSharedFileSummary(value: unknown): value is SharedFileSummary {
+  return isRecord(value) && typeof value.filename === "string" && typeof value.size_bytes === "number";
+}
+
+function isShareableFile(value: unknown): value is ShareableFile {
+  return (
+    isRecord(value) &&
+    typeof value.filename === "string" &&
+    typeof value.size_bytes === "number" &&
+    Array.isArray(value.used_by) &&
+    value.used_by.every((user) => typeof user === "string")
+  );
+}
+
+function validateShareableFilesResponse(body: unknown, status: number): ShareableFilesResponse {
+  if (
+    !isRecord(body) ||
+    !Array.isArray(body.files) ||
+    !body.files.every(isShareableFile) ||
+    typeof body.importable !== "boolean" ||
+    !(typeof body.not_importable_reason === "string" || body.not_importable_reason === null)
+  ) {
+    throw unexpectedShape(status, "shareable-files");
+  }
+  return {
+    files: body.files.map((file) => ({
+      filename: file.filename,
+      size_bytes: file.size_bytes,
+      used_by: [...file.used_by],
+    })),
+    importable: body.importable,
+    not_importable_reason: body.not_importable_reason,
+  };
+}
+
+function validateSharedImportResponse(body: unknown, status: number): SharedImportResponse {
+  if (!isRecord(body) || typeof body.session_id !== "string" || typeof body.state_id !== "string") {
+    throw unexpectedShape(status, "shared-import");
+  }
+  return { session_id: body.session_id, state_id: body.state_id };
+}
+
+/**
+ * POST /api/sessions/{session_id}/mark-ready-for-review.
+ *
+ * ``options`` is optional while the dialog still mints with the server
+ * defaults: absent sends no body (the legacy request).
+ */
 export async function markReadyForReview(
   sessionId: string,
+  options?: MarkReadyOptions,
   signal?: AbortSignal,
 ): Promise<MarkReadyForReviewResponse> {
   const response = await authFetch(`/api/sessions/${sessionId}/mark-ready-for-review`, {
     method: "POST",
-    headers: authHeaders(),
+    headers: authHeaders(options === undefined ? undefined : "application/json"),
+    ...(options === undefined
+      ? {}
+      : {
+          body: JSON.stringify({
+            allow_import: options.allowImport,
+            lifetime_seconds: options.lifetimeSeconds,
+          }),
+        }),
     signal,
   });
   return validateMarkReadyResponse(await parseResponse<unknown>(response), response.status);
@@ -212,6 +278,39 @@ export async function fetchSharedInspect(
     headers: authHeaders(),
     signal,
   });
+  return validateSharedInspectResponse(await parseSharedResponse(response), response.status);
+}
+
+/** GET /api/sessions/{session_id}/shareable-files. */
+export async function fetchShareableFiles(
+  sessionId: string,
+  signal?: AbortSignal,
+): Promise<ShareableFilesResponse> {
+  const response = await authFetch(`/api/sessions/${sessionId}/shareable-files`, {
+    method: "GET",
+    headers: authHeaders(),
+    signal,
+  });
+  return validateShareableFilesResponse(await parseResponse<unknown>(response), response.status);
+}
+
+/**
+ * POST /api/sessions/shared/{token}/import. A capability 401 (bad or
+ * expired token, no Bearer challenge) must not log the user out.
+ */
+export async function importSharedSnapshot(
+  token: string,
+  signal?: AbortSignal,
+): Promise<SharedImportResponse> {
+  const response = await authFetch(`/api/sessions/shared/${encodeURIComponent(token)}/import`, {
+    method: "POST",
+    headers: authHeaders(),
+    signal,
+  });
+  return validateSharedImportResponse(await parseSharedResponse(response), response.status);
+}
+
+async function parseSharedResponse(response: Response): Promise<unknown> {
   // This is the backend's bare challenge, not a general challenge parser.
   // Older servers and capability refusals retain the existing no-logout path.
   const authenticationRefused = response.status === 401 &&
@@ -227,5 +326,5 @@ export async function fetchSharedInspect(
     }
     throw error;
   }
-  return validateSharedInspectResponse(body, response.status);
+  return body;
 }

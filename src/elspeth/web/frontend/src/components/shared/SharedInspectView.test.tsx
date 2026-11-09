@@ -68,6 +68,8 @@ const _validResponse: SharedInspectResponse = {
   created_by_username: "alice-the-analyst",
   created_at: "2026-05-19T00:00:00+00:00",
   expires_at: "2026-06-19T00:00:00+00:00",
+  import_allowed: false,
+  files: [],
 };
 
 describe("SharedInspectView", () => {

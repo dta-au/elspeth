@@ -2,6 +2,8 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import {
   fetchShareableLink,
   fetchSharedInspect,
+  fetchShareableFiles,
+  importSharedSnapshot,
   markReadyForReview,
 } from "./shareableReviews";
 import { useAuthStore } from "../stores/authStore";
@@ -163,6 +165,8 @@ describe("shareableReviews API client", () => {
       created_by_username: "alice-the-analyst",
       created_at: "2026-05-19T00:00:00+00:00",
       expires_at: "2026-06-19T00:00:00+00:00",
+      import_allowed: true,
+      files: [{ filename: "a.csv", size_bytes: 12 }],
     };
     (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
       new Response(JSON.stringify(body), {
@@ -172,6 +176,8 @@ describe("shareableReviews API client", () => {
     );
 
     const response = await fetchSharedInspect(token);
+    expect(response.import_allowed).toBe(true);
+    expect(response.files).toEqual([{ filename: "a.csv", size_bytes: 12 }]);
     expect(response.session_id).toBe(SESSION_ID);
     expect(response.audit_readiness.rows).toHaveLength(6);
 
@@ -235,6 +241,8 @@ describe("shareableReviews API client", () => {
       created_by_username: "alice-the-analyst",
       created_at: "2026-05-19T00:00:00+00:00",
       expires_at: "2026-06-19T00:00:00+00:00",
+      import_allowed: false,
+      files: [],
       ...overrides,
     };
   }
@@ -474,5 +482,110 @@ describe("shareableReviews API client", () => {
     await expect(fetchSharedInspect("good-but-stale-token")).rejects.toMatchObject({
       status: 404,
     });
+  });
+
+  // ── share options + import ──────────────────────────────────────────
+
+  const MARK_READY_BODY = {
+    token: "tk",
+    share_url: "/#/shared/tk",
+    expires_at: "2026-06-19T00:00:00+00:00",
+    payload_digest: "sha256:" + "ab".repeat(32),
+  };
+
+  it("markReadyForReview sends allow_import and lifetime_seconds as a JSON body", async () => {
+    _mockJsonResponse(MARK_READY_BODY);
+    await markReadyForReview(SESSION_ID, { allowImport: true, lifetimeSeconds: 86400 });
+    const [, init] = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(JSON.parse(init?.body as string)).toEqual({ allow_import: true, lifetime_seconds: 86400 });
+    const headers = init?.headers as Record<string, string> | undefined;
+    expect(headers?.["Content-Type"]).toBe("application/json");
+  });
+
+  it("markReadyForReview without options sends no body", async () => {
+    _mockJsonResponse(MARK_READY_BODY);
+    await markReadyForReview(SESSION_ID);
+    const [, init] = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(init?.body).toBeUndefined();
+  });
+
+  it("fetchSharedInspect rejects a missing import_allowed", async () => {
+    const body = _buildValidSharedInspectBody();
+    delete body.import_allowed;
+    _mockJsonResponse(body);
+    await expect(fetchSharedInspect("any-token")).rejects.toMatchObject({
+      detail: expect.stringContaining("shared-inspect"),
+    });
+  });
+
+  it("fetchSharedInspect rejects a malformed files entry", async () => {
+    _mockJsonResponse(_buildValidSharedInspectBody({ files: [{ filename: "a.csv" }] }));
+    await expect(fetchSharedInspect("any-token")).rejects.toMatchObject({
+      detail: expect.stringContaining("shared-inspect"),
+    });
+  });
+
+  it("fetchShareableFiles GETs the URL and parses the response", async () => {
+    _mockJsonResponse({
+      files: [{ filename: "a.csv", size_bytes: 3, used_by: ["source"] }],
+      importable: false,
+      not_importable_reason: "too big",
+    });
+    const response = await fetchShareableFiles(SESSION_ID);
+    expect(response.files[0].used_by).toEqual(["source"]);
+    expect(response.not_importable_reason).toBe("too big");
+    const [url, init] = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(url).toBe(`/api/sessions/${SESSION_ID}/shareable-files`);
+    expect(init?.method).toBe("GET");
+  });
+
+  it("fetchShareableFiles rejects a malformed body", async () => {
+    _mockJsonResponse({ files: [{ filename: "a.csv", size_bytes: 3 }], importable: true, not_importable_reason: null });
+    await expect(fetchShareableFiles(SESSION_ID)).rejects.toMatchObject({
+      detail: expect.stringContaining("shareable-files"),
+    });
+  });
+
+  it("importSharedSnapshot POSTs the URL-encoded import path and parses 201", async () => {
+    _mockJsonResponse({ session_id: SESSION_ID, state_id: "st-1" }, 201);
+    const response = await importSharedSnapshot("a/b");
+    expect(response).toEqual({ session_id: SESSION_ID, state_id: "st-1" });
+    const [url, init] = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(url).toBe(`/api/sessions/shared/${encodeURIComponent("a/b")}/import`);
+    expect(init?.method).toBe("POST");
+  });
+
+  it("importSharedSnapshot rejects a malformed body", async () => {
+    _mockJsonResponse({ session_id: SESSION_ID }, 201);
+    await expect(importSharedSnapshot("tk")).rejects.toMatchObject({
+      detail: expect.stringContaining("shared-import"),
+    });
+  });
+
+  it("importSharedSnapshot does not log out on a capability 401", async () => {
+    localStorage.setItem("auth_token", "reviewer-session-token");
+    useAuthStore.setState({ token: "reviewer-session-token", isLoading: false });
+    _mockJsonResponse({ detail: "Invalid or expired share token" }, 401);
+    const request = importSharedSnapshot("bad-token");
+    await expect(request).rejects.toMatchObject({ status: 401 });
+    await expect(request).rejects.not.toMatchObject({ error_type: "authentication_required" });
+    expect(useAuthStore.getState().token).toBe("reviewer-session-token");
+    expect(localStorage.getItem("auth_token")).toBe("reviewer-session-token");
+  });
+
+  it("importSharedSnapshot logs out on a bare Bearer 401", async () => {
+    localStorage.setItem("auth_token", "expired-token");
+    useAuthStore.setState({ token: "expired-token", isLoading: false });
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+      new Response(JSON.stringify({ detail: "Token expired" }), {
+        status: 401,
+        headers: { "content-type": "application/json", "WWW-Authenticate": "Bearer" },
+      }),
+    );
+    await expect(importSharedSnapshot("tk")).rejects.toMatchObject({
+      status: 401,
+      error_type: "authentication_required",
+    });
+    expect(useAuthStore.getState().token).toBeNull();
   });
 });
