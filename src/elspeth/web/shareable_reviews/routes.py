@@ -1,19 +1,21 @@
 """FastAPI router for the shareable-reviews endpoints.
 
-Phase 6A Task 6 (UX redesign 2026-05). Four routes:
+Phase 6A Task 6 (UX redesign 2026-05). Five routes:
 
 * ``POST /api/sessions/{session_id}/mark-ready-for-review``
 * ``GET  /api/sessions/{session_id}/shareable-link``
 * ``GET  /api/sessions/{session_id}/shareable-files``
 * ``GET  /api/sessions/shared/{token}``
+* ``POST /api/sessions/shared/{token}/import``
 
-The first two require ``verify_session_ownership`` — same byte-identical
-404 contract used by every other session-scoped route. The third is the
-recipient's inspect view: it requires authentication (the token is a
-capability, NOT an authenticator — see plan §"Capability vs authenticator"),
-but does NOT call ownership verification because the recipient is
-deliberately a different user from the session owner. Token-verification
-failures map to 401; expired payload-store blobs map to 404.
+The first three require ``verify_session_ownership`` — same byte-identical
+404 contract used by every other session-scoped route. The last two are the
+recipient's: the inspect view and the import. They require authentication
+(the token is a capability, NOT an authenticator — see plan §"Capability vs
+authenticator"), but do NOT call ownership verification because the
+recipient is deliberately a different user from the session owner.
+Token-verification failures map to 401; expired payload-store blobs map to
+404.
 
 Layer: L3 (application). Reads ``app.state.shareable_review_service``
 which is wired in ``web/app.py``.
@@ -39,11 +41,13 @@ from elspeth.web.middleware.rate_limit import (
 )
 from elspeth.web.sessions.ownership import verify_session_ownership
 from elspeth.web.sessions.protocol import SessionServiceProtocol
+from elspeth.web.shareable_reviews.importer import ImportNotAllowedError, import_shared_snapshot
 from elspeth.web.shareable_reviews.models import (
     MarkReadyForReviewRequest,
     MarkReadyForReviewResponse,
     ShareableFilesResponse,
     ShareableLinkResponse,
+    SharedImportResponse,
     SharedInspectResponse,
 )
 from elspeth.web.shareable_reviews.service import (
@@ -58,7 +62,7 @@ _NO_STORE = "no-store"
 def create_shareable_reviews_router() -> APIRouter:
     """Create the shareable-reviews router.
 
-    Four endpoints; see module docstring for the access-control matrix.
+    Five endpoints; see module docstring for the access-control matrix.
     """
     router = APIRouter(tags=["shareable-reviews"])
 
@@ -236,6 +240,48 @@ def create_shareable_reviews_router() -> APIRouter:
                 detail="Shared snapshot is no longer available; ask the sender for a fresh link",
             ) from None
         return JSONResponse(
+            content=result.model_dump(mode="json"),
+            headers={"Cache-Control": _NO_STORE},
+        )
+
+    @router.post(
+        "/api/sessions/shared/{token}/import",
+        status_code=201,
+        response_model=SharedImportResponse,
+    )
+    async def import_shared_pipeline(
+        token: str,
+        request: Request,
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
+        # Strict bucket: a token probe that also creates a session and copies files.
+        rate_limiter: WebRateLimiter = Depends(get_rate_limiter),  # noqa: B008
+    ) -> JSONResponse:
+        """Import a copy of a shared pipeline and its files into a new session.
+
+        Any authenticated pipeline user holding a link that allows import may
+        import it, the sharer included; the token is the capability, so no
+        ownership check applies. Nothing is created unless the token, the
+        snapshot and every frozen file read cleanly.
+
+        ``InvalidToken`` → 401; a view-only link → 403; a snapshot or frozen
+        file no longer stored → 404 (ask the sender for a fresh link). Quota
+        refusals and seeding refusals surface as their own errors, and the
+        half-built session is archived.
+        """
+        await rate_limiter.check(user.user_id)
+        try:
+            result = await import_shared_snapshot(token=token, request=request, user=user)
+        except InvalidToken:
+            raise HTTPException(status_code=401, detail="Invalid or expired share token") from None
+        except ImportNotAllowedError:
+            raise HTTPException(status_code=403, detail="This share link does not allow import") from None
+        except PayloadNotFoundError:
+            raise HTTPException(
+                status_code=404,
+                detail="Shared snapshot is no longer available; ask the sender for a fresh link",
+            ) from None
+        return JSONResponse(
+            status_code=201,
             content=result.model_dump(mode="json"),
             headers={"Cache-Control": _NO_STORE},
         )

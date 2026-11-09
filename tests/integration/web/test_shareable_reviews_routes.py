@@ -676,6 +676,13 @@ def test_review_write_endpoints_use_write_bucket_and_resolve_stays_strict(
     first = client.get(f"/api/sessions/shared/{token}")
     second = client.get(f"/api/sessions/shared/{token}")
     assert 429 in (first.status_code, second.status_code)
+    # Import (token probe that creates a session) is strict too: a fresh
+    # limit=1 strict bucket trips on the second call while the write bucket
+    # is untouched.
+    client.app.state.rate_limiter = ComposerRateLimiter(limit=1)
+    first_import = client.post(f"/api/sessions/shared/{token}/import")
+    second_import = client.post(f"/api/sessions/shared/{token}/import")
+    assert (first_import.status_code, second_import.status_code) == (401, 429)
 
 
 def test_mark_ready_for_review_audit_write_failure_returns_no_token(
@@ -850,3 +857,53 @@ def test_mark_ready_with_import_freezes_an_uploaded_file(
         (blob["content_hash"], "customers.csv", len(content))
     ]
     assert storage_path not in json.dumps(stored)
+
+
+# ── POST /sessions/shared/{token}/import ────────────────────────────────
+
+
+def test_import_route_requires_authentication(
+    audit_readiness_client_anonymous: TestClient,
+) -> None:
+    """The token is a capability, not an authenticator: import needs a login."""
+    response = audit_readiness_client_anonymous.post("/api/sessions/shared/some-token/import")
+    assert response.status_code == 401
+
+
+def test_import_route_copies_the_shared_file_into_a_new_session(
+    audit_readiness_client_with_state: tuple[TestClient, UUID],
+) -> None:
+    """End to end through the real routes: share with import, then import it."""
+    client, session_id = audit_readiness_client_with_state
+    content = b"id,name\n1,Ada\n"
+    seeded = _seed_uploaded_file_source(client, session_id, content)
+    marked = client.post(f"/api/sessions/{session_id}/mark-ready-for-review", json={"allow_import": True})
+    assert marked.status_code == 200, marked.text
+
+    imported = client.post(f"/api/sessions/shared/{marked.json()['token']}/import")
+
+    assert imported.status_code == 201, imported.text
+    assert imported.headers["Cache-Control"] == "no-store"
+    new_session_id = imported.json()["session_id"]
+    assert new_session_id != str(session_id)
+    with client.app.state.session_engine.connect() as conn:
+        copies = conn.execute(select(blobs_table).where(blobs_table.c.session_id == new_session_id)).mappings().all()
+    assert [(row["content_hash"], row["filename"]) for row in copies] == [(seeded["content_hash"], "customers.csv")]
+    record = asyncio.run(client.app.state.session_service.get_current_state(UUID(new_session_id)))
+    assert record is not None
+    assert str(record.id) == imported.json()["state_id"]
+    assert record.sources["source"]["options"]["blob_ref"] == copies[0]["id"]
+    assert record.composer_meta["shared_import"]["payload_digest"] == marked.json()["payload_digest"]
+
+
+def test_import_route_refuses_a_view_only_link_with_403(
+    audit_readiness_client_with_state: tuple[TestClient, UUID],
+) -> None:
+    client, session_id = audit_readiness_client_with_state
+    token = _mint_token(client, session_id)
+    before = client.get("/api/sessions").json()
+
+    response = client.post(f"/api/sessions/shared/{token}/import")
+
+    assert response.status_code == 403, response.text
+    assert client.get("/api/sessions").json() == before

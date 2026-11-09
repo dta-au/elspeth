@@ -37,6 +37,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import Literal
+from uuid import UUID
 
 from elspeth.web.audit_readiness.models import AuditReadinessSnapshot
 from elspeth.web.execution.schemas import _StrictResponse
@@ -96,6 +97,17 @@ class ShareableLinkResponse(_StrictResponse):
     expires_at: datetime
     state_id: str
     payload_digest: str
+
+
+class SharedImportResponse(_StrictResponse):
+    """Returned by ``POST /api/sessions/shared/{token}/import``.
+
+    The recipient's new session and the composition state the import seeded
+    into it.
+    """
+
+    session_id: UUID
+    state_id: str
 
 
 class ShareableFileView(_StrictResponse):
