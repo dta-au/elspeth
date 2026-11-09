@@ -35,9 +35,24 @@ different owners:
    limit, but a user describes all three the same way, so rule it out
    explicitly.
 
-The fix differs by case. Case 1 is a server-chosen number and a context
-policy; case 2 is a model choice plus a context policy; case 3 is a planner
-brief defect and out of scope here.
+The maintainer reports cases 1 and 2 both occur: some sessions are refused
+at the 2 MiB cap before reaching the gateway, others reach the gateway and
+are rejected with "too many tokens". Treat them as two symptoms of one
+unbounded growth, not two problems. The arithmetic says why: at the measured
+ratio of about 4.3 bytes per prompt token, 2 MiB is roughly 490,000 tokens,
+far past the window of every planner model in use, so the byte cap can only
+be the first thing hit when the growth is concentrated in bytes the provider
+would tokenize cheaply (large JSON tool results, the hatch transcript) or when
+the request outgrows the window and the cap in the same step. Phase 1 must
+explain, per failing session, which symptom fired and why that one fired
+first. Case 3 is a planner brief defect and out of scope here; rule it out
+and move on.
+
+Note the escape hatch is engaged by `MALFORMED_RESPONSE`, `REPAIR_EXHAUSTED`
+and candidate-rejection exhaustion, not by provider errors, so a
+context-length rejection does not itself trigger the hatch. If a session
+shows a gateway rejection followed by a 2 MiB refusal, find the step that
+grew the request between them rather than assuming the hatch did it.
 
 ### What is already measured (ground truth, 2026-11-09)
 
@@ -85,11 +100,19 @@ Steps:
    `error_class`, `error_message`. Write the table to a file under
    `docs/development/evidence/` (confirm with `git check-ignore -v` that the
    path is tracked).
-2. Classify the failure. Look for `REQUEST_BYTES_EXHAUSTED` in
+2. Classify each failure. Look for `REQUEST_BYTES_EXHAUSTED` in
    `composer_async_operations.failure_code` and in the operation's result
-   JSON; look for `context_length_exceeded` in the call records; look for
-   `budget_exhausted` and `REPAIR_EXHAUSTED`. State which one the user hits,
-   how often, and at what turn number and byte total.
+   JSON; look for `context_length_exceeded` in the call records (note the
+   byte-cap refusal produces no call record, because no call was made, so
+   the operation row is the only evidence for it); look for
+   `budget_exhausted` and `REPAIR_EXHAUSTED`. For every failing operation
+   state which symptom fired, the turn number, the last recorded
+   `prompt_tokens`, and the request byte total at the refusal. Separate the
+   sessions that hit the byte cap from those rejected by the gateway and
+   compare their component profiles: the hypothesis to test is that
+   byte-cap sessions carry large low-token-density JSON (tool results,
+   schema evidence, transcript) and gateway-rejected sessions carry prose
+   history.
 3. Attribute the growth. From the `message_bytes` series across the session's
    calls, say which message index grows: the user-2 provider request
    (conversation context), the continuation tail, the reference block, or the
@@ -148,7 +171,19 @@ and the audit model.
   user must be able to restate it.
 - **Thresholds in tokens, from provider usage.** `prompt_tokens` is in the
   ledger; bytes-to-tokens shifts with JSON density. The byte ceiling stays
-  as the outer guard.
+  as the outer guard, but it must be made consistent with the planner
+  model's window: a user should be refused by ELSPETH, with an actionable
+  message and an audit record, before the gateway refuses them with "too
+  many tokens". Propose a per-model token budget (window minus the
+  completion allowance `composer_planner_max_completion_tokens` minus a
+  margin) and derive the byte guard from it with the measured ratio, or
+  justify keeping a fixed byte number. Either way the refusal must name the
+  component that overflowed, from the byte split, not just the total.
+- **Both symptoms must disappear together.** Acceptance is a replay of
+  every failing session in the Phase 1 evidence showing the new policy
+  keeps each call under the token budget and the byte guard, with the
+  omissions recorded. A fix that moves sessions from one symptom to the
+  other is not a fix.
 - **The fixed prefix stays byte-identical across calls.** The skill,
   reference block and tool definitions are three quarters of the prompt and
   are served from cache on every call after the first. Any policy that
@@ -193,8 +228,11 @@ Likely shape, to be confirmed by Phase 1:
 5. Frontend: when an operation fails with `REQUEST_BYTES_EXHAUSTED` or
    `context_length_exceeded`, the user must see an actionable message
    naming the cause and the recourse (start a new session, shorten the
-   request). Check `frontend/src/types/index.ts` for the existing error
-   shapes before adding one.
+   request). Today the user reports these as "hitting a limit", which
+   means neither surface is telling them what happened. Check
+   `frontend/src/types/index.ts` for the existing error shapes before
+   adding one, and make the two cases distinguishable to the user and in
+   the audit record.
 
 ### Phase 4: verify
 
