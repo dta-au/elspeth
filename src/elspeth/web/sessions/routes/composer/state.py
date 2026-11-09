@@ -4,13 +4,15 @@ import asyncio
 import json
 import re
 from dataclasses import replace
-from typing import Annotated, NotRequired, TypedDict
+from typing import Annotated, Final, NotRequired, TypedDict
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from elspeth.contracts.blobs import BlobRecord
+from elspeth.contracts.blobs_inline import BlobInlineRef, ContentEncoding
 from elspeth.contracts.composer_interpretation import InterpretationSurfaceOrigin
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.core.secrets import collect_credential_field_violations
@@ -20,7 +22,7 @@ from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.schemas import PluginKind
 from elspeth.web.compartments import compartment_ingress_record, compartment_marking_header
 from elspeth.web.composer.invariants import InvariantError
-from elspeth.web.composer.state import CompositionState, SourceSpec
+from elspeth.web.composer.state import SOURCE_AUTHORING_KEY, CompositionState, NodeSpec, OutputSpec, SourceSpec
 from elspeth.web.composer.yaml_generator import (
     PUBLIC_EXPORT_REBIND_GUIDANCE,
     PUBLIC_EXPORT_REDACTED_SOURCE_MARKER_PREFIX,
@@ -118,6 +120,27 @@ class LibraryForkFacts(TypedDict):
 
 class LibraryForkMetaUpdates(TypedDict):
     library_fork: LibraryForkFacts
+
+
+class SharedImportFile(TypedDict):
+    sha256: str
+    blob_id: str
+
+
+class SharedImportFacts(TypedDict):
+    payload_digest: str
+    shared_by_user_id: str
+    shared_by_username: str
+    shared_from_session_id: str
+    shared_from_state_id: str
+    files: list[SharedImportFile]
+
+
+class SharedImportMetaUpdates(TypedDict):
+    shared_import: SharedImportFacts
+
+
+ComposerSeedMetaUpdates = LibraryForkMetaUpdates | SharedImportMetaUpdates
 
 
 async def _surface_reverted_interpretation_reviews(
@@ -247,11 +270,33 @@ class StateYamlResponse(TypedDict):
     redaction: NotRequired[StateYamlRedaction]
 
 
+class InlineBlobBindingRequest(BaseModel):
+    """One file to re-attach as an inline-content marker at a field path."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    blob_id: str
+    encoding: ContentEncoding = "utf-8"
+
+
+class SourceBlobRowsBindingRequest(BaseModel):
+    """The files of one ``blob_rows`` source, in row order."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    blob_ids: list[str] = Field(min_length=1)
+
+
 class ImportStateYamlRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     yaml: str = Field(min_length=1, max_length=MAX_RUNTIME_YAML_IMPORT_CHARS)
     source_blob_ids: dict[str, str] | None = None
+    # Key: canonical inline-ref field path (``source:<name>.options.<f>...``,
+    # ``node:<id>.options...`` or ``output:<name>.options...``).
+    inline_blob_bindings: dict[str, InlineBlobBindingRequest] | None = None
+    # Key: source name.
+    source_blob_rows: dict[str, SourceBlobRowsBindingRequest] | None = None
 
 
 class SeedCompositionStateRequest(BaseModel):
@@ -315,9 +360,11 @@ def _reject_redacted_sources_without_rebind(state: CompositionState, *, yaml_tex
     used to sail through Stage-1 and strand the user with a raw Pydantic
     "path Field required" from the strict lane; the export's own marker lets
     this guard name the real remedy instead. Runs AFTER
-    ``_state_with_imported_source_blobs`` so a supplied re-bind counts, and
-    accepts a hand-re-added path option (the path guards downstream still
-    police its value).
+    ``_state_with_imported_source_blobs`` and
+    ``_state_with_imported_source_blob_rows`` so a supplied re-bind counts
+    (a ``blob_rows`` source's re-bound ``blobs`` list included), and accepts a
+    hand-re-added path option (the path guards downstream still police its
+    value).
     """
     marked = _redaction_marker_source_names(yaml_text)
     if not marked:
@@ -328,6 +375,9 @@ def _reject_redacted_sources_without_rebind(state: CompositionState, *, yaml_tex
         if "blob_ref" in source.options:
             continue
         if any(key in source.options for key in SOURCE_LOCAL_PATH_OPTION_KEYS):
+            continue
+        if source.plugin == "blob_rows" and "blobs" in source.options:
+            # Re-bound through source_blob_rows.
             continue
         raise HTTPException(
             status_code=400,
@@ -541,6 +591,234 @@ async def _state_with_imported_source_blobs(
         metadata=state.metadata,
         version=state.version,
     )
+
+
+# Source option roots the server writes from session records (the composer's
+# set_source_from_blob(s) tools refuse them as wire targets too).
+_SERVER_OWNED_SOURCE_ROOTS: Final = frozenset({"blob_ref", "blobs", SOURCE_AUTHORING_KEY})
+
+
+class _SourceBlobRowsEntry(TypedDict):
+    """One ``blob_rows`` file entry, in ``_resolve_source_blobs``'s shape."""
+
+    blob_id: str
+    payload_ref: str
+    filename: str
+    mime_type: str
+    size_bytes: int
+
+
+def _parse_import_blob_id(raw: str, *, where: str) -> UUID:
+    try:
+        return UUID(raw)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"{where} must be a UUID") from exc
+
+
+async def _ready_import_blob(
+    blob_id: UUID,
+    *,
+    request: Request,
+    session_id: UUID,
+    session_operation_context: SessionOperationContext,
+) -> tuple[BlobRecord, str]:
+    """Return this session's ready blob and its content hash, refusing as the source re-bind does.
+
+    A missing blob and another session's blob are indistinguishable (404); a
+    pending or errored blob has no settled bytes to bind (409).
+    """
+    blob_service = request.app.state.blob_service
+    if blob_service is None:
+        raise HTTPException(status_code=409, detail="Blob service unavailable for YAML import")
+    try:
+        blob: BlobRecord = await blob_service.get_blob(blob_id, session_operation_context=session_operation_context)
+    except BlobNotFoundError:
+        raise HTTPException(status_code=404, detail="Blob not found") from None
+    if blob.session_id != session_id:
+        raise HTTPException(status_code=404, detail="Blob not found")
+    if blob.status != "ready":
+        raise HTTPException(status_code=409, detail="Blob is not ready")
+    if blob.content_hash is None:
+        raise AuditIntegrityError(f"Ready blob '{blob.id}' has no canonical content hash")
+    return blob, blob.content_hash
+
+
+def _with_inline_marker[SpecT: (SourceSpec, NodeSpec, OutputSpec)](
+    spec: SpecT,
+    keys: list[str],
+    marker: dict[str, str],
+    *,
+    field_path: str,
+) -> SpecT:
+    """``spec`` with ``marker`` at ``keys`` inside a thawed copy of its options.
+
+    Missing intermediate mappings are created. A value already at the leaf,
+    or a non-mapping value on the way to it, is refused: re-binding fills a
+    removed marker's slot and never overwrites what the graph carries.
+    """
+    patched = deep_thaw(spec.options)
+    container = patched
+    for key in keys[:-1]:
+        if key not in container:
+            container[key] = {}
+        child = container[key]
+        if type(child) is not dict:
+            raise HTTPException(
+                status_code=400,
+                detail=f"inline_blob_bindings path '{field_path}' crosses option '{key}', which is not an object",
+            )
+        container = child
+    if keys[-1] in container:
+        raise HTTPException(
+            status_code=400,
+            detail=f"inline_blob_bindings path '{field_path}' already holds a value; a file can only fill an empty option",
+        )
+    container[keys[-1]] = marker
+    return replace(spec, options=patched)
+
+
+def _state_with_inline_marker(state: CompositionState, ref: BlobInlineRef, marker: dict[str, str]) -> CompositionState:
+    prefix, _separator, rest = ref.field_path.partition(".options.")
+    keys = rest.split(".")
+    if prefix == "source" or prefix.startswith("source:"):
+        source_name = "source" if prefix == "source" else prefix.removeprefix("source:")
+        if source_name not in state.sources:
+            raise HTTPException(status_code=400, detail=f"inline_blob_bindings references unknown source '{source_name}'")
+        if keys[0] in _SERVER_OWNED_SOURCE_ROOTS:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"inline_blob_bindings path '{ref.field_path}' targets server-owned source option '{keys[0]}'; "
+                    "bind source files with source_blob_ids or source_blob_rows"
+                ),
+            )
+        source = _with_inline_marker(state.sources[source_name], keys, marker, field_path=ref.field_path)
+        return replace(state, sources={**state.sources, source_name: source})
+    if prefix.startswith("node:"):
+        node_id = prefix.removeprefix("node:")
+        node_index = next((index for index, node in enumerate(state.nodes) if node.id == node_id), None)
+        if node_index is None:
+            raise HTTPException(status_code=400, detail=f"inline_blob_bindings references unknown node '{node_id}'")
+        node = _with_inline_marker(state.nodes[node_index], keys, marker, field_path=ref.field_path)
+        nodes = (*state.nodes[:node_index], node, *state.nodes[node_index + 1 :])
+        return replace(state, nodes=nodes)
+    output_name = prefix.removeprefix("output:")
+    output_index = next((index for index, output in enumerate(state.outputs) if output.name == output_name), None)
+    if output_index is None:
+        raise HTTPException(status_code=400, detail=f"inline_blob_bindings references unknown output '{output_name}'")
+    output = _with_inline_marker(state.outputs[output_index], keys, marker, field_path=ref.field_path)
+    outputs = (*state.outputs[:output_index], output, *state.outputs[output_index + 1 :])
+    return replace(state, outputs=outputs)
+
+
+async def _state_with_imported_inline_blobs(
+    state: CompositionState,
+    *,
+    inline_blob_bindings: Mapping[str, InlineBlobBindingRequest] | None,
+    request: Request,
+    session_id: UUID,
+    session_operation_context: SessionOperationContext,
+) -> CompositionState:
+    """Re-attach inline-content file markers the public projection removed.
+
+    Each marker is rebuilt in the canonical writer's shape
+    (``wire_blob_inline_ref``) from this session's blob record, so its
+    ``sha256`` is the copy's own content hash. The version is unchanged: this
+    completes the imported graph, it is not an edit of it.
+    """
+    if not inline_blob_bindings:
+        return state
+
+    requested: list[tuple[str, UUID, ContentEncoding]] = [
+        (field_path, _parse_import_blob_id(binding.blob_id, where=f"inline_blob_bindings.{field_path}.blob_id"), binding.encoding)
+        for field_path, binding in inline_blob_bindings.items()
+    ]
+    for field_path, blob_id, encoding in requested:
+        blob, content_hash = await _ready_import_blob(
+            blob_id,
+            request=request,
+            session_id=session_id,
+            session_operation_context=session_operation_context,
+        )
+        try:
+            ref = BlobInlineRef(field_path=field_path, blob_id=blob.id, sha256=content_hash, encoding=encoding)
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"inline_blob_bindings path '{field_path}' is not a valid option field path "
+                    "(source:<name>.options.<field>, node:<id>.options.<field> or output:<name>.options.<field>)"
+                ),
+            ) from None
+        marker = {"blob_ref": str(blob.id), "mode": "inline_content", "sha256": content_hash}
+        if encoding != "utf-8":
+            marker["encoding"] = encoding
+        state = _state_with_inline_marker(state, ref, marker)
+    return state
+
+
+async def _state_with_imported_source_blob_rows(
+    state: CompositionState,
+    *,
+    source_blob_rows: Mapping[str, SourceBlobRowsBindingRequest] | None,
+    request: Request,
+    session_id: UUID,
+    session_operation_context: SessionOperationContext,
+) -> CompositionState:
+    """Re-attach a ``blob_rows`` source's file list, one entry per blob in order.
+
+    Every entry field comes from this session's blob record, in the shape
+    ``set_source_from_blobs`` writes (``_resolve_source_blobs``).
+    """
+    if not source_blob_rows:
+        return state
+
+    requested: list[tuple[str, list[UUID]]] = []
+    for source_name, binding in source_blob_rows.items():
+        if source_name not in state.sources:
+            raise HTTPException(status_code=400, detail=f"source_blob_rows references unknown source '{source_name}'")
+        source = state.sources[source_name]
+        if source.plugin != "blob_rows":
+            raise HTTPException(status_code=400, detail=f"source_blob_rows.{source_name} binds files to a source that is not blob_rows")
+        if "blobs" in source.options:
+            raise HTTPException(status_code=400, detail=f"source_blob_rows.{source_name}: the source already carries a blobs list")
+        blob_ids = [
+            _parse_import_blob_id(raw, where=f"source_blob_rows.{source_name}.blob_ids[{index}]")
+            for index, raw in enumerate(binding.blob_ids)
+        ]
+        if len(set(blob_ids)) != len(blob_ids):
+            raise HTTPException(status_code=400, detail=f"source_blob_rows.{source_name} lists the same blob more than once")
+        requested.append((source_name, blob_ids))
+
+    sources = dict(state.sources)
+    for source_name, blob_ids in requested:
+        entries: list[_SourceBlobRowsEntry] = []
+        seen_hashes: set[str] = set()
+        for blob_id in blob_ids:
+            blob, content_hash = await _ready_import_blob(
+                blob_id,
+                request=request,
+                session_id=session_id,
+                session_operation_context=session_operation_context,
+            )
+            if content_hash in seen_hashes:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"source_blob_rows.{source_name} lists two files with the same content; entries must be unique documents",
+                )
+            seen_hashes.add(content_hash)
+            entries.append(
+                {
+                    "blob_id": str(blob.id),
+                    "payload_ref": content_hash,
+                    "filename": blob.filename,
+                    "mime_type": blob.mime_type,
+                    "size_bytes": blob.size_bytes,
+                }
+            )
+        source = sources[source_name]
+        sources[source_name] = replace(source, options={**deep_thaw(source.options), "blobs": entries})
+    return replace(state, sources=sources)
 
 
 @router.get(
@@ -919,12 +1197,13 @@ async def seed_state_from_runtime_yaml(
     body: ImportStateYamlRequest,
     request: Request,
     user: UserIdentity,
-    composer_meta_updates: LibraryForkMetaUpdates | None = None,
+    composer_meta_updates: ComposerSeedMetaUpdates | None = None,
 ) -> CompositionStateResponse:
     """Seed through the YAML import validators, stamping exact text ingress.
 
-    Library forks use this same path and attach their source provenance to
-    the first state write. No second state or alternate graph importer exists.
+    Library forks and shared-graph imports use this same path and attach
+    their provenance to the first state write. No second state or alternate
+    graph importer exists.
     """
     service: SessionServiceProtocol = request.app.state.session_service
     # Everything that can raise before the body runs is resolved BEFORE the
@@ -957,6 +1236,20 @@ async def seed_state_from_runtime_yaml(
             imported_state = await _state_with_imported_source_blobs(
                 imported_state,
                 source_blob_ids=body.source_blob_ids,
+                request=request,
+                session_id=session.id,
+                session_operation_context=lease.context,
+            )
+            imported_state = await _state_with_imported_inline_blobs(
+                imported_state,
+                inline_blob_bindings=body.inline_blob_bindings,
+                request=request,
+                session_id=session.id,
+                session_operation_context=lease.context,
+            )
+            imported_state = await _state_with_imported_source_blob_rows(
+                imported_state,
+                source_blob_rows=body.source_blob_rows,
                 request=request,
                 session_id=session.id,
                 session_operation_context=lease.context,
