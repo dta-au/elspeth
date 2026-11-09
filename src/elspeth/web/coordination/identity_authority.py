@@ -62,6 +62,7 @@ from elspeth.contracts.auth import (
     RelationshipType,
 )
 from elspeth.web.auth.models import IdentityClaims
+from elspeth.web.coordination.database_clock import database_now_column
 from elspeth.web.coordination.identity_lifecycle import IdentityAuthorityRevoked, IdentityLifecycleEffect
 from elspeth.web.coordination.membership_authority import _database_clock_value, _ensure_utc
 from elspeth.web.coordination.mutation_connection_registry import _register_mutation_connection, _unregister_mutation_connection
@@ -78,10 +79,12 @@ from elspeth.web.sessions.identity_repository import (
     _row_to_record,
 )
 from elspeth.web.sessions.models import (
+    auth_session_families_table,
     identities_table,
     identity_relationships_table,
     identity_roles_table,
     quota_policies_table,
+    sessions_table,
 )
 
 # The sessions database's clock, read through the connection's own
@@ -127,6 +130,16 @@ REBOUND_DISABLE_REASON: Final = "rebound"
 # drifted between the writer and that reader would leave an ``active`` row
 # still reading ``dormant`` to every admin surface that shows the column.
 DORMANT_DISABLE_REASON: Final = "dormant"
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class StreamSessionScope:
+    """The three ``sessions`` columns a stream's per-send authorization judges."""
+
+    user_id: str
+    auth_provider_type: str
+    archived_at: datetime | None
 
 
 # ---------------------------------------------------------------------------
@@ -830,6 +843,27 @@ _ROLES_OF_IDENTITY: Final = (
     .order_by(identity_roles_table.c.granted_at, identity_roles_table.c.role_id)
 )
 _ROLES_OF_IDENTITY_FOR_UPDATE: Final = _ROLES_OF_IDENTITY.with_for_update()
+# A live stream's per-send principal read (``read_stream_session_scope``):
+# the identity row carries the database clock as one more column, and that
+# one sample judges the session family and the role grants that follow on
+# the same connection.  The family predicate is the one
+# ``RepositoryAuthSessionAuthority.is_active`` applies.
+_IDENTITY_BY_ID_AT_POSTGRESQL_TIME: Final = select(identities_table, database_now_column("postgresql")).where(
+    identities_table.c.identity_id == bindparam("identity_id")
+)
+_IDENTITY_BY_ID_AT_SQLITE_TIME: Final = select(identities_table, database_now_column("sqlite")).where(
+    identities_table.c.identity_id == bindparam("identity_id")
+)
+_LIVE_SESSION_FAMILY: Final = select(auth_session_families_table.c.family_id).where(
+    auth_session_families_table.c.family_id == bindparam("family_id"),
+    auth_session_families_table.c.identity_id == bindparam("identity_id"),
+    auth_session_families_table.c.provider == bindparam("provider"),
+    auth_session_families_table.c.revoked_at.is_(None),
+    auth_session_families_table.c.expires_at > bindparam("now"),
+)
+_SESSION_STREAM_SCOPE: Final = select(sessions_table.c.user_id, sessions_table.c.auth_provider_type, sessions_table.c.archived_at).where(
+    sessions_table.c.id == bindparam("session_id")
+)
 _ROLE_BY_ID_FOR_UPDATE: Final = select(identity_roles_table).where(identity_roles_table.c.role_id == bindparam("role_id")).with_for_update()
 _RELATIONSHIP_BY_ID_FOR_UPDATE: Final = (
     select(identity_relationships_table)
@@ -2417,6 +2451,51 @@ class RepositoryIdentityAuthority:
             rows = conn.execute(_ROLES_OF_IDENTITY, {"identity_id": identity_id}).all()
             now = _database_clock_value(conn.exec_driver_sql(self._clock_sql).scalar_one())
         return any(grant.role == role and grant.scope is None for grant in _active_grants(rows, now))
+
+    def read_stream_session_scope(
+        self,
+        *,
+        identity_id: str,
+        provider: AuthProviderType,
+        family_id: str,
+        role: IdentityRole,
+        session_id: uuid.UUID,
+    ) -> StreamSessionScope | None:
+        """Judge a live stream's principal at one database instant, then read its session.
+
+        One connection and one clock sample, in the order the separate reads
+        ran: the identity must be an active human of ``provider`` (the
+        ``is_active_human_identity`` predicate), its session family must be
+        unrevoked and unexpired (``RepositoryAuthSessionAuthority.is_active``),
+        and it must hold a live deployment-wide ``role``
+        (``holds_active_human_role``). Any refusal returns ``None`` before the
+        next read. Otherwise the session's owner, provider and archive marker
+        are returned for the caller to judge, or ``None`` when no such session
+        exists.
+        """
+        _require_nonblank(identity_id, "identity_id")
+        _require_role(role)
+        with self._engine.connect() as conn:
+            # ``__init__`` admits exactly these two dialects.
+            if conn.dialect.name == "postgresql":
+                identity = conn.execute(_IDENTITY_BY_ID_AT_POSTGRESQL_TIME, {"identity_id": identity_id}).one_or_none()
+            else:
+                identity = conn.execute(_IDENTITY_BY_ID_AT_SQLITE_TIME, {"identity_id": identity_id}).one_or_none()
+            if identity is None or identity.kind != "human" or identity.provider != provider or identity.access_state != "active":
+                return None
+            now = _database_clock_value(identity.database_now)
+            family = conn.execute(
+                _LIVE_SESSION_FAMILY, {"family_id": family_id, "identity_id": identity_id, "provider": provider, "now": now}
+            ).first()
+            if family is None:
+                return None
+            rows = conn.execute(_ROLES_OF_IDENTITY, {"identity_id": identity_id}).all()
+            if not any(grant.role == role and grant.scope is None for grant in _active_grants(rows, now)):
+                return None
+            session = conn.execute(_SESSION_STREAM_SCOPE, {"session_id": str(session_id)}).one_or_none()
+        if session is None:
+            return None
+        return StreamSessionScope(user_id=session.user_id, auth_provider_type=session.auth_provider_type, archived_at=session.archived_at)
 
     def is_active_human_identity(self, *, identity_id: str, provider: AuthProviderType) -> bool:
         """Authenticate only a human identity owned by the configured browser provider."""

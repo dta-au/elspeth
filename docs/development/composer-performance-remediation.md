@@ -54,7 +54,7 @@ verifying path), not by the type of the container.
 |---|---|---|---|---|---|
 | 1 | Cache immutable catalog summaries | Low | Low | Unit | open |
 | 2A | Route interpretation-resolve validation through the queue | Low | Low | Vitest | open |
-| 3-T1 | Stream read consolidation (no semantic change) | Low–Med | Medium | **Testcontainer**, ADR-047 | open |
+| 3-T1 | Stream read consolidation (no semantic change) | Low–Med | Medium | **Testcontainer**, ADR-047 | landed (change 2 reverted); testcontainer suites owed |
 | 2B | Share validation result with readiness | Medium | Medium | Vitest + readiness unit | open — decision needed |
 | 4A | Per-component prompt token accounting | Low | Low | None | open |
 | 4B | Reasoning-effort tuning | Medium (quality) | Low | — | open — applies on OpenRouter test models |
@@ -97,7 +97,7 @@ the original list:
 | S-10/11 Accept re-checks own arguments; serialize-then-hash twice | A | Proposal accept re-verifies arguments it just produced (10–81 ms); same value serialized then hashed separately back-to-back | Fold into fix 6 |
 | S-12 Post-turn GET fan-out | F | Frontend fires 6–7 GETs after every turn, beyond fix 2's validate/readiness pair | Extend fix 2B's coordinator |
 
-Order: 1 ✓ → 10 ✓ → 6 → 7 → 9 → 14 → 15 → 11 → 12 → 2A → 3-T1 → 13 →
+Order: 1 ✓ → 10 ✓ → 6 ✓ → 7 ✓ → 9 ✓ → 14 ✓ → 15 ✓ → 11 ✓ → 12 ✓ → 2A ✓ → 3-T1 ✓ → 13 →
 2B (+S-12) → 4A → re-measure; other composer-side pending items slot in
 once verified and, where marked, ruled on. Fix 13 sits after 3-T1 because it
 is the widest change to session-write transactions and benefits from fixes
@@ -464,7 +464,70 @@ decision set unchanged; all revocation/expiry/cancellation/fencing tests
 green on SQLite and PostgreSQL; a controlled-latency run (e.g. `tc qdisc`
 or a proxy adding 20 ms) shows proportionally reduced frame latency.
 
-**Evidence.** _(fill in)_
+**Evidence (landed; lane report
+`.claude/lanes/perf-eval/fix3t1-implementation.md`).** Changes 1, 3, 4 and 5
+landed; change 2 (the narrow running-row projection) was built, measured and
+**reverted on the orchestrator's ruling**: it gave up whole-row Tier-1
+validation on every running poll for ~50 µs of noisy gain (full read
+310–350 µs vs narrow 240–280 µs on SQLite, one run) and the statement counts
+do not depend on it, because the full read is also one statement now. What
+landed: `database_clock.database_now_column(dialect)` /
+`database_now_value(raw)` (the clock as a labelled select-list column plus
+the same normalisation `database_now` already did); `get_with_database_now`
+reads row and clock in one `SELECT` on one connection (a missing row still
+reads the clock on its own); `identity_authority.read_stream_session_scope`
+reads identity (once, with the clock as a column), live session family, role
+grants and the three `sessions` columns on one `connect()` with one clock
+sample; `composer_stream_auth.authorize` uses it instead of
+`provider._authenticate_sync` + `holds_active_human_role` +
+`get_session_for_stream`. Predicates were checked line by line against the
+issuer wiring: `is_active_human_identity` (kind human, same provider,
+`access_state == "active"`), `RepositoryAuthSessionAuthority.is_active`
+(family id/identity/provider, `revoked_at IS NULL`, `expires_at > now`),
+`holds_active_human_role` (deployment-wide grant via `_active_grants`), the
+binding-expiry comparison, and the local provider's `_credential_is_current`
+against `auth.db` (which cannot share the sessions connection). The
+tautological `identity.user_id != principal.user_id` re-check was dropped.
+**Stated coupling:** the stream path now reads the tables directly, so an
+issuer wired with a different `principal_is_active` would not be honoured by
+it; `app.py` and `sso_wiring.py` wire exactly these predicates. Per-frame
+cost (SQLAlchemy `before_cursor_execute` / `engine_connect`; statements /
+clock samples / connections / SQLite write locks; SQLite and local
+PostgreSQL 16 gave the same counts): pre-header authorize 9/3/5/1 → 5/2/2/0,
+status 11/4/6/1 → 6/3/3/0, progress 9/3/5/1 → 5/2/2/0, heartbeat 9/3/5/1 →
+5/2/2/0, terminal 11/4/6/1 → 6/3/3/0. One status+progress iteration 20 → 11
+statements, 11 → 5 connections; the per-send `BEGIN IMMEDIATE` write lock
+is gone; the 0.25 s worker watch reads 1 statement instead of 2. The
+per-send operation and progress re-reads (A5/A6) are kept for the 3-T2
+ruling. Tests: new
+`tests/unit/web/test_composer_stream_round_trips.py` (9 cases: instrument
+control, per-frame count table, reintroduced-duplicate detector moving the
+counts by exactly +2, one-statement clock equals `database_now` on the same
+connection, record+clock read is one statement and selects no
+`request_json`, terminal digest forgery still refused, revoked family /
+disabled identity / wrong provider / missing role refused, local logout and
+password reset refused); against a worktree at the pre-fix commit the file
+fails 5 of 9 with exactly the pre-fix counts. Existing revocation, expiry,
+cancellation and fencing suites unchanged and green (154 + 23 + 1,211 + 66
+passed, exit 0 each); orchestrator confirmation run of the stream, identity,
+clock and operation-authority suites with the new file: 258 passed, exit 0.
+Re-pins with the gates' own tools and before/after controls: full-source
+guard for `composer_operation_authority.py`; writer inventory 16 rows
+re-pinned (`get_with_database_now` fingerprint `c73e6b7d09fec744` →
+`a903a711719fdf56`) and one read-connection row added for
+`read_stream_session_scope`; `composer_operations.py`,
+`routes/composer/operations.py`, `test_routes.py` and the fencing gate are
+byte-identical to HEAD after the revert. ruff, format, mypy and
+`check_contracts` (census 2,615) clean. **Not run:** the architecture suite
+and lint corpus (batch 2 gate); the testcontainer suites (no Docker; owed on
+a Docker host, mandatory for this fix:
+`test_cross_process_progress_postgres.py`,
+`test_composer_operations_postgres.py`,
+`test_auth_session_revocation_postgres.py`); the controlled-latency run.
+Follow-ups: `SessionServiceImpl.get_session_for_stream` and the
+`ComposerStreamAuthServices.sessions` field no longer have a production
+caller (two tests use the method as a stand-in); delete or keep is a
+developer call.
 
 ### 3-T2 — Snapshot-bound per-send authorization (ruling needed)
 
