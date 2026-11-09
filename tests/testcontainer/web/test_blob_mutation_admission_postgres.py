@@ -12,6 +12,7 @@ from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import event, select, update
+from tests.fixtures.resource_identity import UUID_SPELLINGS, uuid_spelling
 from tests.testcontainer.web import test_quota_authority_postgres as quota_fixtures
 from tests.testcontainer.web.test_quota_authority_postgres import _wait_for_database_lock
 from tests.unit.web.auth.test_audit import _durable_recorder, _durable_rows, _metadata
@@ -22,6 +23,7 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.blobs.replacement import BlobReplacementCoordinator
 from elspeth.web.blobs.service import BlobServiceImpl, _blob_operation_path_token, content_hash
+from elspeth.web.composer.state import SourceSpec
 from elspeth.web.composer.tools.blobs import admit_blob_mutation
 from elspeth.web.coordination.contracts import SessionOperationFenceLost
 from elspeth.web.coordination.repository import PostgresSessionOperationRepository
@@ -68,10 +70,38 @@ def _setup(fenced, tmp_path):
 
 
 @pytest.mark.parametrize("tool_name", ["update_blob", "delete_blob"])
-def test_postgres_admission_waiter_observes_real_writer_debt_without_allocating(pg_fenced, tmp_path, tool_name):
+@pytest.mark.parametrize("spelling", UUID_SPELLINGS)
+def test_postgres_bound_selector_alias_refuses_without_resource_effect(pg_fenced, tmp_path, tool_name, spelling):
+    repository, _service, record, context, _recorder, _url = _setup(pg_fenced, tmp_path)
+    try:
+        state = replace(
+            _empty_state(),
+            sources={
+                "source": SourceSpec(
+                    plugin="csv",
+                    on_success="rows",
+                    on_validation_failure="discard",
+                    options={"path": "elsewhere.csv", "blob_ref": str(record.id)},
+                )
+            },
+        )
+        arguments = {"blob_id": uuid_spelling(str(record.id), spelling), **({"content": "new"} if tool_name == "update_blob" else {})}
+        before = _resources(pg_fenced.engine, tmp_path / "blobs")
+        result = admit_blob_mutation(tool_name, arguments, state, context)
+        assert result is not None and not result.success
+        assert "current composition" in result.validation.errors[0].message
+        assert result.updated_state is state
+        assert _resources(pg_fenced.engine, tmp_path / "blobs") == before
+    finally:
+        repository.release(context.session_operation_context)
+
+
+@pytest.mark.parametrize("tool_name", ["update_blob", "delete_blob"])
+@pytest.mark.parametrize("spelling", ["canonical", "braced", "urn"])
+def test_postgres_admission_waiter_observes_real_writer_debt_without_allocating(pg_fenced, tmp_path, tool_name, spelling):
     repository, service, record, context, recorder, _url = _setup(pg_fenced, tmp_path)
     operation = context.session_operation_context
-    arguments = {"blob_id": str(record.id), **({"content": "new"} if tool_name == "update_blob" else {})}
+    arguments = {"blob_id": uuid_spelling(str(record.id), spelling), **({"content": "new"} if tool_name == "update_blob" else {})}
     before = _resources(pg_fenced.engine, tmp_path / "blobs")
     assert admit_blob_mutation(tool_name, arguments, _empty_state(), context) is None
     assert _resources(pg_fenced.engine, tmp_path / "blobs") == before

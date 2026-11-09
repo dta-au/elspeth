@@ -5061,7 +5061,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         fingerprint="6d19cc377aa5042b",
         ordinal=1,
         authority=None,
-        line=501,
+        line=502,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -5072,7 +5072,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         fingerprint="6d0dc169d76447ab",
         ordinal=1,
         authority=None,
-        line=536,
+        line=538,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -5083,7 +5083,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         fingerprint="a447ba3ecc90a1f8",
         ordinal=1,
         authority=None,
-        line=561,
+        line=563,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -5094,7 +5094,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         fingerprint="cb9dd966393cab1d",
         ordinal=1,
         authority=None,
-        line=1826,
+        line=1834,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -20888,7 +20888,7 @@ def test_live_connection_domain_classification_is_exact() -> None:
             "701a4d03f32ac0d4",
             1,
             None,
-            line=935,
+            line=955,
         ),
     )
     expected = (

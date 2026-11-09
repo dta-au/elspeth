@@ -66,6 +66,7 @@ from elspeth.web.sessions.models import (
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from tests.fixtures.identities import ensure_test_identity, grant_test_pipeline_user
+from tests.fixtures.resource_identity import UUID_SPELLINGS, uuid_spelling
 from tests.unit.web.composer.conftest import (
     _fake_llm_response as _raw_fake_llm_response,
 )
@@ -2232,12 +2233,15 @@ async def test_canonical_source_order_change_remains_stageable(tmp_path: Path) -
 @pytest.mark.asyncio
 @pytest.mark.parametrize("tool_name", ("update_blob", "delete_blob"))
 @pytest.mark.parametrize("content", ("replacement bytes", "original bytes"))
+@pytest.mark.parametrize("spelling", UUID_SPELLINGS)
+@pytest.mark.parametrize("dialect", tuple(ToolContractDialect))
 async def test_durable_blob_mutations_admit_and_stage_without_executing_effect_handler(
-    tmp_path: Path, tool_name: str, content: str
+    tmp_path: Path, tool_name: str, content: str, spelling: str, dialect: ToolContractDialect
 ) -> None:
     from tests.helpers.session_fences import fenced_operation_context
 
     harness = _harness(tmp_path)
+    harness.service._planner_dialect = dialect
     state = _incremental_base_state(tmp_path)
     with fenced_operation_context(harness.engine, harness.session_id, operation_kind=SessionOperationKind.CREATE) as operation:
         blob = await BlobServiceImpl(harness.engine, tmp_path).create_blob(
@@ -2247,10 +2251,13 @@ async def test_durable_blob_mutations_admit_and_stage_without_executing_effect_h
             "text/plain",
             session_operation_context=operation,
         )
-    arguments = {"blob_id": str(blob.id)}
+    arguments = {"blob_id": uuid_spelling(str(blob.id), spelling)}
     if tool_name == "update_blob":
         arguments["content"] = content
-    llm = _ScriptedLLM(_tool_turn("call_durable", tool_name, arguments), _fake_llm_response(content="The blob change awaits approval."))
+    llm = _ScriptedLLM(
+        _tool_turn("call_durable", tool_name, encode_semantic_arguments(tool_name, dialect, arguments)),
+        _fake_llm_response(content="The blob change awaits approval."),
+    )
     with (
         patch.object(harness.service._provider_gateway, "_call_llm", new=llm),
         patch("elspeth.web.composer.tool_batch.execute_tool", side_effect=AssertionError("Durable tool must never be previewed")),
@@ -2268,6 +2275,11 @@ async def test_durable_blob_mutations_admit_and_stage_without_executing_effect_h
     assert Path(blob.storage_path).read_bytes() == b"original bytes"
     proposals = await harness.sessions.list_composition_proposals(UUID(harness.session_id))
     assert [proposal.tool_name for proposal in proposals] == [tool_name]
+    assert proposals[0].arguments_json == arguments
+    assert proposals[0].tool_arguments_hash == stable_hash(arguments)
+    assert json.loads(result.tool_invocations[0].arguments_canonical)["blob_id"] == arguments["blob_id"]
+    captured = next(message for message in llm.message_snapshots[1] if message["role"] == "assistant" and message.get("tool_calls"))
+    assert json.loads(captured["tool_calls"][0]["function"]["arguments"])["blob_id"] == arguments["blob_id"]
     assert _count_rows(harness.engine, blobs_table) == 1
 
 
@@ -2277,12 +2289,17 @@ async def test_durable_blob_mutations_admit_and_stage_without_executing_effect_h
     [(tool, refusal) for tool in ("update_blob", "delete_blob") for refusal in ("nonready", "bound", "missing")]
     + [("update_blob", "quota")],
 )
-async def test_blob_admission_refuses_known_ineligible_effect_once_without_proposal(tmp_path: Path, tool_name: str, refusal: str) -> None:
+@pytest.mark.parametrize("spelling", ["canonical", "braced", "urn"])
+@pytest.mark.parametrize("dialect", tuple(ToolContractDialect))
+async def test_blob_admission_refuses_known_ineligible_effect_once_without_proposal(
+    tmp_path: Path, tool_name: str, refusal: str, spelling: str, dialect: ToolContractDialect
+) -> None:
     from sqlalchemy import update
 
     from tests.helpers.session_fences import fenced_operation_context
 
     harness = _harness(tmp_path)
+    harness.service._planner_dialect = dialect
     state = _incremental_base_state(tmp_path)
     with fenced_operation_context(harness.engine, harness.session_id, operation_kind=SessionOperationKind.CREATE) as operation:
         blob = await BlobServiceImpl(harness.engine, tmp_path).create_blob(
@@ -2295,17 +2312,20 @@ async def test_blob_admission_refuses_known_ineligible_effect_once_without_propo
         state = replace(
             state,
             sources={
-                name: replace(source, options={**source.options, "path": blob.storage_path}) for name, source in state.sources.items()
+                name: replace(source, options={**source.options, "path": "elsewhere.txt", "blob_ref": str(blob.id)})
+                for name, source in state.sources.items()
             },
         )
     elif refusal == "quota":
         harness.service._settings = harness.service._settings.model_copy(update={"max_blob_storage_per_session_bytes": 15})
-    arguments = {"blob_id": str(uuid4()) if refusal == "missing" else str(blob.id)}
+    arguments = {"blob_id": uuid_spelling(str(uuid4()) if refusal == "missing" else str(blob.id), spelling)}
     if tool_name == "update_blob":
         arguments["content"] = "replacement bytes"
     llm = _ScriptedLLM(
-        _tool_turn("call_refused_blob", tool_name, arguments),
-        _tool_turn("call_repair", "set_metadata", {"patch": {"name": "repaired draft"}}),
+        _tool_turn("call_refused_blob", tool_name, encode_semantic_arguments(tool_name, dialect, arguments)),
+        _tool_turn(
+            "call_repair", "set_metadata", encode_semantic_arguments("set_metadata", dialect, {"patch": {"name": "repaired draft"}})
+        ),
         _fake_llm_response(content="The repair awaits approval."),
     )
     with patch.object(harness.service._provider_gateway, "_call_llm", new=llm), _record_phase3_outcomes(harness.service) as batches:
@@ -2322,6 +2342,8 @@ async def test_blob_admission_refuses_known_ineligible_effect_once_without_propo
     feedback = [message for message in llm.message_snapshots[1] if message.get("tool_call_id") == "call_refused_blob"]
     assert len(feedback) == 1
     assert json.loads(feedback[0]["content"])["success"] is False
+    if refusal == "bound":
+        assert "current composition" in feedback[0]["content"]
     outcomes = [outcome for batch in batches for outcome in batch if outcome.call.function.name == tool_name]
     assert len(outcomes) == 1
     assert outcomes[0].pre_version == outcomes[0].post_version == state.version
@@ -2658,7 +2680,7 @@ async def test_publication_resource_race_refuses_once_then_allows_valid_repair(t
             blob = await BlobServiceImpl(harness.engine, tmp_path).create_blob(
                 UUID(harness.session_id), "retained.txt", b"original", "text/plain", session_operation_context=operation
             )
-        tool_name, arguments = "delete_blob", {"blob_id": str(blob.id)}
+        tool_name, arguments = "delete_blob", {"blob_id": uuid_spelling(str(blob.id), "braced")}
     else:
         from tests.integration.web.composer.test_freeform_required_controls import _incremental_textract_state, _required_textract_policy
 

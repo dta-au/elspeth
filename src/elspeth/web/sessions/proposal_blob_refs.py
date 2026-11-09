@@ -12,6 +12,7 @@ from sqlalchemy.engine import Connection
 from elspeth.contracts.blobs import BLOB_REF_PATH_PREFIX, BLOB_STATUSES
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer.pipeline_proposal import is_owned_composition_state_authority
+from elspeth.web.resource_identity import canonical_resource_uuid
 from elspeth.web.sessions.models import blobs_table, composition_proposals_table
 
 _TOP_LEVEL_BLOB_TOOLS = frozenset(
@@ -105,6 +106,11 @@ def proposal_blob_reference_ids(tool_name: str, arguments: Mapping[str, Any]) ->
     mappings, whose blob vocabulary (``blob_ref`` markers and ``blob:<uuid>``
     path/file sentinels) is walked recursively. Missing these positions could
     let a blob be deleted while a proposal depending on it is pending.
+
+    UUID projection here conservatively retains resources; it does not admit
+    graph marker syntax or rewrite the original, exactly hashed arguments.
+    Strict sentinel validation precedes this projection. Nonparseable IDs
+    remain references so malformed authority never silently sheds custody.
     """
     if tool_name not in _BLOB_REFERENCE_TOOLS:
         return ()
@@ -118,7 +124,7 @@ def proposal_blob_reference_ids(tool_name: str, arguments: Mapping[str, Any]) ->
         for index, member in enumerate(raw_blob_ids):
             if type(member) is not str or not member:
                 raise ValueError(f"set_source_from_blobs blob_ids[{index}] must be a non-empty string")
-        return tuple(dict.fromkeys(raw_blob_ids))
+        return tuple(dict.fromkeys(canonical_resource_uuid(value) or value for value in raw_blob_ids))
 
     if tool_name == "set_pipeline":
         collected: list[str] = []
@@ -145,7 +151,7 @@ def proposal_blob_reference_ids(tool_name: str, arguments: Mapping[str, Any]) ->
                         position=f"{collection_name}[{index}]",
                         into=collected,
                     )
-            return tuple(dict.fromkeys(collected))
+            return tuple(dict.fromkeys(canonical_resource_uuid(value) or value for value in collected))
         source = arguments["source"] if "source" in arguments else None
         if source is None:
             return ()
@@ -161,14 +167,14 @@ def proposal_blob_reference_ids(tool_name: str, arguments: Mapping[str, Any]) ->
             if type(options) is not dict:
                 raise ValueError("set_pipeline source.options must be a mapping when present")
             _collect_option_blob_references(options, position="source.options", into=collected)
-        return tuple(dict.fromkeys(collected))
+        return tuple(dict.fromkeys(canonical_resource_uuid(value) or value for value in collected))
 
     value = arguments["blob_id"] if "blob_id" in arguments else None
     if value is None:
         return ()
     if type(value) is not str or not value:
         raise ValueError(f"{tool_name} blob_id must be a non-empty string when present")
-    return (value,)
+    return (canonical_resource_uuid(value) or value,)
 
 
 def validate_proposal_blob_references(
