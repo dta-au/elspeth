@@ -723,7 +723,14 @@ def _model(completion: _ScriptedCompletion, **overrides: object) -> PlannerModel
         "provider": "test-provider",
         "temperature": 0.0,
         "seed": 7,
-        "timeout_seconds": 5.0,
+        # A hang guard, not an assertion: every test that asserts the
+        # wall-clock TIMEOUT sets its own timeout_seconds. The scripted
+        # four-call protocols here take 2.0-2.6 s uninstrumented and
+        # 3.6-3.7 s under --cov on an idle box, so CI's coverage lane
+        # (two workers on a co-loaded runner) exceeded the former 5 s
+        # value with a "planner wall-clock budget exhausted" failure
+        # (dta-au/elspeth#354, 3.13 shard 2).
+        "timeout_seconds": 30.0,
         "max_composition_turns": 4,
         "max_discovery_turns": 3,
         "max_tool_calls_per_turn": 3,
