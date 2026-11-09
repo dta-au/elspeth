@@ -17,6 +17,7 @@ from sqlalchemy.exc import ArgumentError
 from elspeth.contracts import SinkProtocol
 from elspeth.contracts.aws_s3 import S3_PROFILED_AUDIT_SAFE_OPTION_NAMES, S3ProfiledAuditIdentities
 from elspeth.contracts.aws_textract import TEXTRACT_PROFILED_AUDIT_SAFE_OPTION_NAMES, TextractProfiledAuditIdentities
+from elspeth.contracts.composer_paths import McpConfiguredRootAuthority
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.sink_effects import SinkEffectRuntimeBinding
 from elspeth.contracts.trust_boundary import trust_boundary
@@ -41,6 +42,8 @@ from elspeth.web.paths import (
     NESTED_LOCAL_PATH_OPTION_KEYS,
     SINK_LOCAL_PATH_OPTION_KEYS,
     SOURCE_LOCAL_PATH_OPTION_KEYS,
+    is_local_path_value,
+    require_mcp_root_context,
     resolve_data_path,
     resolve_sink_data_path,
 )
@@ -90,7 +93,13 @@ class RuntimeGraphBundle:
     test_ref="tests/unit/web/execution/test_service.py::TestResolveYamlPaths::test_non_dict_yaml_raises_type_error",
     test_fingerprint="0b6962a40eb0f2ab584fb2c1de368235d046257d81da266750c8f8011e651c36",
 )
-def resolve_runtime_yaml_paths(pipeline_yaml: str, data_dir: str, *, session_id: str | None = None) -> str:
+def resolve_runtime_yaml_paths(
+    pipeline_yaml: str,
+    data_dir: str,
+    *,
+    session_id: str | None = None,
+    mcp_root_authority: McpConfiguredRootAuthority | None = None,
+) -> str:
     """Rewrite relative source/sink paths in pipeline YAML to absolute paths.
 
     Plugins call PathConfig.resolved_path() with no base_dir, so relative
@@ -99,6 +108,7 @@ def resolve_runtime_yaml_paths(pipeline_yaml: str, data_dir: str, *, session_id:
     every source/sink path absolute before the YAML reaches the plugin
     layer, so what is allowlisted is what is actually loaded.
     """
+    require_mcp_root_context(mcp_root_authority, data_dir=data_dir, session_id=session_id)
     if not isinstance(pipeline_yaml, str):
         raise TypeError(f"YamlGenerator.generate_yaml() must return str; got {type(pipeline_yaml).__name__}")
 
@@ -124,11 +134,16 @@ def resolve_runtime_yaml_paths(pipeline_yaml: str, data_dir: str, *, session_id:
             raise TypeError(f"YAML generator produced non-dict '{component_path}.options' value (got {type(opts).__name__})")
         path_options = cast(dict[str, Any], opts)
         for key in path_option_keys:
-            if key in path_options and not Path(str(path_options[key])).is_absolute():
-                if sink_paths:
-                    path_options[key] = str(resolve_sink_data_path(str(path_options[key]), data_dir, session_id=session_id))
+            if key not in path_options:
+                continue
+            value = path_options[key]
+            if not is_local_path_value(value):
+                raise ValueError(f"{component_path}.options.{key} must be a nonempty string path without NUL")
+            if not Path(value).is_absolute():
+                if sink_paths and mcp_root_authority is None:
+                    path_options[key] = str(resolve_sink_data_path(value, data_dir, session_id=session_id))
                 else:
-                    path_options[key] = str(resolve_data_path(str(path_options[key]), data_dir))
+                    path_options[key] = str(resolve_data_path(value, data_dir))
 
     if "source" in config:
         source = config["source"]
@@ -227,8 +242,19 @@ def resolve_runtime_yaml_paths(pipeline_yaml: str, data_dir: str, *, session_id:
             if not isinstance(provider_config, dict):
                 continue
             for key in NESTED_LOCAL_PATH_OPTION_KEYS:
-                if key in provider_config and not Path(str(provider_config[key])).is_absolute():
-                    provider_config[key] = str(resolve_sink_data_path(str(provider_config[key]), data_dir, session_id=session_id))
+                if key not in provider_config:
+                    continue
+                value = provider_config[key]
+                if value is None:
+                    continue
+                if not is_local_path_value(value):
+                    raise ValueError(f"transform.options.provider_config.{key} must be a nonempty string path without NUL")
+                if not Path(value).is_absolute():
+                    provider_config[key] = str(
+                        resolve_data_path(value, data_dir)
+                        if mcp_root_authority is not None
+                        else resolve_sink_data_path(value, data_dir, session_id=session_id)
+                    )
 
     return yaml.dump(config, default_flow_style=False)
 

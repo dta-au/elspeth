@@ -12,9 +12,11 @@ from typing import Any, cast
 from unittest.mock import patch
 
 import pytest
+import yaml
 from pydantic import SecretBytes
 
 from elspeth.config_loading import load_settings_from_yaml_string
+from elspeth.contracts.composer_paths import McpConfiguredRootAuthority
 from elspeth.contracts.enums import RunMode
 from elspeth.core.config import ElspethSettings, load_bounded_pipeline_yaml, resolve_config
 from elspeth.plugins.infrastructure.preflight import plugin_preflight_mode, plugin_preflight_mode_enabled
@@ -50,6 +52,63 @@ def _forbid_socket_calls(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(socket, "socket", fail)
     monkeypatch.setattr(socket, "create_connection", fail)
     monkeypatch.setattr(socket, "getaddrinfo", fail)
+
+
+_REWRITTEN_PATH_SITES = [
+    ("source", "path"),
+    ("source", "file"),
+    ("sources", "path"),
+    ("sources", "file"),
+    ("sinks", "path"),
+    ("sinks", "file"),
+    ("sinks", "persist_directory"),
+    ("provider", "persist_directory"),
+]
+
+
+@pytest.mark.parametrize(
+    ("component", "key", "value"),
+    [
+        (component, key, value)
+        for component, key in _REWRITTEN_PATH_SITES
+        for value in (None, 42, False, [], {}, "", "bad\x00path")
+        if not (component == "provider" and value is None)
+    ],
+)
+@pytest.mark.parametrize("mode", ["web", "mcp"])
+def test_runtime_yaml_refuses_invalid_values_before_path_coercion(
+    tmp_path: Path, component: str, key: str, value: object, mode: str
+) -> None:
+    """Resolver entry points cannot turn an invalid scalar/container into a filename."""
+    configured: dict[str, Any]
+    if component == "provider":
+        configured = {"transforms": [{"name": "lookup", "plugin": "rag_retrieval", "options": {"provider_config": {key: value}}}]}
+    else:
+        item = {"plugin": "csv", "options": {key: value}}
+        configured = {component: item if component == "source" else {"main": item}}
+    with pytest.raises(ValueError, match="nonempty string path"):
+        execution_preflight.resolve_runtime_yaml_paths(
+            yaml.safe_dump(configured),
+            str(tmp_path),
+            session_id="test-session" if mode == "web" else None,
+            mcp_root_authority=McpConfiguredRootAuthority(tmp_path) if mode == "mcp" else None,
+        )
+
+
+@pytest.mark.parametrize("mode", ["web", "mcp"])
+def test_runtime_yaml_keeps_absent_path_options_and_nullable_provider(tmp_path: Path, mode: str) -> None:
+    document = {
+        "sources": {"main": {"plugin": "null", "options": {}}},
+        "sinks": {"main": {"plugin": "csv", "options": {}}},
+        "transforms": [{"name": "lookup", "plugin": "rag_retrieval", "options": {"provider_config": {"persist_directory": None}}}],
+    }
+    result = execution_preflight.resolve_runtime_yaml_paths(
+        yaml.safe_dump(document),
+        str(tmp_path),
+        session_id="test-session" if mode == "web" else None,
+        mcp_root_authority=McpConfiguredRootAuthority(tmp_path) if mode == "mcp" else None,
+    )
+    assert yaml.safe_load(result) == document
 
 
 def _web_settings(tmp_path: Path) -> WebSettings:

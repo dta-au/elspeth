@@ -37,6 +37,7 @@ from sqlalchemy import Engine
 from elspeth.contracts.blobs_inline import is_widened_blob_ref
 from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
 from elspeth.contracts.composer_interpretation import InterpretationKind
+from elspeth.contracts.composer_paths import McpConfiguredRootAuthority
 from elspeth.contracts.emitted_option import emitted_option_values, env_placeholders_in
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
@@ -114,6 +115,8 @@ from elspeth.web.paths import (
     SOURCE_LOCAL_PATH_OPTION_KEYS,
     allowed_sink_directories,
     allowed_source_directories,
+    is_local_path_value,
+    require_mcp_root_context,
     resolve_data_path,
     resolve_sink_data_path,
 )
@@ -2328,20 +2331,36 @@ def _validate_aggregation_trigger(trigger: Any) -> str | None:
     return None
 
 
+def _path_policy_refusal_message(context: ToolContext, web_message: str) -> str:
+    """Keep file-authoring repair guidance specific to the owning route."""
+    if context.mcp_root_authority is not None or (context.data_dir is None and context.require_data_dir_for_paths):
+        return "Local file paths require configured data root authority and must remain within the configured data root (--data-dir)."
+    return web_message
+
+
 def _validate_source_path(
     options: Mapping[str, Any],
     data_dir: str | None,
     *,
     session_id: str | None,
     require_data_dir: bool = False,
+    mcp_root_authority: McpConfiguredRootAuthority | None = None,
 ) -> str | None:
-    """S2: Validate path/file options under the caller's blob subtree.
+    """Validate local sources under the owned MCP root or Web blob subtree.
 
     Returns an error message if validation fails, None if OK.
     Uses Path.resolve() + is_relative_to() to defeat ../ traversal.
     """
+    require_mcp_root_context(mcp_root_authority, data_dir=data_dir, session_id=session_id)
     for key in SOURCE_LOCAL_PATH_OPTION_KEYS:
         if key in options:
+            if not is_local_path_value(options[key]):
+                return "Source local path must be a nonempty string without NUL"
+            if mcp_root_authority is not None:
+                resolved = resolve_data_path(options[key], str(mcp_root_authority.root))
+                if not resolved.is_relative_to(mcp_root_authority.root):
+                    return "Source local path is outside the configured data root"
+                continue
             if data_dir is None:
                 if not require_data_dir:
                     return None
@@ -2366,21 +2385,36 @@ def _validate_sink_path(
     data_dir: str | None,
     *,
     session_id: str | None,
+    require_data_dir: bool = False,
+    mcp_root_authority: McpConfiguredRootAuthority | None = None,
 ) -> str | None:
     """Validate that sink path options are under allowed output directories.
 
     Returns an error message if validation fails, None if OK.
     Mirrors _validate_source_path but uses _allowed_sink_directories.
-    Blob-directory writes are confined to the caller's own session subtree
-    (elspeth-bdc17cfdb1); ``session_id=None`` fails closed to outputs only.
+    Web writes are confined to the caller's own session subtrees;
+    ``session_id=None`` grants no Web paths. MCP has separate root authority.
     """
+    require_mcp_root_context(mcp_root_authority, data_dir=data_dir, session_id=session_id)
+    if mcp_root_authority is not None:
+        for key in SINK_LOCAL_PATH_OPTION_KEYS:
+            if key in options:
+                if not is_local_path_value(options[key]):
+                    return "Output local path must be a nonempty string without NUL"
+                if not resolve_data_path(options[key], str(mcp_root_authority.root)).is_relative_to(mcp_root_authority.root):
+                    return "Output local path is outside the configured data root"
+        return None
     if data_dir is None:
+        if require_data_dir and any(key in options for key in SINK_LOCAL_PATH_OPTION_KEYS):
+            return "Output local paths require configured data root authority"
         return None
 
     allowed = allowed_sink_directories(data_dir, session_id=session_id)
 
     for key in SINK_LOCAL_PATH_OPTION_KEYS:
         if key in options:
+            if not is_local_path_value(options[key]):
+                return "Output local path must be a nonempty string without NUL"
             resolved = resolve_sink_data_path(options[key], data_dir, session_id=session_id)
             if not any(resolved.is_relative_to(d) for d in allowed):
                 return (
@@ -2397,6 +2431,8 @@ def _validate_transform_provider_config_path(
     data_dir: str | None,
     *,
     session_id: str | None,
+    require_data_dir: bool = False,
+    mcp_root_authority: McpConfiguredRootAuthority | None = None,
 ) -> str | None:
     """Validate nested provider_config path options are under allowed dirs.
 
@@ -2410,14 +2446,10 @@ def _validate_transform_provider_config_path(
 
     Returns an error message if validation fails, None if OK.
     """
-    if data_dir is None:
-        return None
-
+    require_mcp_root_context(mcp_root_authority, data_dir=data_dir, session_id=session_id)
     provider_config = options["provider_config"] if "provider_config" in options else None
     if not isinstance(provider_config, Mapping):
         return None
-
-    allowed = allowed_sink_directories(data_dir, session_id=session_id)
 
     for key in NESTED_LOCAL_PATH_OPTION_KEYS:
         if key not in provider_config:
@@ -2428,6 +2460,17 @@ def _validate_transform_provider_config_path(
         # ``value is not None`` before resolving.
         if value is None:
             continue
+        if not is_local_path_value(value):
+            return "Provider local path must be a nonempty string without NUL"
+        if mcp_root_authority is not None:
+            if not resolve_data_path(value, str(mcp_root_authority.root)).is_relative_to(mcp_root_authority.root):
+                return "Provider local path is outside the configured data root"
+            continue
+        if data_dir is None:
+            if require_data_dir:
+                return "Provider local paths require configured data root authority"
+            continue
+        allowed = allowed_sink_directories(data_dir, session_id=session_id)
         resolved = resolve_sink_data_path(value, data_dir, session_id=session_id)
         if not any(resolved.is_relative_to(d) for d in allowed):
             return (
@@ -3786,6 +3829,7 @@ class ToolContext:
     catalog: PolicyCatalogView
     plugin_snapshot: PluginAvailabilitySnapshot
     data_dir: str | None = None
+    mcp_root_authority: McpConfiguredRootAuthority | None = None
     require_data_dir_for_paths: bool = False
     session_engine: Engine | None = None
     session_id: str | None = None
@@ -3809,6 +3853,17 @@ class ToolContext:
     reviewed_source_authority: ReviewedSourceAuthority | None = None
     executing_proposal_id: str | None = None
     _interpretation_requirements_are_internal: bool = False
+
+    def __post_init__(self) -> None:
+        require_mcp_root_context(self.mcp_root_authority, data_dir=self.data_dir, session_id=self.session_id)
+        if self.mcp_root_authority is not None and (
+            self.data_dir is not None
+            or self.session_engine is not None
+            or self.session_operation_context is not None
+            or self.session_operation_authority is not None
+            or self.reviewed_source_authority is not None
+        ):
+            raise ValueError("MCP root authority cannot carry Web session custody")
 
 
 ToolHandler = Callable[

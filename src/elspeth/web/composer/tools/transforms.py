@@ -56,6 +56,7 @@ from elspeth.web.composer.tools._common import (
     _mutation_result,
     _normalize_echoed_interpretation_requirements,
     _options_with_default_llm_reviews,
+    _path_policy_refusal_message,
     _plugin_selection_violation,
     _post_mutation_invariant_error,
     _prevalidate_transform_for_context,
@@ -817,11 +818,20 @@ def _execute_upsert_node(
                     state, f"Node '{node_id}': {provider_policy_error}", error_code="llm_retry_budget_policy", rejected_component=node_ref
                 )
 
-        provider_path_error = _validate_transform_provider_config_path(review_options, context.data_dir, session_id=context.session_id)
+        provider_path_error = _validate_transform_provider_config_path(
+            review_options,
+            context.data_dir,
+            session_id=context.session_id,
+            require_data_dir=context.require_data_dir_for_paths,
+            mcp_root_authority=context.mcp_root_authority,
+        )
         if provider_path_error is not None:
             return _saved_graph_rejection_result(
                 state,
-                "Node options.provider_config.persist_directory is outside this session's permitted locations. Use an authorized session-local directory.",
+                _path_policy_refusal_message(
+                    context,
+                    "Node options.provider_config.persist_directory is outside this session's permitted locations. Use an authorized session-local directory.",
+                ),
                 error_code="provider_config_path_policy_invalid",
                 rejected_component=node_ref,
             )
@@ -1927,11 +1937,20 @@ def _execute_patch_node_options(
 
         # S2: confine nested provider_config persist_directory (RAG retrieval).
         # A merge-patch can introduce an escaping path just as upsert_node can.
-        provider_path_error = _validate_transform_provider_config_path(reconciled_options, context.data_dir, session_id=context.session_id)
+        provider_path_error = _validate_transform_provider_config_path(
+            reconciled_options,
+            context.data_dir,
+            session_id=context.session_id,
+            require_data_dir=context.require_data_dir_for_paths,
+            mcp_root_authority=context.mcp_root_authority,
+        )
         if provider_path_error is not None:
             return _saved_graph_rejection_result(
                 state,
-                "Node options.provider_config.persist_directory is outside this session's permitted locations. Use an authorized session-local directory.",
+                _path_policy_refusal_message(
+                    context,
+                    "Node options.provider_config.persist_directory is outside this session's permitted locations. Use an authorized session-local directory.",
+                ),
                 error_code="provider_config_path_policy_invalid",
                 rejected_component=node_ref,
             )
@@ -2145,11 +2164,20 @@ def _prepare_transform_candidate(
             return _saved_graph_rejection_result(
                 state, f"Node '{node_id}': {provider_policy_error}", error_code="llm_retry_budget_policy", rejected_component=node_ref
             )
-    provider_path_error = _validate_transform_provider_config_path(review_options, context.data_dir, session_id=context.session_id)
+    provider_path_error = _validate_transform_provider_config_path(
+        review_options,
+        context.data_dir,
+        session_id=context.session_id,
+        require_data_dir=context.require_data_dir_for_paths,
+        mcp_root_authority=context.mcp_root_authority,
+    )
     if provider_path_error is not None:
         return _saved_graph_rejection_result(
             state,
-            "Node options.provider_config.persist_directory is outside this session's permitted locations. Use an authorized session-local directory.",
+            _path_policy_refusal_message(
+                context,
+                "Node options.provider_config.persist_directory is outside this session's permitted locations. Use an authorized session-local directory.",
+            ),
             error_code="provider_config_path_policy_invalid",
             rejected_component=node_ref,
         )

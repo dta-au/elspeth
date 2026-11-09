@@ -68,6 +68,7 @@ from elspeth.web.composer.tools._common import (
     _mutation_result,
     _normalize_echoed_interpretation_requirements,
     _options_with_pending_requirement,
+    _path_policy_refusal_message,
     _pending_interpretation_requirement,
     _plugin_selection_violation,
     _prevalidate_source_for_context,
@@ -1132,12 +1133,16 @@ def _execute_set_source(
         context.data_dir,
         session_id=context.session_id,
         require_data_dir=context.require_data_dir_for_paths,
+        mcp_root_authority=context.mcp_root_authority,
     )
     if path_error is not None:
         return _saved_graph_rejection_result(
             state,
-            "Source file path options (path or file) must use this session's permitted source locations. "
-            "Use the session's blob binding or an authorized source path.",
+            _path_policy_refusal_message(
+                context,
+                "Source file path options (path or file) must use this session's permitted source locations. "
+                "Use the session's blob binding or an authorized source path.",
+            ),
             error_code="source_path_policy_invalid",
             rejected_component=_source_component_id(source_name),
         )
@@ -2197,12 +2202,16 @@ def _execute_patch_source_options(
         context.data_dir,
         session_id=context.session_id,
         require_data_dir=context.require_data_dir_for_paths,
+        mcp_root_authority=context.mcp_root_authority,
     )
     if path_error is not None:
         return _saved_graph_rejection_result(
             state,
-            "Source file path options (path or file) must use this session's permitted source locations. "
-            "Use the session's blob binding or an authorized source path.",
+            _path_policy_refusal_message(
+                context,
+                "Source file path options (path or file) must use this session's permitted source locations. "
+                "Use the session's blob binding or an authorized source path.",
+            ),
             error_code="source_path_policy_invalid",
             rejected_component=_source_component_id(source_name),
         )
