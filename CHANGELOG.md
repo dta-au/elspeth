@@ -4,6 +4,58 @@ All notable changes to ELSPETH are documented here.
 
 ---
 
+## 0.8.10 - Unreleased
+
+### Composer
+
+- **Composer and advisor must be reasoning models.** Every composer-plane
+  request (compose loop, planner, escape hatch and advisor) now carries a
+  reasoning-effort hint. Previously the hint was silently dropped for bare and
+  `openai/` model names, which covers every OpenAI-compatible gateway alias,
+  including AWS Scenario C's, so those deployments ran unhinted while the boot
+  advisory implied otherwise. A model, provider or gateway that cannot honour
+  the hint now refuses the request instead of running it unhinted.
+- **The `none` reasoning-effort opt-out is removed.**
+  `ELSPETH_WEB__COMPOSER_DISCOVERY_REASONING_EFFORT`,
+  `ELSPETH_WEB__COMPOSER_CANDIDATE_REASONING_EFFORT` and
+  `ELSPETH_WEB__COMPOSER_ADVISOR_REASONING_EFFORT` accept `low`, `medium` or
+  `high`; `none` is refused at startup, and the planner configuration refuses
+  an unhinted or unknown effort before any provider turn.
+
+### LLM gateway
+
+- **The gateway carries the reasoning hint.** The inbound Chat Completions
+  subset accepts `reasoning_effort` (`low`, `medium` or `high`) and passes it to
+  adapters on the canonical request. The OpenRouter-style `reasoning` object is
+  still rejected.
+- **New `reasoning` adapter capability.** An adapter declares it only when its
+  upstream can honour the hint. A request carrying the hint to an adapter that
+  does not declare it is refused with `capability_unsupported` before any
+  upstream call, never forwarded with the hint dropped. The reference adapter
+  declares it and forwards the hint as `generation.deliberation`, and the
+  conformance capability sweep covers it. The reference image's
+  `adapter-fingerprint` label changes accordingly.
+
+### Upgrade notes
+
+- Remove any `none` value from the three composer reasoning-effort settings
+  before upgrading; startup refuses it.
+- A derived gateway adapter must declare `reasoning` (and translate the hint)
+  to serve ELSPETH's composer. Re-run the conformance kit against the derived
+  image.
+- Behind a chat-completions-only gateway, do not give the composer or advisor a
+  GPT-5.4+-style model alias: with tools and the hint, LiteLLM bridges such
+  names to `/v1/responses`, which the gateway does not serve, and the request
+  fails.
+- Some models accept a temperature only with reasoning disabled (for example
+  OpenAI GPT-5.1/5.2). On those routes leave `ELSPETH_WEB__COMPOSER_TEMPERATURE`
+  unset.
+- `deploy/compose` and `deploy/linux-systemd` boot on the `gpt-5.5` default,
+  which is now hinted at the code defaults (`low` discovery, `high` candidate,
+  `medium` advisor). No latency measurements exist for those surfaces yet.
+- The tier-model allowlist entry for `warn_if_not_reasoning_capable` changed
+  and is included in the end-of-release recertification.
+
 ## 0.8.9 - 2026-10-21
 
 This release combines the Composer work developed under 0.8.7, Azure Container
