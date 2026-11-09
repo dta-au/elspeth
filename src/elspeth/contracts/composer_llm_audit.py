@@ -14,10 +14,11 @@ from __future__ import annotations
 
 import math
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass, field, fields
 from datetime import datetime
 from enum import StrEnum
-from typing import Any, Final, Literal, Protocol
+from typing import Any, Final, Literal, Protocol, Self
 
 from elspeth.contracts.composer_audit import PrivateFailureFacts, PrivateReceivedDiagnostic
 from elspeth.contracts.composer_provider_context import PrivateProviderContext
@@ -147,6 +148,100 @@ class ComposerLLMRequestByteSplit:
         }
 
 
+def _require_index_tuple(value: object, field_name: str) -> None:
+    if type(value) is not tuple:
+        raise TypeError(f"{field_name} must be tuple, got {type(value).__name__}")
+    for index, item in enumerate(value):
+        _require_component_bytes(item, f"{field_name}[{index}]")
+
+
+@dataclass(frozen=True, slots=True)
+class ComposerContextBudgetRecord:
+    """The context-budget decision made before one composer model call.
+
+    Carries integer counts, the policy hash and the identifiers of what was
+    shed; never any content. ``bytes_per_token`` is the ``repr`` of the float
+    the estimate used. The shed decisions are by position
+    (``shed_history_indices``, ``shed_hatch_event_indices``, ascending) or by
+    tool-call id (``stubbed_tool_call_ids``, in request order).
+    """
+
+    policy_hash: str
+    bytes_per_token: str
+    estimated_tokens_before: int
+    estimated_tokens_after: int
+    shed_history_indices: tuple[int, ...]
+    stubbed_tool_call_ids: tuple[str, ...]
+    shed_hatch_event_indices: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        _require_non_empty_str(self.policy_hash, "policy_hash")
+        _require_non_empty_str(self.bytes_per_token, "bytes_per_token")
+        _require_component_bytes(self.estimated_tokens_before, "estimated_tokens_before")
+        _require_component_bytes(self.estimated_tokens_after, "estimated_tokens_after")
+        _require_index_tuple(self.shed_history_indices, "shed_history_indices")
+        _require_index_tuple(self.shed_hatch_event_indices, "shed_hatch_event_indices")
+        if type(self.stubbed_tool_call_ids) is not tuple:
+            raise TypeError(f"stubbed_tool_call_ids must be tuple, got {type(self.stubbed_tool_call_ids).__name__}")
+        for index, tool_call_id in enumerate(self.stubbed_tool_call_ids):
+            if type(tool_call_id) is not str:
+                raise TypeError(f"stubbed_tool_call_ids[{index}] must be str, got {type(tool_call_id).__name__}: {tool_call_id!r}")
+
+    @classmethod
+    def from_shed_keys(
+        cls,
+        *,
+        policy_hash: str,
+        bytes_per_token: float,
+        estimated_tokens_before: int,
+        estimated_tokens_after: int,
+        shed_keys: Sequence[str],
+    ) -> Self:
+        """Partition budgeter shed keys: ``history:<int>``, ``tool:<id>``, ``hatch:<int>``.
+
+        A tool-call id may itself contain colons, so each key splits on its
+        first colon only. Any other form is refused.
+        """
+        history: list[int] = []
+        tool_ids: list[str] = []
+        hatch: list[int] = []
+        for key in shed_keys:
+            kind, separator, rest = key.partition(":")
+            if not separator:
+                raise ValueError(f"unrecognised shed key {key!r}")
+            if kind == "tool":
+                tool_ids.append(rest)
+            elif kind in ("history", "hatch"):
+                try:
+                    position = int(rest)
+                except ValueError:
+                    raise ValueError(f"unrecognised shed key {key!r}") from None
+                (history if kind == "history" else hatch).append(position)
+            else:
+                raise ValueError(f"unrecognised shed key {key!r}")
+        return cls(
+            policy_hash=policy_hash,
+            bytes_per_token=repr(bytes_per_token),
+            estimated_tokens_before=estimated_tokens_before,
+            estimated_tokens_after=estimated_tokens_after,
+            shed_history_indices=tuple(sorted(history)),
+            stubbed_tool_call_ids=tuple(tool_ids),
+            shed_hatch_event_indices=tuple(sorted(hatch)),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        """JSON-friendly dict for sidecar serialization."""
+        return {
+            "policy_hash": self.policy_hash,
+            "bytes_per_token": self.bytes_per_token,
+            "estimated_tokens_before": self.estimated_tokens_before,
+            "estimated_tokens_after": self.estimated_tokens_after,
+            "shed_history_indices": list(self.shed_history_indices),
+            "stubbed_tool_call_ids": list(self.stubbed_tool_call_ids),
+            "shed_hatch_event_indices": list(self.shed_hatch_event_indices),
+        }
+
+
 def _require_non_empty_str(value: object, field_name: str, *, optional: bool = False) -> None:
     if optional and value is None:
         return
@@ -261,6 +356,10 @@ class ComposerLLMCall:
     list's UTF-8 byte length and their sum. It is derived at the capture point
     from the same serialization the two hashes use, carries sizes only (never
     content), and is ``None`` only on a record constructed without it.
+
+    ``context_budget`` is the :class:`ComposerContextBudgetRecord` of the
+    pre-call context-budget decision (estimates, policy hash, what was shed),
+    or ``None`` when the call was not budgeted.
     """
 
     model_requested: str
@@ -300,6 +399,7 @@ class ComposerLLMCall:
     tool_contract_dialect: ToolContractDialect | None = None
     strict_tool_count: int | None = None
     request_byte_split: ComposerLLMRequestByteSplit | None = None
+    context_budget: ComposerContextBudgetRecord | None = None
     private_failure: PrivateFailureFacts | None = field(default=None, repr=False)
     private_diagnostics: tuple[PrivateReceivedDiagnostic, ...] = field(default=(), repr=False)
     private_request: PrivateProviderContext | None = field(default=None, repr=False)
@@ -319,6 +419,8 @@ class ComposerLLMCall:
             raise TypeError(f"request_byte_split must be ComposerLLMRequestByteSplit or None, got {type(self.request_byte_split).__name__}")
         if self.request_byte_split is not None and (self.request_byte_split.tools_bytes is None) != (self.tools_spec_hash is None):
             raise ValueError("request_byte_split.tools_bytes and tools_spec_hash must agree on whether tools were sent")
+        if self.context_budget is not None and type(self.context_budget) is not ComposerContextBudgetRecord:
+            raise TypeError(f"context_budget must be ComposerContextBudgetRecord or None, got {type(self.context_budget).__name__}")
         if self.tool_contract_dialect is not None and type(self.tool_contract_dialect) is not ToolContractDialect:
             raise TypeError(f"tool_contract_dialect must be ToolContractDialect or None, got {type(self.tool_contract_dialect).__name__}")
         if self.strict_tool_count is not None:
@@ -429,6 +531,7 @@ class ComposerLLMCall:
         raw["status"] = self.status.value
         raw["tool_contract_dialect"] = self.tool_contract_dialect.value if self.tool_contract_dialect is not None else None
         raw["request_byte_split"] = self.request_byte_split.to_dict() if self.request_byte_split is not None else None
+        raw["context_budget"] = self.context_budget.to_dict() if self.context_budget is not None else None
         raw["started_at"] = self.started_at.isoformat()
         raw["finished_at"] = self.finished_at.isoformat()
         return raw
