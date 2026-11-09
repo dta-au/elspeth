@@ -35,6 +35,7 @@ from dataclasses import dataclass
 from typing import cast
 
 from fastapi import HTTPException, Request
+from pydantic import ValidationError
 
 from elspeth.contracts.blobs import (
     BlobQuotaExceededError,
@@ -246,6 +247,16 @@ async def import_shared_snapshot(*, token: str, request: Request, user: UserIden
     plan = _plan_bindings(snapshot.files)
     composition = CompositionState.from_dict(snapshot.blob["composition_snapshot"])
     public_yaml = generate_public_yaml(composition)
+    # Validate the request shape that does not depend on the new blob ids
+    # (the YAML length cap) before anything is created. 422 matches what
+    # the YAML-import route answers for the same over-cap body.
+    try:
+        ImportStateYamlRequest(yaml=public_yaml)
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=exc.errors(include_url=False, include_input=False, include_context=False),
+        ) from None
     name = composition.metadata.name.strip()
     title = f"Copy of {name}" if name else _FALLBACK_TITLE
     # Resolve the seeder before creating a session, so incomplete wiring

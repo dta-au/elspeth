@@ -24,10 +24,12 @@ from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.payload_store import IntegrityError
 from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
+from elspeth.web.composer.yaml_importer import MAX_RUNTIME_YAML_IMPORT_CHARS
 from elspeth.web.config import WebSettings
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId
 from elspeth.web.sessions.models import blobs_table, sessions_table
 from elspeth.web.sessions.protocol import CompositionStateData, SessionNotFoundError
+from elspeth.web.shareable_reviews import importer as importer_module
 from tests.fixtures.identities import wire_test_pipeline_user_authority
 from tests.integration.web.conftest import _lifespan_test_client, _save_composition_state_with_compose_authority
 from tests.unit.web._sync_asgi_client import SyncASGITestClient
@@ -446,6 +448,23 @@ def test_import_corrupt_frozen_file_raises_and_creates_no_session(
         _import(client, actor, shared.token)
 
     assert created_sessions == []
+
+
+def test_import_oversized_yaml_is_refused_and_creates_no_session(
+    client: SyncASGITestClient, actor: _Actor, created_sessions: list[UUID], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A public YAML over the import cap is refused before any session exists."""
+    shared = _tom_shares(client, actor)
+    oversized = "#" * (MAX_RUNTIME_YAML_IMPORT_CHARS + 1)
+    monkeypatch.setattr(importer_module, "generate_public_yaml", lambda _state: oversized)
+    created_sessions.clear()
+    stored_before = _stored_session_ids(client, _CHRIS)
+
+    response = _import(client, actor, shared.token)
+
+    assert response.status_code == 422, response.text
+    assert created_sessions == []
+    assert _stored_session_ids(client, _CHRIS) == stored_before
 
 
 def test_import_invalid_token_is_401(client: SyncASGITestClient, actor: _Actor, created_sessions: list[UUID]) -> None:
