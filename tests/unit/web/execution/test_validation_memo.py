@@ -594,16 +594,35 @@ async def test_blob_reads_still_current_rechecks_each_row_under_callers_context(
     rows = _BlobRows(recorded)
     try:
         monkeypatch.setattr(service, "_blob_service", rows)
-        unchanged = await service._blob_reads_still_current(((recorded.id, recorded),), session_operation_context=context)
+        unchanged = await service._blob_reads_still_current(
+            ((recorded.id, recorded),), session_id=session_id, session_operation_context=context
+        )
         rows.record = _blob(session_id, content_hash="b" * 64)
-        replaced = await service._blob_reads_still_current(((recorded.id, recorded),), session_operation_context=context)
+        replaced = await service._blob_reads_still_current(
+            ((recorded.id, recorded),), session_id=session_id, session_operation_context=context
+        )
         rows.record = None
-        deleted = await service._blob_reads_still_current(((recorded.id, recorded),), session_operation_context=context)
-        still_absent = await service._blob_reads_still_current(((recorded.id, None),), session_operation_context=context)
+        deleted = await service._blob_reads_still_current(
+            ((recorded.id, recorded),), session_id=session_id, session_operation_context=context
+        )
+        still_absent = await service._blob_reads_still_current(
+            ((recorded.id, None),), session_id=session_id, session_operation_context=context
+        )
+        # Validation reads a row owned by another session as absent, so the
+        # re-check must judge such a row against a recorded ``None`` the same
+        # way, or a hit could never be served for it.
+        rows.record = _blob(uuid4())
+        other_session_as_absent = await service._blob_reads_still_current(
+            ((recorded.id, None),), session_id=session_id, session_operation_context=context
+        )
+        other_session_not_recorded_row = await service._blob_reads_still_current(
+            ((recorded.id, recorded),), session_id=session_id, session_operation_context=context
+        )
     finally:
         await execution_fixture.shutdown_service(service)
 
     assert (unchanged, replaced, deleted, still_absent) == (True, False, False, True)
+    assert (other_session_as_absent, other_session_not_recorded_row) == (True, False)
     assert rows.contexts and all(seen is context for seen in rows.contexts)
 
 

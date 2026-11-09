@@ -1312,6 +1312,39 @@ Record raw output, not summaries, in each fix's Evidence line.
   while the run was in progress, so this run is frozen evidence for the
   batch 1 commits only, not for those two fixes; the batch 2 run covers
   them.
+- Batch 2 gate (fixes 3-T1, 2C, 4A, 13 on top of batch 1; HEAD 12e4ba2d
+  plus the gate repairs committed with this record). Compose smoke: clean
+  ledger, 2 provider / 2 planner calls in one run, 50.0 s model time, zero
+  violations, final read complete; the run's exit 1 was the Run phase's
+  409 (`Session operation is already active`), a frontend race fixed as
+  [#352](https://github.com/dta-au/elspeth/issues/352), not a compose
+  regression (per-resolve latency unchanged at ~420 ms). Architecture
+  suite, first run on the uncommitted fix 13 tree: exit 1, 24 failed /
+  1,958 passed; every failure was the same assertion, "terminal SQL
+  transfer: finite current service declaration namespace changed", because
+  fix 13 changed one `SessionServiceImpl` method header
+  (`_prepare_or_create_pending_interpretation_event`). Re-pinned
+  `NAMESPACE_GRAMMAR` in `tests/helpers/web_reserve_terminal_sql_transfers.py`
+  with the gate's own `namespace_grammar()`; control: the pre-fix-13 file at
+  3e22ac19 hashes to the old pin, and the only header delta is that one
+  signature. Rerun of the two failing files: exit 0, 912 passed. Keyless
+  lint corpus after batch 2: 3,675 lines; against batch 1 (line numbers
+  normalised) the only delta is one added R5 `isinstance` finding in
+  `composer_stream_auth.py` (an ADR-032 nominal check against our own
+  `LocalAuthProvider`; kept) and one R6 line reworded by 3-T1's narrower
+  except clause. The 13 lines of drift the first batch 2 corpus showed were
+  repaired before that comparison: `_blob_get_metadata` in the execution
+  service restored verbatim so its signed tier-model allowlist entry
+  (scope fingerprint `1297e11905ed7542`) binds again, with the memo's blob
+  observation moved into a separate `_observed_blob_metadata` wrapper; two
+  R6 handlers in `_blob_row_matches` given explicit returns (`False` with
+  no blob service; `recorded is None` on not-found and on another
+  session's row); two R1 `dict.get()`-shaped lookups in the memo replaced
+  with membership tests. Scoped tests after the repairs: memo and lifecycle
+  files 120 passed, `tests/unit/web/execution/` 2,108 passed, ruff /
+  ruff-format / mypy clean. Still owed: the full `pytest tests/` and the
+  `testcontainer` suites (fixes 10, 3-T1, 13 touch session persistence and
+  locks) — to run on the maintainer's CI runners.
 - The repo-root `.env` used for this work is read by the CLI even under
   `--no-dotenv`: `tests/unit/web/coordination/test_cli_quota_admission.py`
   (2 cases) fails in this checkout with "an active human admin already

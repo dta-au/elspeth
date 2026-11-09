@@ -1579,15 +1579,21 @@ class ExecutionServiceImpl:
             try:
                 record = self._call_async(self._blob_service.get_blob(blob_id, session_operation_context=session_operation_context))
             except BlobNotFoundError:
-                if blob_reads is not None:
-                    blob_reads.record(blob_id, None)
                 return None
             if type(record) is not BlobRecord:
                 raise TypeError("BlobServiceProtocol.get_blob() must return an exact BlobRecord")
-            if blob_reads is not None:
-                blob_reads.record(blob_id, record)
             if session_id is not None and record.session_id != session_id:
                 return None
+            return record
+
+        def _observed_blob_metadata(blob_id: UUID) -> BlobRecord | None:
+            # The advisory validate_state memo records what validation SAW:
+            # the session-filtered view above (a row owned by another session
+            # reads as absent). ``_blob_reads_still_current`` applies the same
+            # filter when it re-checks a hit, so the two views agree.
+            record = _blob_get_metadata(blob_id)
+            if blob_reads is not None:
+                blob_reads.record(blob_id, record)
             return record
 
         def _blob_get_content(blob_id: UUID) -> tuple[BlobRecord, bytes]:
@@ -1603,7 +1609,7 @@ class ExecutionServiceImpl:
                 if blob_reads is not None:
                     blob_reads.mark_uncacheable()
                 raise
-            record = _blob_get_metadata(blob_id)
+            record = _observed_blob_metadata(blob_id)
             if record is None:
                 raise BlobNotFoundError(str(blob_id))
             return record, content
@@ -1615,7 +1621,7 @@ class ExecutionServiceImpl:
             secret_service=self._secret_service,
             secret_wiring_policy=self._secret_wiring_policy,
             user_id=user_id,
-            blob_get_metadata=_blob_get_metadata,
+            blob_get_metadata=_observed_blob_metadata,
             blob_get_content=_blob_get_content,
             session_id=str(session_id) if session_id is not None else None,
             plugin_snapshot=plugin_snapshot,
@@ -3349,7 +3355,9 @@ class ExecutionServiceImpl:
             )
 
         async def _blob_reads_current(blob_reads: BlobReads) -> bool:
-            return await self._blob_reads_still_current(blob_reads, session_operation_context=session_operation_context)
+            return await self._blob_reads_still_current(
+                blob_reads, session_id=session_id, session_operation_context=session_operation_context
+            )
 
         if fresh or _state_has_secret_ref_sites(state, env_ref_names):
             result = await _compute(None)
@@ -3372,21 +3380,39 @@ class ExecutionServiceImpl:
         self,
         blob_reads: BlobReads,
         *,
+        session_id: UUID | None,
         session_operation_context: SessionOperationContext,
     ) -> bool:
         """Re-read each blob row a memoized validation consulted; True iff all are unchanged."""
         for blob_id, recorded in blob_reads:
-            if self._blob_service is None:
-                return False
-            try:
-                current = await self._blob_service.get_blob(blob_id, session_operation_context=session_operation_context)
-            except BlobNotFoundError:
-                current = None
-            if current is not None and type(current) is not BlobRecord:
-                raise TypeError("BlobServiceProtocol.get_blob() must return an exact BlobRecord")
-            if current != recorded:
+            if not await self._blob_row_matches(
+                blob_id, recorded, session_id=session_id, session_operation_context=session_operation_context
+            ):
                 return False
         return True
+
+    async def _blob_row_matches(
+        self,
+        blob_id: UUID,
+        recorded: BlobRecord | None,
+        *,
+        session_id: UUID | None,
+        session_operation_context: SessionOperationContext,
+    ) -> bool:
+        """True iff the blob row, seen through validation's session filter, equals what was recorded."""
+        if self._blob_service is None:
+            return False
+        try:
+            current = await self._blob_service.get_blob(blob_id, session_operation_context=session_operation_context)
+        except BlobNotFoundError:
+            return recorded is None
+        if type(current) is not BlobRecord:
+            raise TypeError("BlobServiceProtocol.get_blob() must return an exact BlobRecord")
+        if session_id is not None and current.session_id != session_id:
+            # Validation's metadata view reads a row owned by another session
+            # as absent, so the recorded observation for it is ``None``.
+            return recorded is None
+        return current == recorded
 
     async def verify_run_ownership(self, user: UserIdentity, run_id: str) -> bool:
         """Verify that a run belongs to the authenticated user's session.

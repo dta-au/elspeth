@@ -165,7 +165,7 @@ class ValidationResultMemo:
         loop = asyncio.get_running_loop()
         with self._lock:
             self._evict_expired_locked()
-            entry = self._entries.get(key)
+            entry = self._entries[key] if key in self._entries else None
             outcome = None if entry is None else entry.outcome
             joinable = entry is not None and outcome is None and entry.future.get_loop() is loop
         if entry is not None and joinable:
@@ -212,7 +212,7 @@ class ValidationResultMemo:
 
     def _discard(self, key: ValidationMemoKey, entry: _Entry) -> None:
         with self._lock:
-            if self._entries.get(key) is entry:
+            if key in self._entries and self._entries[key] is entry:
                 del self._entries[key]
 
     def _evict_expired_locked(self) -> None:
