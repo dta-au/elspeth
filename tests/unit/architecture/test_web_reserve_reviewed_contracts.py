@@ -428,6 +428,65 @@ def test_reviewed_turn_grammar_matches_live_source_and_refuses_reserve_drift(con
     assert failures == [expected]
 
 
+@pytest.mark.parametrize("fault", ("policy", "refusal-context", "refusal-callee", "refusal-cancellation", "settlement-reason"))
+def test_d1_reviewed_bindings_preserve_policy_refusal_and_settlement_authority(fault: str) -> None:
+    """Actual recipe checks detect drift in the newly reviewed dependencies."""
+    canonical = fencing._production_units()
+    assert fencing._reserve_recipe_failures(canonical) == []
+    path = compose.SETTLEMENT if fault == "settlement-reason" else compose.PROPOSALS
+    original = next(unit for unit in canonical if unit.path == path)
+    changed = fencing._parse_source(path, original.source)
+    symbol = (
+        "accept_composition_proposal"
+        if fault == "policy"
+        else "_settle_pipeline_proposal_under_compose_lock"
+        if fault == "settlement-reason"
+        else "_reject_legacy_proposal_refusal"
+    )
+    method = fencing._reserve_node_at(changed, symbol)
+    if fault == "policy":
+        worker = next(
+            call
+            for call in ast.walk(method)
+            if isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Name)
+            and call.func.id == "run_sync_in_worker"
+            and call.args
+            and isinstance(call.args[0], ast.Name)
+            and call.args[0].id == "execute_tool"
+        )
+        policy = next(keyword for keyword in worker.keywords if keyword.arg == "secret_wiring_policy")
+        worker.keywords.remove(policy)
+    elif fault == "settlement-reason":
+        reasons = next(
+            node.value
+            for node in ast.walk(method)
+            if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.target.id == "reason_by_code"
+        )
+        index = next(index for index, key in enumerate(reasons.keys) if key.value == "NO_CHANGE")
+        reasons.values[index] = ast.Constant(value="operator_rejected")
+    else:
+        rejection = next(
+            call
+            for call in ast.walk(method)
+            if isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute) and call.func.attr == "reject_composition_proposal"
+        )
+        if fault == "refusal-context":
+            keyword = next(keyword for keyword in rejection.keywords if keyword.arg == "session_operation_context")
+            keyword.value = ast.Name(id="foreign_context", ctx=ast.Load())
+        elif fault == "refusal-callee":
+            rejection.func.value = ast.Name(id="foreign_service", ctx=ast.Load())
+        else:
+            draining = next(
+                call
+                for call in ast.walk(method)
+                if isinstance(call, ast.Call) and isinstance(call.func, ast.Name) and call.func.id == "_await_with_deferred_cancellation"
+            )
+            next(keyword for keyword in draining.keywords if keyword.arg == "state").value = ast.Constant(value=None)
+    units = tuple(changed if unit.path == path else unit for unit in canonical)
+    assert fencing._reserve_recipe_failures(units) == ["writer target/field recipe changed " + path + ":" + symbol]
+
+
 @pytest.mark.parametrize("fault", ("omit", "include"))
 def test_provider_turn_contract_binds_private_transcript_filter(fault: str) -> None:
     unit = _source_units((TURN,))[0]
