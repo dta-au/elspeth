@@ -4774,6 +4774,32 @@ class TestDiscoveryCache:
             affected_nodes=(),
         ).to_dict()["validation"]
         assert cached_payload["validation"] == expected_validation
+        assert cached_payload["affected_nodes"] == first_payload["affected_nodes"] == []
+        discovery_invocations = [entry for entry in result.tool_invocations if entry.tool_name == tool_name]
+        assert len(discovery_invocations) == 2
+        assert [entry.cache_hit for entry in discovery_invocations] == [False, True]
+        miss, hit = discovery_invocations
+        assert miss.result_canonical is not None
+        assert hit.result_canonical is not None
+        assert json.loads(miss.result_canonical) == first_payload
+        assert json.loads(hit.result_canonical) == cached_payload
+
+        from elspeth.web.composer.diagnostic_evidence import ComposerDiagnosticEvidence
+
+        stored = await service._require_sessions_service().get_messages(UUID(session_id), limit=None)
+        private = [
+            ComposerDiagnosticEvidence.from_envelope(envelope, expected_session_id=session_id)
+            for message in stored
+            if message.role == "audit"
+            for envelope in message.tool_calls or ()
+            if envelope["_kind"] == "composer_diagnostic_evidence" and envelope["tool_call_id"] in {"c1", "c3"}
+        ]
+        assert [entry.tool_call_id for entry in private] == ["c1", "c3"]
+        for entry, delivered in zip(private, (first_payload, cached_payload), strict=True):
+            assert entry.result.disposition == "retained"
+            assert entry.result.content is not None
+            assert json.loads(entry.result.content) == delivered
+            assert entry.result.retained_sha256 == stable_hash(delivered)
         # See test_cacheable_tool_returns_cached_result: PolicyCatalogView
         # memoizes its unrestricted listing per instance, so repeated
         # internal list_sources()/capability_groups() reads within one
@@ -4892,6 +4918,8 @@ class TestDiscoveryCache:
         assert [call.args[1].status for call in record.call_args_list] == [ComposerToolStatus.SUCCESS, ComposerToolStatus.PLUGIN_CRASH]
         messages = [message for message in completion.call_args_list[-1][0][0] if message["role"] == "tool"]
         assert [message["tool_call_id"] for message in messages] == ["miss"]
+        stored = await service._require_sessions_service().get_messages(UUID(session_id), limit=None)
+        assert [message.tool_call_id for message in stored if message.role == "tool"] == ["miss"]
 
     @pytest.mark.asyncio
     async def test_selected_response_semantic_failure_is_never_cached(self) -> None:
