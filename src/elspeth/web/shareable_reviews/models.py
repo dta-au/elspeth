@@ -43,6 +43,23 @@ from elspeth.web.execution.schemas import _StrictResponse
 from elspeth.web.sessions.schemas import CompositionObject
 
 
+class MarkReadyForReviewRequest(_StrictResponse):
+    """Optional body of ``POST /api/sessions/{session_id}/mark-ready-for-review``.
+
+    An absent body keeps the original behaviour: a view-only link that lasts
+    the deployment's ``shareable_link_lifetime_seconds``.
+
+    ``lifetime_seconds`` is the closed set the dialog offers (1, 7 or 30
+    days); anything else is a 422 from validation. ``None`` means the
+    deployment maximum. A listed value above the deployment maximum is
+    refused by the service (also 422) — the browser is not trusted to
+    enforce the operator's cap.
+    """
+
+    allow_import: bool = False
+    lifetime_seconds: Literal[86400, 604800, 2592000] | None = None
+
+
 class MarkReadyForReviewResponse(_StrictResponse):
     """Returned by ``POST /api/sessions/{session_id}/mark-ready-for-review``.
 

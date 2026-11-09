@@ -978,6 +978,8 @@ async def _service_lifespan(app: FastAPI) -> AsyncIterator[None]:
             # ``telemetry=app.state.sessions_telemetry`` pattern at line 259
             # for the execution service.
             telemetry=app.state.sessions_telemetry,
+            # Reads the owner's uploaded files when a share opts in to import.
+            blob_service=app.state.blob_service,
         )
 
         # Prime the OpenRouter model catalog from the live ``/models``

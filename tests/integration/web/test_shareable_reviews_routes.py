@@ -30,7 +30,7 @@ from elspeth.core.canonical import canonical_json
 from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.middleware.rate_limit import ComposerRateLimiter
-from elspeth.web.sessions.models import composer_completion_events_table
+from elspeth.web.sessions.models import blobs_table, composer_completion_events_table
 from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.shareable_reviews.signer import ShareTokenPayload
 from tests.fixtures.identities import ensure_test_identity
@@ -614,3 +614,129 @@ def test_mark_ready_for_review_audit_write_failure_returns_no_token(
         client.post(f"/api/sessions/{session_id}/mark-ready-for-review")
     # CRITICAL: no blob was written.
     assert store_calls == [], "audit insert must precede blob write — blob should not exist when audit fails"
+
+
+# ── Mark-ready body: import opt-in and per-link lifespan ────────────────
+
+
+def test_mark_ready_accepts_absent_body(
+    audit_readiness_client_with_state: tuple[TestClient, UUID],
+) -> None:
+    """No body is today's behaviour: view-only, the settings lifetime."""
+    client, session_id = audit_readiness_client_with_state
+    response = client.post(f"/api/sessions/{session_id}/mark-ready-for-review")
+    assert response.status_code == 200, response.text
+    service = client.app.state.shareable_review_service
+    payload = service._signer.verify(response.json()["token"])
+    lifetime = client.app.state.settings.shareable_link_lifetime_seconds
+    assert payload.expires_at - payload.created_at == timedelta(seconds=lifetime)
+    stored = json.loads(client.app.state.payload_store.retrieve(payload.payload_digest.removeprefix("sha256:")))
+    assert stored["import_allowed"] is False
+    assert stored["files"] == []
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param({"lifetime_seconds": 3600}, id="unknown-lifetime"),
+        pytest.param({"lifetime_seconds": "86400"}, id="string-lifetime"),
+        pytest.param({"allow_import": "yes"}, id="non-bool-import"),
+        pytest.param({"allow_import": True, "expires": 1}, id="extra-field"),
+    ],
+)
+def test_mark_ready_rejects_unknown_lifetime_with_422(
+    audit_readiness_client_with_state: tuple[TestClient, UUID],
+    body: dict[str, object],
+) -> None:
+    client, session_id = audit_readiness_client_with_state
+    response = client.post(f"/api/sessions/{session_id}/mark-ready-for-review", json=body)
+    assert response.status_code == 422, response.text
+    with client.app.state.session_engine.connect() as conn:
+        rows = conn.execute(
+            select(composer_completion_events_table).where(composer_completion_events_table.c.session_id == str(session_id))
+        ).all()
+    assert rows == []
+
+
+def test_mark_ready_maps_lifetime_above_maximum_to_422(
+    audit_readiness_client_with_state: tuple[TestClient, UUID],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The server, not the browser, enforces the operator's cap."""
+    client, session_id = audit_readiness_client_with_state
+    service = client.app.state.shareable_review_service
+    capped = client.app.state.settings.model_copy(update={"shareable_link_lifetime_seconds": 604800})
+    monkeypatch.setattr(service, "_settings", capped)
+    response = client.post(
+        f"/api/sessions/{session_id}/mark-ready-for-review",
+        json={"lifetime_seconds": 2592000},
+    )
+    assert response.status_code == 422, response.text
+    assert "7 days" in response.json()["detail"]
+
+
+def test_mark_ready_with_lifetime_and_copy_link_keep_one_day(
+    audit_readiness_client_with_state: tuple[TestClient, UUID],
+) -> None:
+    client, session_id = audit_readiness_client_with_state
+    marked = client.post(
+        f"/api/sessions/{session_id}/mark-ready-for-review",
+        json={"allow_import": True, "lifetime_seconds": 86400},
+    )
+    assert marked.status_code == 200, marked.text
+    service = client.app.state.shareable_review_service
+    payload = service._signer.verify(marked.json()["token"])
+    assert payload.expires_at - payload.created_at == timedelta(days=1)
+
+    reminted = client.get(f"/api/sessions/{session_id}/shareable-link")
+    assert reminted.status_code == 200, reminted.text
+    reminted_payload = service._signer.verify(reminted.json()["token"])
+    assert reminted_payload.expires_at - reminted_payload.created_at == timedelta(days=1)
+
+
+def test_mark_ready_with_import_freezes_an_uploaded_file(
+    audit_readiness_client_with_state: tuple[TestClient, UUID],
+) -> None:
+    """End to end through the real blob service: the uploaded bytes are frozen."""
+    client, session_id = audit_readiness_client_with_state
+    content = b"id,name\n1,Ada\n"
+    uploaded = client.post(
+        f"/api/sessions/{session_id}/blobs",
+        files={"file": ("customers.csv", content, "text/csv")},
+    )
+    assert uploaded.status_code == 201, uploaded.text
+    blob = uploaded.json()
+    with client.app.state.session_engine.connect() as conn:
+        storage_path = conn.execute(select(blobs_table.c.storage_path).where(blobs_table.c.id == blob["id"])).scalar_one()
+
+    session_service = client.app.state.session_service
+    state_d = _passthrough_composition_state(client.app.state.settings.data_dir, session_id).to_dict()
+    state_d["sources"]["source"]["options"].update({"path": storage_path, "blob_ref": blob["id"]})
+    asyncio.run(
+        _save_composition_state_with_compose_authority(
+            session_service,
+            session_id,
+            CompositionStateData(
+                sources=state_d["sources"],
+                nodes=state_d["nodes"],
+                edges=state_d["edges"],
+                outputs=state_d["outputs"],
+                metadata_=state_d["metadata"],
+                is_valid=True,
+                validation_errors=None,
+            ),
+            provenance="session_seed",
+        )
+    )
+
+    marked = client.post(f"/api/sessions/{session_id}/mark-ready-for-review", json={"allow_import": True})
+
+    assert marked.status_code == 200, marked.text
+    payload_store = client.app.state.payload_store
+    assert payload_store.retrieve(blob["content_hash"]) == content
+    stored = json.loads(payload_store.retrieve(marked.json()["payload_digest"].removeprefix("sha256:")))
+    assert stored["import_allowed"] is True
+    assert [(entry["sha256"], entry["filename"], entry["size_bytes"]) for entry in stored["files"]] == [
+        (blob["content_hash"], "customers.csv", len(content))
+    ]
+    assert storage_path not in json.dumps(stored)

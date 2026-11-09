@@ -23,7 +23,7 @@ from __future__ import annotations
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from elspeth.contracts.payload_store import PayloadNotFoundError
@@ -39,6 +39,7 @@ from elspeth.web.middleware.rate_limit import (
 from elspeth.web.sessions.ownership import verify_session_ownership
 from elspeth.web.sessions.protocol import SessionServiceProtocol
 from elspeth.web.shareable_reviews.models import (
+    MarkReadyForReviewRequest,
     MarkReadyForReviewResponse,
     ShareableLinkResponse,
     SharedInspectResponse,
@@ -69,15 +70,21 @@ def create_shareable_reviews_router() -> APIRouter:
         user: Annotated[UserIdentity, Depends(require_pipeline_user)],
         # Write bucket: cheap DB write / token mint, not an LLM call.
         rate_limiter: WebRateLimiter = Depends(get_write_rate_limiter),  # noqa: B008
+        # Optional: an absent body is a view-only link at the deployment's
+        # maximum lifetime (the behaviour before the body existed).
+        body: MarkReadyForReviewRequest | None = Body(default=None),  # noqa: B008
     ) -> JSONResponse:
         """Mint a signed share artifact for the current composition state.
 
         Returns 409 with a generic detail if the composition fails either
-        gate (validation or readiness-error). Returns 404 (byte-identical
-        to "session does not exist") if the session belongs to a
-        different user (IDOR). Returns 401 if the request is
-        unauthenticated.
+        gate (validation or readiness-error), or — when import is allowed —
+        if a file it uses cannot be shared (the detail names the file).
+        Returns 422 for a lifetime outside the offered set or above the
+        deployment maximum. Returns 404 (byte-identical to "session does
+        not exist") if the session belongs to a different user (IDOR).
+        Returns 401 if the request is unauthenticated.
         """
+        options = body if body is not None else MarkReadyForReviewRequest()
         await rate_limiter.check(user.user_id)
         await verify_session_ownership(session_id, user, request)
         service: ShareableReviewService = request.app.state.shareable_review_service
@@ -103,8 +110,14 @@ def create_shareable_reviews_router() -> APIRouter:
                     # resolve an opaque id.
                     username=user.username,
                     session_operation_context=lease.context,
+                    allow_import=options.allow_import,
+                    lifetime_seconds=options.lifetime_seconds,
                 )
             except CompositionNotRunnableError as exc:
+                if exc.reason == "lifetime_exceeds_maximum":
+                    # A request the owner can fix by choosing a shorter
+                    # lifetime, not a composition-state conflict.
+                    raise HTTPException(status_code=422, detail=exc.detail or exc.reason) from exc
                 # ``from exc``: preserves the server-side __context__ chain for
                 # logs. Wire-facing ``detail`` is unaffected — only the internal
                 # traceback chain. The probing-attacker rationale that justifies
