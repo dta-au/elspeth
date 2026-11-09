@@ -27,6 +27,7 @@ from elspeth.web.composer.state import (
     validate_composer_source_name,
 )
 from elspeth.web.credential_guard import CredentialMaterialRefused, require_no_credential_material_in_state
+from elspeth.web.resource_identity import canonical_resource_uuid
 
 GraphRecoveryAction = Literal["park", "reset_to_turn_start", "reset_to_safe_checkpoint", "restore_parked_graph"]
 
@@ -54,6 +55,9 @@ class GraphRecoveryIntent:
         if self.action == "restore_parked_graph":
             if type(self.park_id) is not str or not self.park_id.strip() or len(self.park_id) > 128:
                 raise ValueError("Graph recovery restore requires a bounded nonblank park_id")
+            canonical_park_id = canonical_resource_uuid(self.park_id.strip())
+            if canonical_park_id is not None:
+                object.__setattr__(self, "park_id", canonical_park_id)
         elif self.park_id is not None:
             raise ValueError("Only parked graph restoration accepts park_id")
 
