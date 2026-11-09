@@ -116,9 +116,20 @@ establish qualification, a published tag or an image.
 
 ### Upgrade notes
 
-Session epoch remains 78 and Landscape epoch remains 50; existing compatible
-stores need no action, and this entry authorizes no migration, reset or
-downgrade.
+0.8.10 changes neither schema epoch, so the 0.8.9 cutover guidance continues to
+apply unchanged. Session epoch advances from 77 to 78;
+Landscape advances from epoch 49 to 50. The combined package retains committed
+graph-review authority over immutable graph snapshots and adds durable quota
+custody, aggregate container storage, rate-limit policy binding and run
+provider-attempt evidence.
+Preserve epoch-75 stores, both distinct epoch-76 predecessors, epoch-77 session
+stores and epoch-49 Landscape stores with compatible prior application access;
+configure an explicitly new epoch-78 target and an explicitly new epoch-50
+Landscape target. An existing epoch-78 session store and epoch-50 Landscape
+store qualified for 0.8.9 need no action. Older readers ignore those completion
+blockers or cannot admit the new quota shape. This authorizes no migration,
+reset, restamping or downgrade. Drain and isolate old/new deployments; they
+cannot share session stores or replicas.
 
 - Remove any `none` value from the three composer reasoning-effort settings
   before upgrading; startup refuses it.
