@@ -109,6 +109,7 @@ def _build(tmp_path: Path, *, dev_admin_user: str | None = "devadmin") -> _Harne
         auth_provider="local",
         dev_admin_user=dev_admin_user,
         composer_max_composition_turns=15,
+        composer_context_max_prompt_tokens=200_000,
         composer_max_discovery_turns=10,
         composer_timeout_seconds=85.0,
         composer_rate_limit_per_minute=10,

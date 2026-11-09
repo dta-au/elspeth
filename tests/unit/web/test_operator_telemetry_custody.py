@@ -506,6 +506,7 @@ def test_failed_app_constructor_arms_before_lexical_telemetry_cleanup(tmp_path, 
                 data_dir=tmp_path,
                 composer_boot_probe_enabled=False,
                 composer_max_composition_turns=15,
+                composer_context_max_prompt_tokens=200_000,
                 composer_max_discovery_turns=10,
                 composer_timeout_seconds=85,
                 composer_rate_limit_per_minute=100,
@@ -536,6 +537,7 @@ def test_production_closed_record_and_reset_refusal_are_permanent(monkeypatch: p
     runtime = operator_telemetry.bootstrap_operator_telemetry(
         WebSettings(
             composer_max_composition_turns=15,
+            composer_context_max_prompt_tokens=200_000,
             composer_max_discovery_turns=10,
             composer_timeout_seconds=85,
             composer_rate_limit_per_minute=100,
@@ -652,6 +654,7 @@ def test_unsupported_sdk_version_refuses_before_reader_allocation(package: str, 
         operator_telemetry.bootstrap_operator_telemetry(
             WebSettings(
                 composer_max_composition_turns=15,
+                composer_context_max_prompt_tokens=200_000,
                 composer_max_discovery_turns=10,
                 composer_timeout_seconds=85,
                 composer_rate_limit_per_minute=100,
@@ -674,6 +677,7 @@ def test_unsupported_sdk_shape_refuses_before_reader_allocation(field: str, monk
         operator_telemetry.bootstrap_operator_telemetry(
             WebSettings(
                 composer_max_composition_turns=15,
+                composer_context_max_prompt_tokens=200_000,
                 composer_max_discovery_turns=10,
                 composer_timeout_seconds=85,
                 composer_rate_limit_per_minute=100,

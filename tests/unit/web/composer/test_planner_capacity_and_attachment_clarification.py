@@ -63,6 +63,7 @@ def test_deployed_capacity_environment_override_retains_transport_cost_and_repai
 ) -> None:
     values = {
         "COMPOSER_MAX_COMPOSITION_TURNS": "15",
+        "COMPOSER_CONTEXT_MAX_PROMPT_TOKENS": "200000",
         "COMPOSER_MAX_DISCOVERY_TURNS": "10",
         "COMPOSER_RATE_LIMIT_PER_MINUTE": "10",
         "SHAREABLE_LINK_SIGNING_KEY": "0" * 64,
@@ -87,6 +88,7 @@ def test_deployed_capacity_environment_override_retains_transport_cost_and_repai
 
     defaults = WebSettings(
         composer_max_composition_turns=15,
+        composer_context_max_prompt_tokens=200_000,
         composer_max_discovery_turns=10,
         composer_timeout_seconds=300,
         composer_rate_limit_per_minute=10,

@@ -21,6 +21,7 @@ from elspeth.web.deployment_contract import validate_aws_ecs_settings
 
 _REQUIRED_WEB_ENV = {
     "ELSPETH_WEB__COMPOSER_MAX_COMPOSITION_TURNS": "15",
+    "ELSPETH_WEB__COMPOSER_CONTEXT_MAX_PROMPT_TOKENS": "200000",
     "ELSPETH_WEB__COMPOSER_MAX_DISCOVERY_TURNS": "10",
     "ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS": "85.0",
     "ELSPETH_WEB__COMPOSER_RATE_LIMIT_PER_MINUTE": "10",
@@ -76,6 +77,7 @@ class TestWebSettingsValidation:
         with pytest.raises(ValidationError, match="extra"):
             WebSettings(
                 composer_max_composition_turns=15,
+                composer_context_max_prompt_tokens=200_000,
                 composer_max_discovery_turns=10,
                 composer_timeout_seconds=85.0,
                 composer_rate_limit_per_minute=10,
@@ -86,6 +88,7 @@ class TestWebSettingsValidation:
     def test_bedrock_guardrail_settings_round_trip_without_repr_leak(self) -> None:
         settings = WebSettings(
             composer_max_composition_turns=15,
+            composer_context_max_prompt_tokens=200_000,
             composer_max_discovery_turns=10,
             composer_timeout_seconds=85.0,
             composer_rate_limit_per_minute=10,
@@ -109,6 +112,7 @@ class TestWebSettingsValidation:
             WebSettings(
                 auth_provider="invalid",
                 composer_max_composition_turns=15,
+                composer_context_max_prompt_tokens=200_000,
                 composer_max_discovery_turns=10,
                 composer_timeout_seconds=85.0,
                 composer_rate_limit_per_minute=10,
@@ -120,6 +124,7 @@ class TestWebSettingsValidation:
             WebSettings(
                 auth_provider="kerberos",
                 composer_max_composition_turns=15,
+                composer_context_max_prompt_tokens=200_000,
                 composer_max_discovery_turns=10,
                 composer_timeout_seconds=85.0,
                 composer_rate_limit_per_minute=10,
@@ -131,6 +136,7 @@ class TestWebSettingsValidation:
             WebSettings(
                 port=0,
                 composer_max_composition_turns=15,
+                composer_context_max_prompt_tokens=200_000,
                 composer_max_discovery_turns=10,
                 composer_timeout_seconds=85.0,
                 composer_rate_limit_per_minute=10,
@@ -142,6 +148,7 @@ class TestWebSettingsValidation:
             WebSettings(
                 port=-1,
                 composer_max_composition_turns=15,
+                composer_context_max_prompt_tokens=200_000,
                 composer_max_discovery_turns=10,
                 composer_timeout_seconds=85.0,
                 composer_rate_limit_per_minute=10,
@@ -153,6 +160,7 @@ class TestWebSettingsValidation:
             WebSettings(
                 port=65536,
                 composer_max_composition_turns=15,
+                composer_context_max_prompt_tokens=200_000,
                 composer_max_discovery_turns=10,
                 composer_timeout_seconds=85.0,
                 composer_rate_limit_per_minute=10,
@@ -163,6 +171,7 @@ class TestWebSettingsValidation:
         with pytest.raises(ValueError):
             WebSettings(
                 composer_max_composition_turns=0,
+                composer_context_max_prompt_tokens=200_000,
                 composer_max_discovery_turns=10,
                 composer_timeout_seconds=85.0,
                 composer_rate_limit_per_minute=10,
@@ -173,6 +182,7 @@ class TestWebSettingsValidation:
         with pytest.raises(ValueError):
             WebSettings(
                 composer_max_composition_turns=15,
+                composer_context_max_prompt_tokens=200_000,
                 composer_max_discovery_turns=0,
                 composer_timeout_seconds=85.0,
                 composer_rate_limit_per_minute=10,
@@ -182,6 +192,7 @@ class TestWebSettingsValidation:
     def test_composer_max_tool_calls_per_turn_defaults_to_16(self) -> None:
         settings = WebSettings(
             composer_max_composition_turns=15,
+            composer_context_max_prompt_tokens=200_000,
             composer_max_discovery_turns=10,
             composer_timeout_seconds=85.0,
             composer_rate_limit_per_minute=10,
@@ -193,6 +204,7 @@ class TestWebSettingsValidation:
     def test_pipeline_planner_budgets_are_explicit_and_validated(self) -> None:
         base = {
             "composer_max_composition_turns": 15,
+            "composer_context_max_prompt_tokens": 200_000,
             "composer_max_discovery_turns": 10,
             "composer_timeout_seconds": 85.0,
             "composer_rate_limit_per_minute": 10,
@@ -222,6 +234,7 @@ class TestWebSettingsValidation:
         with pytest.raises(ValueError):
             WebSettings(
                 composer_max_composition_turns=15,
+                composer_context_max_prompt_tokens=200_000,
                 composer_max_discovery_turns=10,
                 composer_max_tool_calls_per_turn=0,
                 composer_timeout_seconds=85.0,
@@ -233,6 +246,7 @@ class TestWebSettingsValidation:
         with pytest.raises(ValueError):
             WebSettings(
                 composer_max_composition_turns=15,
+                composer_context_max_prompt_tokens=200_000,
                 composer_max_discovery_turns=10,
                 composer_timeout_seconds=0,
                 composer_rate_limit_per_minute=10,
@@ -242,6 +256,7 @@ class TestWebSettingsValidation:
     def test_async_composer_budget_is_independent_of_transport_headroom(self) -> None:
         settings = WebSettings(
             composer_max_composition_turns=15,
+            composer_context_max_prompt_tokens=200_000,
             composer_max_discovery_turns=10,
             composer_timeout_seconds=300.0,
             composer_rate_limit_per_minute=10,
@@ -253,6 +268,7 @@ class TestWebSettingsValidation:
     def test_composer_timeout_allows_explicit_larger_transport_ceiling(self) -> None:
         settings = WebSettings(
             composer_max_composition_turns=15,
+            composer_context_max_prompt_tokens=200_000,
             composer_max_discovery_turns=10,
             composer_timeout_seconds=300.0,
             composer_transport_idle_ceiling_seconds=360.0,
@@ -294,6 +310,7 @@ class TestWebSettingsValidation:
         monkeypatch.setattr(config_module, "_slog", logger)
         settings = WebSettings(
             composer_max_composition_turns=12,
+            composer_context_max_prompt_tokens=200_000,
             composer_max_discovery_turns=8,
             composer_timeout_seconds=120.0,
             composer_rate_limit_per_minute=10,
@@ -318,6 +335,7 @@ class TestWebSettingsValidation:
         monkeypatch.setattr(config_module, "_slog", logger)
         WebSettings(
             composer_max_composition_turns=3,
+            composer_context_max_prompt_tokens=200_000,
             composer_max_discovery_turns=2,
             composer_timeout_seconds=85.0,
             composer_rate_limit_per_minute=10,
@@ -329,6 +347,7 @@ class TestWebSettingsValidation:
         with pytest.raises(ValueError):
             WebSettings(
                 composer_max_composition_turns=15,
+                composer_context_max_prompt_tokens=200_000,
                 composer_max_discovery_turns=10,
                 composer_timeout_seconds=85.0,
                 composer_rate_limit_per_minute=0,
@@ -343,6 +362,7 @@ class TestWebSettingsValidation:
     def test_composer_model_default_uses_current_openai_frontier_model(self) -> None:
         settings = WebSettings(
             composer_max_composition_turns=15,
+            composer_context_max_prompt_tokens=200_000,
             composer_max_discovery_turns=10,
             composer_timeout_seconds=85.0,
             composer_rate_limit_per_minute=10,
@@ -354,6 +374,7 @@ class TestWebSettingsValidation:
     def test_composer_sampling_defaults_to_none_and_probe_enabled(self) -> None:
         settings = WebSettings(
             composer_max_composition_turns=15,
+            composer_context_max_prompt_tokens=200_000,
             composer_max_discovery_turns=10,
             composer_timeout_seconds=85.0,
             composer_rate_limit_per_minute=10,
@@ -367,6 +388,7 @@ class TestWebSettingsValidation:
     def test_composer_temperature_accepts_in_range_and_rejects_out_of_range(self) -> None:
         base = {
             "composer_max_composition_turns": 15,
+            "composer_context_max_prompt_tokens": 200_000,
             "composer_max_discovery_turns": 10,
             "composer_timeout_seconds": 85.0,
             "composer_rate_limit_per_minute": 10,
@@ -383,6 +405,7 @@ class TestWebSettingsValidation:
     def test_composer_seed_accepts_int_and_none(self) -> None:
         base = {
             "composer_max_composition_turns": 15,
+            "composer_context_max_prompt_tokens": 200_000,
             "composer_max_discovery_turns": 10,
             "composer_timeout_seconds": 85.0,
             "composer_rate_limit_per_minute": 10,
@@ -397,6 +420,7 @@ class TestWebSettingsValidation:
             WebSettings(
                 max_upload_bytes=0,
                 composer_max_composition_turns=15,
+                composer_context_max_prompt_tokens=200_000,
                 composer_max_discovery_turns=10,
                 composer_timeout_seconds=85.0,
                 composer_rate_limit_per_minute=10,
@@ -413,6 +437,7 @@ class TestWebSettingsValidation:
             WebSettings(
                 payload_store_retention_days=0,
                 composer_max_composition_turns=15,
+                composer_context_max_prompt_tokens=200_000,
                 composer_max_discovery_turns=10,
                 composer_timeout_seconds=85.0,
                 composer_rate_limit_per_minute=10,
@@ -424,6 +449,7 @@ class TestDeploymentSettings:
     def test_defaults_to_default_target_and_auto_state_mode(self) -> None:
         settings = WebSettings(
             composer_max_composition_turns=15,
+            composer_context_max_prompt_tokens=200_000,
             composer_max_discovery_turns=10,
             composer_timeout_seconds=85.0,
             composer_rate_limit_per_minute=10,
@@ -448,6 +474,7 @@ class TestDeploymentSettings:
         settings = WebSettings(
             deployment_target=target,
             composer_max_composition_turns=15,
+            composer_context_max_prompt_tokens=200_000,
             composer_max_discovery_turns=10,
             composer_timeout_seconds=85.0,
             composer_rate_limit_per_minute=10,
@@ -461,6 +488,7 @@ class TestDeploymentSettings:
         settings = WebSettings(
             deployment_state_mode=state_mode,
             composer_max_composition_turns=15,
+            composer_context_max_prompt_tokens=200_000,
             composer_max_discovery_turns=10,
             composer_timeout_seconds=85.0,
             composer_rate_limit_per_minute=10,
@@ -493,6 +521,7 @@ class TestOperatorTelemetrySettings:
     def test_local_defaults_remain_prometheus_only(self) -> None:
         settings = WebSettings(
             composer_max_composition_turns=15,
+            composer_context_max_prompt_tokens=200_000,
             composer_max_discovery_turns=10,
             composer_timeout_seconds=85.0,
             composer_rate_limit_per_minute=10,
@@ -517,6 +546,7 @@ class TestOperatorTelemetrySettings:
         settings = WebSettings(
             operator_metrics_bearer_token=raw_token,
             composer_max_composition_turns=15,
+            composer_context_max_prompt_tokens=200_000,
             composer_max_discovery_turns=10,
             composer_timeout_seconds=85.0,
             composer_rate_limit_per_minute=10,
@@ -533,6 +563,7 @@ class TestOperatorTelemetrySettings:
             WebSettings(
                 operator_metrics_bearer_token=raw_token,
                 composer_max_composition_turns=15,
+                composer_context_max_prompt_tokens=200_000,
                 composer_max_discovery_turns=10,
                 composer_timeout_seconds=85.0,
                 composer_rate_limit_per_minute=10,
@@ -559,6 +590,7 @@ class TestOperatorTelemetrySettings:
         with pytest.raises(ValidationError, match=field) as caught:
             WebSettings(
                 composer_max_composition_turns=15,
+                composer_context_max_prompt_tokens=200_000,
                 composer_max_discovery_turns=10,
                 composer_timeout_seconds=85.0,
                 composer_rate_limit_per_minute=10,
@@ -587,6 +619,7 @@ class TestOperatorTelemetrySettings:
         }
         settings = WebSettings(
             composer_max_composition_turns=15,
+            composer_context_max_prompt_tokens=200_000,
             composer_max_discovery_turns=10,
             composer_timeout_seconds=85.0,
             composer_rate_limit_per_minute=10,
@@ -601,6 +634,7 @@ class TestOperatorTelemetrySettings:
             operator_telemetry_service_name="team/service:blue",
             operator_telemetry_environment="staging/eu:1",
             composer_max_composition_turns=15,
+            composer_context_max_prompt_tokens=200_000,
             composer_max_discovery_turns=10,
             composer_timeout_seconds=85.0,
             composer_rate_limit_per_minute=10,
@@ -651,6 +685,7 @@ class TestOperatorTelemetrySettings:
             settings = WebSettings(
                 deployment_target="aws-ecs",
                 composer_max_composition_turns=15,
+                composer_context_max_prompt_tokens=200_000,
                 composer_max_discovery_turns=10,
                 composer_timeout_seconds=85.0,
                 composer_rate_limit_per_minute=10,
@@ -664,6 +699,7 @@ class TestOperatorTelemetrySettings:
             WebSettings(
                 deployment_target="aws-ecs",
                 composer_max_composition_turns=15,
+                composer_context_max_prompt_tokens=200_000,
                 composer_max_discovery_turns=10,
                 composer_timeout_seconds=85.0,
                 composer_rate_limit_per_minute=10,
@@ -688,6 +724,7 @@ class TestOperatorTelemetrySettings:
         with pytest.raises(ValidationError, match=field) as caught:
             WebSettings(
                 composer_max_composition_turns=15,
+                composer_context_max_prompt_tokens=200_000,
                 composer_max_discovery_turns=10,
                 composer_timeout_seconds=85.0,
                 composer_rate_limit_per_minute=10,
@@ -702,6 +739,7 @@ class TestOperatorTelemetrySettings:
 
         settings = WebSettings(
             composer_max_composition_turns=15,
+            composer_context_max_prompt_tokens=200_000,
             composer_max_discovery_turns=10,
             composer_timeout_seconds=85.0,
             composer_rate_limit_per_minute=10,
@@ -724,6 +762,7 @@ class TestOperatorTelemetrySettings:
         with pytest.raises(ValidationError, match="extra") as caught:
             WebSettings(
                 composer_max_composition_turns=15,
+                composer_context_max_prompt_tokens=200_000,
                 composer_max_discovery_turns=10,
                 composer_timeout_seconds=85.0,
                 composer_rate_limit_per_minute=10,
@@ -741,6 +780,7 @@ class TestOperatorTelemetrySettings:
             WebSettings(
                 deployment_target="azure-aca",
                 composer_max_composition_turns=15,
+                composer_context_max_prompt_tokens=200_000,
                 composer_max_discovery_turns=10,
                 composer_timeout_seconds=85.0,
                 composer_rate_limit_per_minute=10,
@@ -755,6 +795,7 @@ class TestWebSettingsDerivedAccessors:
         settings = WebSettings(
             data_dir=Path("/app/data"),
             composer_max_composition_turns=15,
+            composer_context_max_prompt_tokens=200_000,
             composer_max_discovery_turns=10,
             composer_timeout_seconds=85.0,
             composer_rate_limit_per_minute=10,
@@ -767,6 +808,7 @@ class TestWebSettingsDerivedAccessors:
         settings = WebSettings(
             landscape_url="postgresql://db/audit",
             composer_max_composition_turns=15,
+            composer_context_max_prompt_tokens=200_000,
             composer_max_discovery_turns=10,
             composer_timeout_seconds=85.0,
             composer_rate_limit_per_minute=10,
@@ -779,6 +821,7 @@ class TestWebSettingsDerivedAccessors:
         settings = WebSettings(
             data_dir=Path("/app/data"),
             composer_max_composition_turns=15,
+            composer_context_max_prompt_tokens=200_000,
             composer_max_discovery_turns=10,
             composer_timeout_seconds=85.0,
             composer_rate_limit_per_minute=10,
@@ -791,6 +834,7 @@ class TestWebSettingsDerivedAccessors:
         settings = WebSettings(
             payload_store_path=Path("/mnt/payloads"),
             composer_max_composition_turns=15,
+            composer_context_max_prompt_tokens=200_000,
             composer_max_discovery_turns=10,
             composer_timeout_seconds=85.0,
             composer_rate_limit_per_minute=10,
@@ -805,6 +849,7 @@ class TestWebSettingsDerivedAccessors:
         location regardless of later os.chdir calls."""
         settings = WebSettings(
             composer_max_composition_turns=15,
+            composer_context_max_prompt_tokens=200_000,
             composer_max_discovery_turns=10,
             composer_timeout_seconds=85.0,
             composer_rate_limit_per_minute=10,
@@ -819,6 +864,7 @@ class TestWebSettingsDerivedAccessors:
         payload path inherits that absolute prefix."""
         settings = WebSettings(
             composer_max_composition_turns=15,
+            composer_context_max_prompt_tokens=200_000,
             composer_max_discovery_turns=10,
             composer_timeout_seconds=85.0,
             composer_rate_limit_per_minute=10,
@@ -831,6 +877,7 @@ class TestWebSettingsDerivedAccessors:
         settings = WebSettings(
             data_dir=Path("/app/data"),
             composer_max_composition_turns=15,
+            composer_context_max_prompt_tokens=200_000,
             composer_max_discovery_turns=10,
             composer_timeout_seconds=85.0,
             composer_rate_limit_per_minute=10,
@@ -843,6 +890,7 @@ class TestWebSettingsDerivedAccessors:
         settings = WebSettings(
             session_db_url="postgresql://db/sessions",
             composer_max_composition_turns=15,
+            composer_context_max_prompt_tokens=200_000,
             composer_max_discovery_turns=10,
             composer_timeout_seconds=85.0,
             composer_rate_limit_per_minute=10,
@@ -856,6 +904,7 @@ class TestWebSettingsDerivedAccessors:
         validation time; session DB URL inherits that prefix."""
         settings = WebSettings(
             composer_max_composition_turns=15,
+            composer_context_max_prompt_tokens=200_000,
             composer_max_discovery_turns=10,
             composer_timeout_seconds=85.0,
             composer_rate_limit_per_minute=10,
@@ -874,6 +923,7 @@ class TestSecretKeyGuard:
             WebSettings(
                 host="0.0.0.0",
                 composer_max_composition_turns=15,
+                composer_context_max_prompt_tokens=200_000,
                 composer_max_discovery_turns=10,
                 composer_timeout_seconds=85.0,
                 composer_rate_limit_per_minute=10,
@@ -885,6 +935,7 @@ class TestSecretKeyGuard:
         settings = WebSettings(
             host="127.0.0.1",
             composer_max_composition_turns=15,
+            composer_context_max_prompt_tokens=200_000,
             composer_max_discovery_turns=10,
             composer_timeout_seconds=85.0,
             composer_rate_limit_per_minute=10,
@@ -896,6 +947,7 @@ class TestSecretKeyGuard:
         settings = WebSettings(
             host="localhost",
             composer_max_composition_turns=15,
+            composer_context_max_prompt_tokens=200_000,
             composer_max_discovery_turns=10,
             composer_timeout_seconds=85.0,
             composer_rate_limit_per_minute=10,
@@ -907,6 +959,7 @@ class TestSecretKeyGuard:
         settings = WebSettings(
             host="::1",
             composer_max_composition_turns=15,
+            composer_context_max_prompt_tokens=200_000,
             composer_max_discovery_turns=10,
             composer_timeout_seconds=85.0,
             composer_rate_limit_per_minute=10,
@@ -922,6 +975,7 @@ class TestSecretKeyGuard:
             WebSettings(
                 host="127.0.0.1",
                 composer_max_composition_turns=15,
+                composer_context_max_prompt_tokens=200_000,
                 composer_max_discovery_turns=10,
                 composer_timeout_seconds=85.0,
                 composer_rate_limit_per_minute=10,
@@ -935,6 +989,7 @@ class TestSecretKeyGuard:
             host="0.0.0.0",
             secret_key="this-non-loopback-secret-is-long-enough",
             composer_max_composition_turns=15,
+            composer_context_max_prompt_tokens=200_000,
             composer_max_discovery_turns=10,
             composer_timeout_seconds=85.0,
             composer_rate_limit_per_minute=10,
@@ -948,6 +1003,7 @@ class TestSecretKeyGuard:
                 host="0.0.0.0",
                 secret_key="short-secret",
                 composer_max_composition_turns=15,
+                composer_context_max_prompt_tokens=200_000,
                 composer_max_discovery_turns=10,
                 composer_timeout_seconds=85.0,
                 composer_rate_limit_per_minute=10,
@@ -960,6 +1016,7 @@ class TestSecretKeyGuard:
                 host="0.0.0.0",
                 secret_key="x" * 32,
                 composer_max_composition_turns=15,
+                composer_context_max_prompt_tokens=200_000,
                 composer_max_discovery_turns=10,
                 composer_timeout_seconds=85.0,
                 composer_rate_limit_per_minute=10,
@@ -971,6 +1028,7 @@ class TestSecretKeyGuard:
             host="127.0.0.1",
             secret_key="short-secret",
             composer_max_composition_turns=15,
+            composer_context_max_prompt_tokens=200_000,
             composer_max_discovery_turns=10,
             composer_timeout_seconds=85.0,
             composer_rate_limit_per_minute=10,
@@ -986,6 +1044,7 @@ class TestSecretKeyGuard:
                 host=host,
                 secret_key=secret_key,
                 composer_max_composition_turns=15,
+                composer_context_max_prompt_tokens=200_000,
                 composer_max_discovery_turns=10,
                 composer_timeout_seconds=85.0,
                 composer_rate_limit_per_minute=10,
@@ -1001,6 +1060,7 @@ class TestAuthFieldValidation:
         settings = WebSettings(
             auth_provider="local",
             composer_max_composition_turns=15,
+            composer_context_max_prompt_tokens=200_000,
             composer_max_discovery_turns=10,
             composer_timeout_seconds=85.0,
             composer_rate_limit_per_minute=10,
@@ -1022,6 +1082,7 @@ class TestAuthFieldValidation:
                 auth_provider="local",
                 entra_tenant_id="a-tenant",
                 composer_max_composition_turns=15,
+                composer_context_max_prompt_tokens=200_000,
                 composer_max_discovery_turns=10,
                 composer_timeout_seconds=85.0,
                 composer_rate_limit_per_minute=10,
@@ -1054,6 +1115,7 @@ class TestAuthFieldValidation:
                 auth_provider="local",
                 **{field_name: "https://issuer.example.com"},
                 composer_max_composition_turns=15,
+                composer_context_max_prompt_tokens=200_000,
                 composer_max_discovery_turns=10,
                 composer_timeout_seconds=85.0,
                 composer_rate_limit_per_minute=10,
@@ -1079,6 +1141,7 @@ class TestAuthFieldValidation:
             WebSettings(
                 auth_provider="oidc",
                 composer_max_composition_turns=15,
+                composer_context_max_prompt_tokens=200_000,
                 composer_max_discovery_turns=10,
                 composer_timeout_seconds=85.0,
                 composer_rate_limit_per_minute=10,
@@ -1104,6 +1167,7 @@ class TestPathFieldValidation:
                 **{
                     field_name: value,
                     "composer_max_composition_turns": 15,
+                    "composer_context_max_prompt_tokens": 200_000,
                     "composer_max_discovery_turns": 10,
                     "composer_timeout_seconds": 85.0,
                     "composer_rate_limit_per_minute": 10,
@@ -1115,6 +1179,7 @@ class TestPathFieldValidation:
         settings = WebSettings(
             data_dir="~/data",
             composer_max_composition_turns=15,
+            composer_context_max_prompt_tokens=200_000,
             composer_max_discovery_turns=10,
             composer_timeout_seconds=85.0,
             composer_rate_limit_per_minute=10,
@@ -1130,6 +1195,7 @@ class TestPathFieldValidation:
         settings = WebSettings(
             payload_store_path="~/payloads",
             composer_max_composition_turns=15,
+            composer_context_max_prompt_tokens=200_000,
             composer_max_discovery_turns=10,
             composer_timeout_seconds=85.0,
             composer_rate_limit_per_minute=10,
@@ -1147,6 +1213,7 @@ class TestPathFieldValidation:
         settings = WebSettings(
             payload_store_path=configured_path,
             composer_max_composition_turns=15,
+            composer_context_max_prompt_tokens=200_000,
             composer_max_discovery_turns=10,
             composer_timeout_seconds=85.0,
             composer_rate_limit_per_minute=10,
@@ -1168,6 +1235,7 @@ class TestPathFieldValidation:
         settings = WebSettings(
             data_dir="data",
             composer_max_composition_turns=15,
+            composer_context_max_prompt_tokens=200_000,
             composer_max_discovery_turns=10,
             composer_timeout_seconds=85.0,
             composer_rate_limit_per_minute=10,
@@ -1189,6 +1257,7 @@ class TestServerSecretAllowlistValidation:
     def test_azure_content_safety_key_not_allowlisted_by_default(self) -> None:
         settings = WebSettings(
             composer_max_composition_turns=15,
+            composer_context_max_prompt_tokens=200_000,
             composer_max_discovery_turns=10,
             composer_timeout_seconds=85.0,
             composer_rate_limit_per_minute=10,
@@ -1200,6 +1269,7 @@ class TestServerSecretAllowlistValidation:
     def test_bedrock_credentials_are_allowlisted_by_default(self) -> None:
         settings = WebSettings(
             composer_max_composition_turns=15,
+            composer_context_max_prompt_tokens=200_000,
             composer_max_discovery_turns=10,
             composer_timeout_seconds=85.0,
             composer_rate_limit_per_minute=10,
@@ -1216,6 +1286,7 @@ class TestServerSecretAllowlistValidation:
     def test_user_secrets_are_enabled_unless_the_operator_locks_down(self) -> None:
         required = {
             "composer_max_composition_turns": 15,
+            "composer_context_max_prompt_tokens": 200_000,
             "composer_max_discovery_turns": 10,
             "composer_timeout_seconds": 85.0,
             "composer_rate_limit_per_minute": 10,
@@ -1230,6 +1301,7 @@ class TestServerSecretAllowlistValidation:
             WebSettings(
                 server_secret_allowlist=("ELSPETH_FINGERPRINT_KEY",),
                 composer_max_composition_turns=15,
+                composer_context_max_prompt_tokens=200_000,
                 composer_max_discovery_turns=10,
                 composer_timeout_seconds=85.0,
                 composer_rate_limit_per_minute=10,
@@ -1458,6 +1530,7 @@ class TestDBURLValidation:
 
     _COMPOSER_DEFAULTS: typing.ClassVar[dict[str, object]] = {
         "composer_max_composition_turns": 15,
+        "composer_context_max_prompt_tokens": 200_000,
         "composer_max_discovery_turns": 10,
         "composer_timeout_seconds": 85.0,
         "composer_rate_limit_per_minute": 10,
@@ -1556,6 +1629,7 @@ class TestFieldValidatorCoverage:
 
     _COMPOSER_DEFAULTS: typing.ClassVar[dict[str, object]] = {
         "composer_max_composition_turns": 15,
+        "composer_context_max_prompt_tokens": 200_000,
         "composer_max_discovery_turns": 10,
         "composer_timeout_seconds": 85.0,
         "composer_rate_limit_per_minute": 10,
@@ -1586,6 +1660,7 @@ class TestJWKSFailureRetryFloor:
 
     _COMPOSER_DEFAULTS: typing.ClassVar[dict[str, object]] = {
         "composer_max_composition_turns": 15,
+        "composer_context_max_prompt_tokens": 200_000,
         "composer_max_discovery_turns": 10,
         "composer_timeout_seconds": 85.0,
         "composer_rate_limit_per_minute": 10,
@@ -1624,6 +1699,7 @@ class TestJWKSMaxStaleAge:
 
     _COMPOSER_DEFAULTS: typing.ClassVar[dict[str, object]] = {
         "composer_max_composition_turns": 15,
+        "composer_context_max_prompt_tokens": 200_000,
         "composer_max_discovery_turns": 10,
         "composer_timeout_seconds": 85.0,
         "composer_rate_limit_per_minute": 10,
@@ -1653,6 +1729,7 @@ def _settings(**overrides: Any) -> WebSettings:
     """
     base: dict[str, Any] = {
         "composer_max_composition_turns": 20,
+        "composer_context_max_prompt_tokens": 200_000,
         "composer_max_discovery_turns": 20,
         "composer_timeout_seconds": 85.0,
         "composer_rate_limit_per_minute": 30,
@@ -1973,6 +2050,7 @@ def test_settings_from_env_coerces_numeric_strings_for_strict_fields(monkeypatch
 
     for key, value in {
         "ELSPETH_WEB__COMPOSER_MAX_COMPOSITION_TURNS": "30",
+        "ELSPETH_WEB__COMPOSER_CONTEXT_MAX_PROMPT_TOKENS": "200000",
         "ELSPETH_WEB__COMPOSER_MAX_DISCOVERY_TURNS": "10",
         "ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS": "20.0",
         "ELSPETH_WEB__COMPOSER_RATE_LIMIT_PER_MINUTE": "10",
@@ -1995,6 +2073,7 @@ def test_settings_from_env_coerces_numeric_strings_for_strict_fields(monkeypatch
 
 _REQUIRED_ENV_FOR_RATE_LIMIT_TESTS = {
     "ELSPETH_WEB__COMPOSER_MAX_COMPOSITION_TURNS": "30",
+    "ELSPETH_WEB__COMPOSER_CONTEXT_MAX_PROMPT_TOKENS": "200000",
     "ELSPETH_WEB__COMPOSER_MAX_DISCOVERY_TURNS": "10",
     "ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS": "20.0",
     "ELSPETH_WEB__COMPOSER_RATE_LIMIT_PER_MINUTE": "10",
@@ -2056,6 +2135,7 @@ def test_settings_from_env_derives_deployment_region_only_from_ambient_aws_regio
 
     for key, value in {
         "ELSPETH_WEB__COMPOSER_MAX_COMPOSITION_TURNS": "30",
+        "ELSPETH_WEB__COMPOSER_CONTEXT_MAX_PROMPT_TOKENS": "200000",
         "ELSPETH_WEB__COMPOSER_MAX_DISCOVERY_TURNS": "10",
         "ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS": "20.0",
         "ELSPETH_WEB__COMPOSER_RATE_LIMIT_PER_MINUTE": "10",
@@ -2542,3 +2622,77 @@ class TestQuotaDefaultsWhenEnabled:
     def test_a_container_ceiling_is_accepted_beside_both_defaults(self) -> None:
         settings = _settings(quota_default_tokens_per_day=10, quota_default_storage_bytes=20, quota_container_tokens_per_day=1000)
         assert settings.quotas_enabled is True
+
+
+class TestComposerContextBudgetSettings:
+    """Required token cap, shed marks and the lowered planner request-byte default."""
+
+    _BASE: typing.ClassVar[dict[str, object]] = {
+        "composer_max_composition_turns": 20,
+        "composer_max_discovery_turns": 20,
+        "composer_timeout_seconds": 85.0,
+        "composer_rate_limit_per_minute": 30,
+        "shareable_link_signing_key": b"x" * 32,
+    }
+
+    def test_token_cap_is_required_and_named_in_the_error(self) -> None:
+        with pytest.raises(ValidationError, match="composer_context_max_prompt_tokens"):
+            WebSettings(**self._BASE)
+
+    @pytest.mark.parametrize("bad", [0, -1, 1.5, "200000"])
+    def test_token_cap_must_be_a_positive_strict_int(self, bad: object) -> None:
+        with pytest.raises(ValidationError, match="composer_context_max_prompt_tokens"):
+            WebSettings(**self._BASE, composer_context_max_prompt_tokens=bad)
+
+    def test_defaults(self) -> None:
+        settings = WebSettings(**self._BASE, composer_context_max_prompt_tokens=200_000)
+
+        assert settings.composer_context_max_prompt_tokens == 200_000
+        assert settings.composer_context_shed_above == 0.85
+        assert settings.composer_context_shed_to == 0.60
+        assert settings.composer_planner_max_request_bytes == 983040
+
+    @pytest.mark.parametrize(
+        ("above", "to"),
+        [(0.6, 0.6), (0.5, 0.6), (0.9, 0.95)],
+    )
+    def test_shed_to_must_be_below_shed_above(self, above: float, to: float) -> None:
+        with pytest.raises(ValidationError, match="composer_context_shed_to must be below composer_context_shed_above"):
+            WebSettings(
+                **self._BASE,
+                composer_context_max_prompt_tokens=200_000,
+                composer_context_shed_above=above,
+                composer_context_shed_to=to,
+            )
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"composer_context_shed_above": 0.0},
+            {"composer_context_shed_above": 1.01},
+            {"composer_context_shed_to": 0.0},
+            {"composer_context_shed_to": 1.0},
+        ],
+    )
+    def test_shed_marks_are_bounded(self, overrides: dict[str, float]) -> None:
+        with pytest.raises(ValidationError):
+            WebSettings(**self._BASE, composer_context_max_prompt_tokens=200_000, **overrides)
+
+    @pytest.mark.usefixtures("required_web_env")
+    def test_env_loader_accepts_the_three_new_names(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("ELSPETH_WEB__COMPOSER_CONTEXT_MAX_PROMPT_TOKENS", "123456")
+        monkeypatch.setenv("ELSPETH_WEB__COMPOSER_CONTEXT_SHED_ABOVE", "0.9")
+        monkeypatch.setenv("ELSPETH_WEB__COMPOSER_CONTEXT_SHED_TO", "0.5")
+
+        settings = web_config.settings_from_env()
+
+        assert settings.composer_context_max_prompt_tokens == 123456
+        assert settings.composer_context_shed_above == 0.9
+        assert settings.composer_context_shed_to == 0.5
+
+    @pytest.mark.usefixtures("required_web_env")
+    def test_env_loader_without_the_token_cap_fails_naming_the_field(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("ELSPETH_WEB__COMPOSER_CONTEXT_MAX_PROMPT_TOKENS", raising=False)
+
+        with pytest.raises((ValidationError, RuntimeError), match="composer_context_max_prompt_tokens"):
+            web_config.settings_from_env()

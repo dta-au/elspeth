@@ -351,6 +351,7 @@ def test_fixture_policy_requires_every_requested_plugin() -> None:
     settings = WebSettings(
         plugin_allowlist=ACCEPTANCE_PLUGIN_ALLOWLIST,
         composer_max_composition_turns=12,
+        composer_context_max_prompt_tokens=200_000,
         composer_max_discovery_turns=6,
         composer_timeout_seconds=900,
         composer_transport_idle_ceiling_seconds=960,
