@@ -14,7 +14,7 @@
     "postbuild": "node scripts/prune-stale-assets.mjs",
     "typecheck": "tsc -p tsconfig.app.json --noEmit && tsc -p tsconfig.oidc.json --noEmit",
     "typecheck:workspace-e2e": "tsc -p tsconfig.workspace-e2e.json --noEmit",
-    "lint": "eslint src vite.config.ts playwright.oidc.config.ts tests/e2e/aws-ecs-oidc.staging.spec.ts tests/e2e/harness/oidc-*.ts tests/e2e/composer-workspace-*.spec.ts tests/e2e/composer-workspace.visual.spec.ts tests/e2e/composer-reflow.spec.ts tests/e2e/helpers/api.ts tests/e2e/helpers/workspace-*.ts tests/e2e/page-objects/composer-page.ts",
+    "lint": "eslint src vite.config.ts playwright.oidc.config.ts tests/e2e/aws-ecs-oidc.staging.spec.ts tests/e2e/harness/oidc-*.ts tests/e2e/composer-workspace-*.spec.ts tests/e2e/composer-workspace.visual.spec.ts tests/e2e/composer-reflow.spec.ts tests/e2e/shared-graph-import.spec.ts tests/e2e/helpers/api.ts tests/e2e/helpers/workspace-*.ts tests/e2e/page-objects/composer-page.ts",
     "lint:css": "stylelint 'src/**/*.css'",
     "preview": "vite preview",
     "test": "npm run test:dependencies && vitest run",
@@ -72,12 +72,13 @@
     "vitest": "^4.1.2"
   },
   "overrides": {
+    "minimatch": "11.0.5",
     "braces": "npm:@dieub/braces-depth-guard@3.0.3-pn.2",
     "mermaid": {
       "katex": "0.18.2"
     },
     "openapi-typescript": {
-      "undici": "6.29.0"
+      "undici": "6.29.1"
     }
   }
 }

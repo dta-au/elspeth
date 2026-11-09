@@ -43,7 +43,7 @@ from elspeth.web.credential_guard import require_no_credential_material_in_state
 from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.protocol import SessionRecord, SessionServiceProtocol
 from elspeth.web.sessions.routes._helpers import _verify_session_ownership
-from elspeth.web.sessions.routes.composer.state import ImportStateYamlRequest, LibraryForkMetaUpdates
+from elspeth.web.sessions.routes.composer.state import ComposerSeedMetaUpdates, ImportStateYamlRequest
 from elspeth.web.sessions.schemas import CompositionStateResponse
 from elspeth.web.validation import reject_credential_material
 
@@ -143,7 +143,7 @@ class LibraryStateSeeder(Protocol):
         body: ImportStateYamlRequest,
         request: Request,
         user: UserIdentity,
-        composer_meta_updates: LibraryForkMetaUpdates,
+        composer_meta_updates: ComposerSeedMetaUpdates,
     ) -> CompositionStateResponse: ...
 
 

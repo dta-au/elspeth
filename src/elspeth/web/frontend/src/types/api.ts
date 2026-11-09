@@ -195,6 +195,41 @@ export interface MarkReadyForReviewResponse {
   payload_digest: string;
 }
 
+/** Lifetimes the share dialog offers, in seconds (1 day, 7 days, 30 days). */
+export type ShareLifetimeSeconds = 86400 | 604800 | 2592000;
+
+/** Options for POST /api/sessions/{session_id}/mark-ready-for-review. */
+export interface MarkReadyOptions {
+  allowImport: boolean;
+  lifetimeSeconds: ShareLifetimeSeconds;
+}
+
+/** One file an importable share would carry, as the owner sees it. */
+export interface ShareableFile {
+  filename: string;
+  size_bytes: number;
+  used_by: string[];
+}
+
+/** Response from GET /api/sessions/{session_id}/shareable-files. */
+export interface ShareableFilesResponse {
+  files: ShareableFile[];
+  importable: boolean;
+  not_importable_reason: string | null;
+}
+
+/** Response from POST /api/sessions/shared/{token}/import. */
+export interface SharedImportResponse {
+  session_id: string;
+  state_id: string;
+}
+
+/** A file listed on a shared snapshot (no owner-side usage detail). */
+export interface SharedFileSummary {
+  filename: string;
+  size_bytes: number;
+}
+
 /** Response from GET /api/sessions/{session_id}/shareable-link. */
 export interface ShareableLinkResponse {
   token: string;
@@ -242,4 +277,8 @@ export interface SharedInspectResponse {
   created_by_username: string;
   created_at: string;
   expires_at: string;
+  /** Whether the link lets the recipient import a copy of the pipeline. */
+  import_allowed: boolean;
+  /** Files an import would copy; empty when import is not allowed. */
+  files: SharedFileSummary[];
 }

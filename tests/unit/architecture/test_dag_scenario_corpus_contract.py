@@ -979,7 +979,11 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "ce864e47072455449fc0498e7f0d5e39bf7f0fe25dd
 # 2026-10-20: d82dc0df8 refreshed three ValueTransform source_file_hash values
 # in union-collision-fail. Canonical case comparison against 03594a269 confirms
 # every other field is unchanged; restoring those values reproduces the old pin.
-EXPECTED_CASE_REGISTRY_SHA256 = "69b81fc4685a5fe70c2deabb8c6d68e2332905e5cf11241d4e99e6547d3118f1"
+# 0.8.10 version cut: the same eight engine-owned plugin_version values advance
+# (seven manifest lines). The canonical case JSON of the 0.8.9 manifest with
+# only engine:0.8.9 -> engine:0.8.10 substituted is byte-identical to the new
+# one, and this instrument reproduces the previous pin from the old manifest.
+EXPECTED_CASE_REGISTRY_SHA256 = "3538b2de3a4036fb2effdcbae99c2b4a0b7711b09252456a4514b93ca5636536"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",

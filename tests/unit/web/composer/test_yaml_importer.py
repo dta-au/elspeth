@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -1558,3 +1559,78 @@ def test_a_newly_modelled_section_is_refused_rather_than_dropped(monkeypatch: py
 
     with pytest.raises(yaml_importer.RuntimeYamlImportError, match="brand_new_section"):
         composition_state_from_runtime_yaml(doc)
+
+
+def _transform_options_doc(transform_options: dict[str, object]) -> str:
+    """One source -> one reference_join transform -> one sink."""
+    return yaml.safe_dump(
+        {
+            "sources": {
+                "primary": {
+                    "plugin": "csv",
+                    "on_success": "lookup_in",
+                    "on_validation_failure": "discard",
+                    "options": {"path": "in.csv", "schema": {"mode": "observed"}},
+                }
+            },
+            "transforms": [
+                {
+                    "name": "lookup",
+                    "plugin": "reference_join",
+                    "input": "lookup_in",
+                    "on_success": "out",
+                    "on_error": "discard",
+                    "options": transform_options,
+                }
+            ],
+            "sinks": {"out": {"plugin": "json", "on_write_failure": "discard", "options": {"path": "out.jsonl"}}},
+        },
+        sort_keys=False,
+    )
+
+
+# What the pre-fix public projection left behind when it scrubbed only the
+# ``blob_ref`` key out of a transform's uploaded-file marker.
+_HEADLESS_INLINE_FRAGMENT = {"mode": "inline_content", "sha256": "ab" * 32, "encoding": "utf-8"}
+
+
+@pytest.mark.parametrize(
+    ("transform_options", "fragment_path"),
+    [
+        (
+            {"tables": {"t": {"reference_content": _HEADLESS_INLINE_FRAGMENT, "reference_format": "csv"}}},
+            "transforms[0].options.tables.t.reference_content",
+        ),
+        ({"parts": ["intro", _HEADLESS_INLINE_FRAGMENT]}, "transforms[0].options.parts[1]"),
+        ({"bound": {"mode": "bind_source"}}, "transforms[0].options.bound"),
+    ],
+)
+def test_composition_state_from_runtime_yaml_refuses_headless_blob_marker_fragment(
+    transform_options: dict[str, object], fragment_path: str
+) -> None:
+    with pytest.raises(RuntimeYamlImportError, match=re.escape(fragment_path)) as excinfo:
+        composition_state_from_runtime_yaml(_transform_options_doc(transform_options))
+
+    message = str(excinfo.value)
+    assert "file" in message
+    # Messages name the path, never the value (house rule for this module).
+    assert "ab" * 32 not in message
+
+
+def test_composition_state_from_runtime_yaml_keeps_ordinary_mode_options() -> None:
+    """Negative control: a nested ``mode`` that is not a blob mode is plugin data."""
+    options = {"tables": {"t": {"reference_content": "id\n1\n", "reference_format": "csv"}}, "schema": {"mode": "observed"}}
+
+    state = composition_state_from_runtime_yaml(_transform_options_doc(options))
+
+    assert state.nodes[0].options["schema"]["mode"] == "observed"
+
+
+def test_composition_state_from_runtime_yaml_still_admits_a_whole_inline_marker() -> None:
+    """Positive control: a complete marker is unchanged by the fragment rule."""
+    marker = {"blob_ref": "22222222-2222-4222-8222-222222222222", **_HEADLESS_INLINE_FRAGMENT}
+    options = {"tables": {"t": {"reference_content": marker, "reference_format": "csv"}}}
+
+    state = composition_state_from_runtime_yaml(_transform_options_doc(options))
+
+    assert state.nodes[0].options["tables"]["t"]["reference_content"]["blob_ref"] == marker["blob_ref"]

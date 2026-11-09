@@ -16,7 +16,8 @@ export type AppNoticeKind =
   | "preferences"
   | "redirect"
   | "stale-build"
-  | "composer-unavailable";
+  | "composer-unavailable"
+  | "shared-import";
 
 export interface AppNotice {
   kind: AppNoticeKind;
@@ -32,6 +33,7 @@ const NOTICE_PRIORITY: Record<AppNoticeKind, number> = {
   redirect: 3,
   "stale-build": 4,
   "composer-unavailable": 5,
+  "shared-import": 6,
 };
 
 function bannerClassName(tone: AppNotice["tone"]): string {

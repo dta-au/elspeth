@@ -209,6 +209,22 @@ describe("AppNoticeCenter", () => {
     );
   });
 
+  it("ranks the shared-import notice below every other kind", async () => {
+    render(
+      <AppNoticeCenter
+        notices={[
+          notice("shared-import", "status", "Imported"),
+          notice("composer-unavailable", "status", "Composer unavailable"),
+        ]}
+      />,
+    );
+    expect(
+      within(screen.getByTestId("app-notice-primary")).getByText(
+        "Composer unavailable",
+      ),
+    ).toBeVisible();
+  });
+
   it("renders no banner row when there are no active notices", () => {
     const { container } = render(<AppNoticeCenter notices={[]} />);
     expect(container.firstChild).toBeNull();

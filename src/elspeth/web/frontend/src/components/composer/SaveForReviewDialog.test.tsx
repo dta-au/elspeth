@@ -22,6 +22,25 @@ const _validResponse = {
   payload_digest: "sha256:" + "ab".repeat(32),
 };
 
+const _FILES = {
+  files: [
+    { filename: "a.csv", size_bytes: 2048, used_by: ["source"] },
+    { filename: "b.json", size_bytes: 12, used_by: ["transform:lookup", "sink:out"] },
+  ],
+  importable: true,
+  not_importable_reason: null,
+};
+const _OPTIONS = { allowImport: true, lifetimeSeconds: 604800 } as const;
+
+async function _openAndConfirm(
+  sessionId: string,
+  options: { allowImport: boolean; lifetimeSeconds: 86400 | 604800 | 2592000 },
+) {
+  vi.spyOn(api, "fetchShareableFiles").mockResolvedValue(_FILES);
+  await useShareableReviewStore.getState().openConfigure(sessionId);
+  await useShareableReviewStore.getState().confirmMark(options);
+}
+
 function _withOrigin(origin: string, fn: () => void) {
   const original = window.location;
   Object.defineProperty(window, "location", {
@@ -37,6 +56,7 @@ function _withOrigin(origin: string, fn: () => void) {
 
 describe("SaveForReviewDialog", () => {
   beforeEach(() => {
+    vi.restoreAllMocks();
     useShareableReviewStore.getState().reset();
     useExecutionStore.setState({
       validationResult: makeValidationResult(),
@@ -124,13 +144,13 @@ describe("SaveForReviewDialog", () => {
       })
       .mockResolvedValueOnce(_validResponse);
 
-    await useShareableReviewStore.getState().openAndMark("sess-retry");
+    await _openAndConfirm("sess-retry", _OPTIONS);
     render(<SaveForReviewDialog />);
 
     fireEvent.click(screen.getByTestId("save-for-review-retry"));
 
     await waitFor(() => expect(apiSpy).toHaveBeenCalledTimes(2));
-    expect(apiSpy).toHaveBeenLastCalledWith("sess-retry");
+    expect(apiSpy).toHaveBeenLastCalledWith("sess-retry", _OPTIONS);
     await waitFor(() =>
       expect(screen.getByTestId("save-for-review-success")).toBeInTheDocument(),
     );
@@ -142,7 +162,7 @@ describe("SaveForReviewDialog", () => {
       status: 409,
       detail: "composition validation failed",
     });
-    await useShareableReviewStore.getState().openAndMark("sess-retry");
+    await _openAndConfirm("sess-retry", _OPTIONS);
     render(<SaveForReviewDialog />);
 
     act(() => {
@@ -371,5 +391,121 @@ describe("SaveForReviewDialog", () => {
         "https://elspeth.example/#/shared/abc",
       );
     });
+  });
+  // ── configure step ──────────────────────────────────────────────────
+
+  async function _renderConfigure(files: typeof _FILES | Error = _FILES) {
+    const fetchSpy = vi.spyOn(api, "fetchShareableFiles");
+    if (files instanceof Error) fetchSpy.mockRejectedValue(files);
+    else fetchSpy.mockResolvedValue(files);
+    const mint = vi.spyOn(api, "markReadyForReview").mockResolvedValue(_validResponse);
+    await useShareableReviewStore.getState().openConfigure("sess-cfg");
+    const view = render(<SaveForReviewDialog />);
+    return { fetchSpy, mint, ...view };
+  }
+
+  it("opening shows the configure step and makes no mint call", async () => {
+    const { mint } = await _renderConfigure();
+    expect(screen.getByTestId("save-for-review-configure")).toBeInTheDocument();
+    expect(screen.queryByTestId("save-for-review-spinner")).toBeNull();
+    expect(mint).not.toHaveBeenCalled();
+    const checkbox = screen.getByRole("checkbox", { name: "Let recipients import a copy" });
+    expect(checkbox).not.toBeChecked();
+    expect(screen.getByRole("radio", { name: "30 days" })).toBeChecked();
+    expect(screen.getByRole("radio", { name: "1 day" })).not.toBeChecked();
+    expect(screen.getByRole("radio", { name: "7 days" })).not.toBeChecked();
+  });
+
+  it("ticking import reveals the file list with human-readable sizes and users", async () => {
+    await _renderConfigure();
+    expect(screen.queryByTestId("save-for-review-file-list")).toBeNull();
+    fireEvent.click(screen.getByRole("checkbox", { name: "Let recipients import a copy" }));
+    const list = screen.getByTestId("save-for-review-file-list");
+    expect(list).toHaveTextContent("a.csv");
+    expect(list).toHaveTextContent("2.0 KB");
+    expect(list).toHaveTextContent("b.json");
+    expect(list).toHaveTextContent("12 B");
+    expect(list).toHaveTextContent("transform:lookup, sink:out");
+  });
+
+  it("Create link sends the chosen options", async () => {
+    const { mint } = await _renderConfigure();
+    fireEvent.click(screen.getByRole("checkbox", { name: "Let recipients import a copy" }));
+    fireEvent.click(screen.getByRole("radio", { name: "7 days" }));
+    fireEvent.click(screen.getByRole("button", { name: "Create link" }));
+    await waitFor(() =>
+      expect(mint).toHaveBeenCalledWith("sess-cfg", { allowImport: true, lifetimeSeconds: 604800 }),
+    );
+    await waitFor(() => expect(screen.getByTestId("save-for-review-success")).toBeInTheDocument());
+  });
+
+  it("Create link with defaults sends a view-only 30 day link", async () => {
+    const { mint } = await _renderConfigure();
+    fireEvent.click(screen.getByRole("button", { name: "Create link" }));
+    await waitFor(() =>
+      expect(mint).toHaveBeenCalledWith("sess-cfg", { allowImport: false, lifetimeSeconds: 2592000 }),
+    );
+  });
+
+  it("a not-importable graph disables the checkbox and shows the reason", async () => {
+    await _renderConfigure({
+      files: [],
+      importable: false,
+      not_importable_reason: "a.csv is a blob source and cannot travel",
+    } as unknown as typeof _FILES);
+    const checkbox = screen.getByRole("checkbox", { name: "Let recipients import a copy" });
+    expect(checkbox).toBeDisabled();
+    expect(screen.getByTestId("save-for-review-import-note")).toHaveTextContent(
+      "a.csv is a blob source and cannot travel",
+    );
+    expect(screen.getByRole("button", { name: "Create link" })).not.toBeDisabled();
+  });
+
+  it("Create link is disabled while the file list loads", async () => {
+    vi.spyOn(api, "fetchShareableFiles").mockReturnValue(new Promise(() => {}));
+    void useShareableReviewStore.getState().openConfigure("sess-cfg");
+    render(<SaveForReviewDialog />);
+    expect(screen.getByRole("button", { name: "Create link" })).toBeDisabled();
+    expect(screen.getByRole("checkbox", { name: "Let recipients import a copy" })).toBeDisabled();
+    expect(screen.getByTestId("save-for-review-files-loading")).toBeInTheDocument();
+  });
+
+  it("a file-list failure still allows a view-only link and retry reloads the files", async () => {
+    const { fetchSpy, mint } = await _renderConfigure(new Error("boom"));
+    expect(screen.getByTestId("save-for-review-files-error")).toHaveTextContent("boom");
+    expect(screen.getByRole("checkbox", { name: "Let recipients import a copy" })).toBeDisabled();
+
+    fetchSpy.mockResolvedValue(_FILES);
+    fireEvent.click(screen.getByTestId("save-for-review-files-retry"));
+    await waitFor(() => expect(fetchSpy).toHaveBeenCalledTimes(2));
+    await waitFor(() =>
+      expect(screen.getByRole("checkbox", { name: "Let recipients import a copy" })).not.toBeDisabled(),
+    );
+    expect(mint).not.toHaveBeenCalled();
+  });
+
+  it("a file-list failure does not block creating a view-only link", async () => {
+    const { mint } = await _renderConfigure(new Error("boom"));
+    fireEvent.click(screen.getByRole("button", { name: "Create link" }));
+    await waitFor(() =>
+      expect(mint).toHaveBeenCalledWith("sess-cfg", { allowImport: false, lifetimeSeconds: 2592000 }),
+    );
+  });
+
+  it("closes on Escape from the configure step", async () => {
+    await _renderConfigure();
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(useShareableReviewStore.getState().dialogOpen).toBe(false);
+  });
+
+  it("has no accessibility violations in the configure step", async () => {
+    const { container } = await _renderConfigure();
+    fireEvent.click(screen.getByRole("checkbox", { name: "Let recipients import a copy" }));
+    expect(await axe(container)).toHaveNoViolations();
+  });
+
+  it("has no accessibility violations when the file list failed to load", async () => {
+    const { container } = await _renderConfigure(new Error("boom"));
+    expect(await axe(container)).toHaveNoViolations();
   });
 });

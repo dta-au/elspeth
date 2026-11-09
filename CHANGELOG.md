@@ -4,6 +4,238 @@ All notable changes to ELSPETH are documented here.
 
 ---
 
+## 0.8.10 - 2026-11-09
+
+This entry records the Composer performance remediation and the fixes landed
+with it on the 0.8.10 candidate. The dated entry and package version do not
+establish qualification, a published tag or an image.
+
+### Engine and runtime
+
+- **Approval binding shares the cached runtime VAL manifest with `begin_run`.**
+  The approval hash and the run header are now derived from the same frozen
+  manifest text, keyed on the registry fingerprint, instead of rebuilding the
+  manifest on every approval binding. The resume drift check stays uncached.
+  Warm approval binding drops from about half a second to under a millisecond.
+  Closes [#346](https://github.com/dta-au/elspeth/issues/346).
+- **The transform executor reads the recorded input hash.** The executor
+  hashed every row's input on every attempt while the Landscape repository
+  hashed the same row again inside `begin_node_state`. The executor now reads
+  the hash the repository derived and recorded. Its output hash is kept because
+  it routes NaN and Infinity output as a Tier-2 violation. Recorded hashes and
+  sink output are byte-identical on the shipped examples. Closes
+  [#347](https://github.com/dta-au/elspeth/issues/347).
+- **`.env` discovery follows the working directory.** The CLI searched upward
+  from the installed package, so an editable checkout loaded the checkout's
+  `.env` from any directory and a wheel install ignored the operator's `.env`.
+  Discovery now starts from the current working directory, as documented.
+  `--env-file` and `--no-dotenv` are unchanged. Tests that assert `--no-dotenv`
+  no longer inherit the variables pytest preloaded from the checkout's `.env`.
+  Closes [#353](https://github.com/dta-au/elspeth/issues/353).
+
+### Composer
+
+- **Composer and advisor must be reasoning models.** Every composer-plane
+  request (compose loop, planner, escape hatch and advisor) now carries a
+  reasoning-effort hint. Previously the hint was silently dropped for bare and
+  `openai/` model names, which covers every OpenAI-compatible gateway alias,
+  including AWS Scenario C's, so those deployments ran unhinted while the boot
+  advisory implied otherwise. A model, provider or gateway that cannot honour
+  the hint now refuses the request instead of running it unhinted.
+- **The `none` reasoning-effort opt-out is removed.**
+  `ELSPETH_WEB__COMPOSER_DISCOVERY_REASONING_EFFORT`,
+  `ELSPETH_WEB__COMPOSER_CANDIDATE_REASONING_EFFORT` and
+  `ELSPETH_WEB__COMPOSER_ADVISOR_REASONING_EFFORT` accept `low`, `medium` or
+  `high`; `none` is refused at startup, and the planner configuration refuses
+  an unhinted or unknown effort before any provider turn.
+- **Every LLM call row records request byte sizes per component.** Each
+  composer call record carries the UTF-8 size of every message sent, in send
+  order, the size of the tool-definition array and their sum, derived from the
+  same canonical serialization the message and tool hashes already perform.
+  The contract refuses a split that does not sum or that disagrees with the
+  tool hash about whether tools were sent. The sidecar exposes sizes, never
+  content.
+- **Proposals, schemas and tool definitions are verified once.**
+  `PipelineProposal.create` freezes and hashes its tree once instead of four
+  and two times; hand-built, replaced and decoded proposals still run full
+  verification. The canonical `set_pipeline` schema and its compiled validator
+  are built once per process and served as fresh decoded copies. Passing
+  credential-scan verdicts for the fixed tool definitions are memoized by
+  content hash; a refused list is never remembered and messages are still
+  scanned on every call. Draft hashes and canonical pipelines are byte-identical.
+- **Candidate builds and review projections preserve state identity.** The
+  `set_pipeline` candidate envelope is built from the request-scoped authority,
+  removing a provisional whole-graph walk that nothing read. Restored states
+  are threaded through review projection, graph-review reads, reconciliation,
+  proposal restoration and commit binding instead of being rebuilt, so the
+  content-hash memo survives; reconciliation returns its input when every
+  component reproduces the original exactly. All outputs are byte-identical.
+- **Plugin summaries, proposal lists and review cards read once.** The catalog
+  builds plugin summaries at construction instead of regenerating about sixty
+  schemas per composer request. Dispatch custody verification reads the
+  session's `tool_calls` history once per proposal list. Publishing the review
+  cards for one candidate prepares the shared context once and locks the head
+  state per card instead of re-reading it, with per-card provenance and
+  authorization checks unchanged.
+- **Advisory validation is memoized briefly; durable records validate fresh.**
+  `POST /validate` and `GET /audit-readiness` for the same composition version
+  share a bounded ten-second single-flight memo keyed on user, session, content
+  hash, version, plugin snapshot and secret inventory. States wiring a
+  user-authored secret bypass it, failures are never stored, and execute and
+  approval binding never read it. `validate_state` and `compute_snapshot` take
+  a keyword-only `fresh` parameter, and marking a state ready for review passes
+  `fresh=True`, so nothing in the durable review record derives from the memo.
+- **Operation streams authorize on one connection.** The database clock is
+  read as a column of the operation row, and identity, session family, role
+  grants and the session columns the stream judges are read on one connection
+  with one clock sample. No revocation, expiry, cancellation or fencing
+  decision changed; SQLite's write lock is no longer taken per frame.
+- **The frontend validates once per edit and holds Run while work settles.**
+  Validation after an interpretation resolve or a YAML import goes through the
+  auto-validation queue instead of a second direct `POST /validate`; with no
+  queue registered the store still validates directly. Run and Retry are held,
+  with a short status line, while a compose turn, a proposal decision, a resolve
+  or opt-out for the session, or validation is still in flight, so the run route
+  no longer answers a bare 409. No backend change; the tutorial runs the same
+  backend as every session. Closes
+  [#352](https://github.com/dta-au/elspeth/issues/352).
+- **Shared, published and exported graphs no longer keep half of a
+  transform's uploaded-file reference.** A transform that reads an uploaded
+  file (a `reference_join` lookup table, a file-backed prompt) previously
+  lost only the file's identifier in share snapshots, library publications,
+  the MCP `generate_yaml` tool and YAML export, leaving a fragment that named
+  no file but still carried its digest. The whole reference is now removed,
+  the export's redaction account names each affected node and option
+  (`stripped_node_options`, `# redacted-node:` header lines), and YAML import
+  refuses a leftover fragment with guidance to re-attach the file. Re-importing
+  such an export reports the missing option unless the request re-attaches the
+  file (see YAML import below).
+- **Shared, published and exported graphs no longer carry a `blob_rows`
+  source's file entries.** The public projection previously dropped only each
+  entry's `blob_id`, leaving the file's digest (`payload_ref`), filename, MIME
+  type and size, and reported nothing. The whole `blobs` list is now removed
+  and the redaction account names it (`blobs`, labelled `blob-linkage` in the
+  export header); such sources also count as reading uploaded files.
+- **A shared link can let recipients import a copy, files included.** The
+  "Share inspect link" dialog now has a configure step: "Let recipients import
+  a copy" (off by default), which lists the files that would travel, and "Link
+  expires after" 1 day, 7 days or 30 days. Nothing is minted until "Create
+  link". The deployment's `shareable_link_lifetime_seconds` is now the maximum;
+  a longer lifespan is refused with 422, and "copy link again" keeps the chosen
+  lifespan, clamped to the current maximum. When import is allowed, every
+  uploaded file the graph is attached to (source `blob_ref`, `blob_rows`
+  entries, transform inline-content markers) is frozen into the share at
+  creation, so later edits or deletion on the sharer's side do not break the
+  link. A recipient opening an import link sees "Import a copy into my
+  workspace" and the file list; importing creates a new session, "Copy of
+  ‹name›", with its own copy of each file and every attachment pointing at the
+  copy, and records the share's digest and sharer as `shared_import`
+  provenance in the new state. Links minted before this release, and links
+  without the opt-in, stay view-only (403 on import). Secrets never travel,
+  and output file locations do not travel either: the copy must have its sink
+  paths set before it validates. A graph using a plugin the recipient's policy
+  disallows is refused with 422 and the new session is archived.
+- **Files written by the assistant cannot be shared for import.** If the graph
+  is attached to a file the assistant created rather than one the user
+  uploaded, creating an import link is refused with 409 naming the file, and
+  the dialog says so before the link is created. View-only links to the same
+  graph are unaffected.
+- **Known cost: share snapshots and frozen files are not reclaimed.** Nothing
+  in the web app deletes payload-store content, so every share, and every file
+  frozen into an import link, stays on disk after the link expires. Identical
+  bytes are stored once. Reclamation is tracked in
+  [#356](https://github.com/dta-au/elspeth/issues/356).
+- **Accepted gaps in import.** There is no staged session and no server-side
+  idempotency (neither is possible without a sessions-schema change), so a
+  process that dies mid-import can leave a half-built "Copy of …" session for
+  the recipient to delete, and a deliberate retry after a network failure can
+  create a second copy. The Import button is disabled while its request is in
+  flight.
+- **YAML import can re-attach files to transforms and multi-file sources.**
+  `POST /api/sessions/{id}/state/yaml` accepts `inline_blob_bindings`, keyed by
+  component and option path, which rebuilds an inline-content file marker
+  from a ready blob of the session (its `sha256` is that blob's content
+  hash), and
+  `source_blob_rows`, which re-binds a `blob_rows` source's file entries. The
+  Import YAML dialog does not offer these fields yet.
+
+### LLM gateway
+
+- **The gateway carries the reasoning hint.** The inbound Chat Completions
+  subset accepts `reasoning_effort` (`low`, `medium` or `high`) and passes it to
+  adapters on the canonical request. The OpenRouter-style `reasoning` object is
+  still rejected.
+- **New `reasoning` adapter capability.** An adapter declares it only when its
+  upstream can honour the hint. A request carrying the hint to an adapter that
+  does not declare it is refused with `capability_unsupported` before any
+  upstream call, never forwarded with the hint dropped. The reference adapter
+  declares it and forwards the hint as `generation.deliberation`, and the
+  conformance capability sweep covers it. The reference image's
+  `adapter-fingerprint` label changes accordingly.
+
+### Dependencies
+
+- **Security updates.** The application lock moves filelock to 4.2.1, litellm
+  to 1.102.2, oauthlib to 4.0.1 and virtualenv to 21.14.5. The gateway lock
+  moves filelock to 4.2.1 and opentelemetry-api to 1.45.2, and the gateway
+  image rebuilds on the current `python:3.12-alpine` digest, which carries
+  musl 1.2.6-r3 and zlib 1.3.2-r1. The frontend and test-tooling npm locks
+  take the patched dompurify, zod, undici, fast-uri, vitest and minimatch
+  releases.
+- **Still open.** The application's OpenTelemetry 1.40 pin (CVE-2026-114603)
+  and eight virtualenv advisories remain. OpenTelemetry 1.45 breaks web start-up
+  and operator telemetry custody, and virtualenv 21.14.7 or later needs
+  packaging 26, which langfuse 3 forbids. Both need their own change.
+
+### Upgrade notes
+
+0.8.10 changes neither schema epoch, so the 0.8.9 cutover guidance continues to
+apply unchanged. Session epoch advances from 77 to 78;
+Landscape advances from epoch 49 to 50. The combined package retains committed
+graph-review authority over immutable graph snapshots and adds durable quota
+custody, aggregate container storage, rate-limit policy binding and run
+provider-attempt evidence.
+Preserve epoch-75 stores, both distinct epoch-76 predecessors, epoch-77 session
+stores and epoch-49 Landscape stores with compatible prior application access;
+configure an explicitly new epoch-78 target and an explicitly new epoch-50
+Landscape target. An existing epoch-78 session store and epoch-50 Landscape
+store qualified for 0.8.9 need no action. Older readers ignore those completion
+blockers or cannot admit the new quota shape. This authorizes no migration,
+reset, restamping or downgrade. Drain and isolate old/new deployments; they
+cannot share session stores or replicas.
+
+- Remove any `none` value from the three composer reasoning-effort settings
+  before upgrading; startup refuses it.
+- A derived gateway adapter must declare `reasoning` (and translate the hint)
+  to serve ELSPETH's composer. Re-run the conformance kit against the derived
+  image.
+- Behind a chat-completions-only gateway, do not give the composer or advisor a
+  GPT-5.4+-style model alias: with tools and the hint, LiteLLM bridges such
+  names to `/v1/responses`, which the gateway does not serve, and the request
+  fails.
+- Some models accept a temperature only with reasoning disabled (for example
+  OpenAI GPT-5.1/5.2). On those routes leave `ELSPETH_WEB__COMPOSER_TEMPERATURE`
+  unset.
+- `deploy/compose` and `deploy/linux-systemd` boot on the `gpt-5.5` default,
+  which is now hinted at the code defaults (`low` discovery, `high` candidate,
+  `medium` advisor). No latency measurements exist for those surfaces yet.
+- The tier-model allowlist entry for `warn_if_not_reasoning_capable` changed
+  and needs operator re-judging and signing before release; CI does not make
+  that claim.
+- Operators who relied on an editable checkout's `.env` being loaded from
+  another working directory must now start from that directory or pass
+  `--env-file`.
+
+### Publication and acceptance
+
+These notes describe the 0.8.10 source package. Final-head CI and the protected
+merge remain required; this entry does not establish a published tag or image.
+Automatic image publication from main remains held. The 0.8.10 tag and container
+publication follow successful required checks and the protected merge.
+Operator signing, live-provider acceptance and deployment remain separate steps.
+The PostgreSQL testcontainer suites for the statement-count changes are owed on
+a Docker host before merge.
+
 ## 0.8.9 - 2026-10-21
 
 This release combines the Composer work developed under 0.8.7, Azure Container

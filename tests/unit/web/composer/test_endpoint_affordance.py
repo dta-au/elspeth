@@ -70,13 +70,15 @@ async def test_call_llm_omits_endpoint_kwargs_when_unset(monkeypatch: pytest.Mon
     assert "api_base" not in captured
     assert "api_key" not in captured
     # Reply-only calls omit tool schemas as well as unconfigured endpoints.
-    # Bare OpenAI-surface aliases retain the mandatory discovery effort hint.
+    # The reasoning hint is always present: composer and advisor must be
+    # reasoning models, and bare OpenAI-surface aliases carry
+    # ``reasoning_effort`` at the discovery default (elspeth-dc459d438e).
     assert captured == {
         "model": "gpt-5.5",
+        "reasoning_effort": "low",
         "messages": [{"role": "user", "content": "hi"}],
         "num_retries": 0,
         "max_retries": 0,
-        "reasoning_effort": "low",
         "provider_custody": None,
         "prompt_guard_mount": None,
         "prompt_guard_mode": "required",
@@ -148,10 +150,10 @@ async def test_text_llm_omits_endpoint_kwargs_when_unset(monkeypatch: pytest.Mon
     assert "api_key" not in captured
     assert captured == {
         "model": "gpt-5.5",
+        "reasoning_effort": "low",
         "messages": [{"role": "user", "content": "hi"}],
         "num_retries": 0,
         "max_retries": 0,
-        "reasoning_effort": "low",
         "provider_custody": None,
         "prompt_guard_mount": None,
         "prompt_guard_mode": "required",

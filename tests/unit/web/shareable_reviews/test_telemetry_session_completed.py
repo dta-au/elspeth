@@ -121,6 +121,16 @@ class _ShareReviewSettingsFake:
     compartment_id: str | None
 
 
+class _UnreadBlobService:
+    """These tests mark view-only shares, which never read an uploaded file."""
+
+    async def get_blob(self, blob_id: UUID, *, session_operation_context: SessionOperationContext) -> object:
+        raise AssertionError("a view-only share must not read blobs")
+
+    async def read_blob_content(self, blob_id: UUID, *, session_operation_context: SessionOperationContext) -> bytes:
+        raise AssertionError("a view-only share must not read blobs")
+
+
 @pytest.fixture
 def engine():  # type: ignore[no-untyped-def]
     eng = create_session_engine("sqlite:///:memory:")
@@ -306,6 +316,7 @@ def _build_service_with_fresh_telemetry(  # type: ignore[no-untyped-def]
         session_operation_authority=SQLiteLocalSessionOperationAuthority(engine),
         payload_store=payload_store,
         telemetry=telemetry,
+        blob_service=_UnreadBlobService(),
     )
     return service, telemetry
 

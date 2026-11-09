@@ -710,16 +710,25 @@ _GET_BLOB_METADATA_DECLARATION = ToolDeclaration(
     source_param="container",
     suppresses=("R5",),
     invariant=(
-        "raises ValueError when a field_path segment collides with an existing non-object value or "
-        "when field_path carries no segment; never coerces an existing value into an object"
+        "raises ValueError when a field_path segment collides with an existing non-object value, "
+        "when field_path carries no segment, or (replace_existing=False) when the leaf already holds a value; "
+        "never coerces an existing value into an object"
     ),
     test_ref="tests/unit/web/composer/test_blob_inline_tools.py::test_set_nested_option_rejects_non_object_segment_collision",
     test_fingerprint="f737be9d00e5cfa17240cfb4dda84f2dbf1ef46dd5be557429ef27613b2877d2",
 )
-def _set_nested_option(container: dict[str, Any], keys: list[str], value: Any) -> dict[str, Any]:
+def _set_nested_option(
+    container: dict[str, Any],
+    keys: list[str],
+    value: Any,
+    *,
+    replace_existing: bool = True,
+) -> dict[str, Any]:
     if not keys:
         raise ValueError("field_path must include at least one .options.<field> segment")
     if len(keys) == 1:
+        if not replace_existing and keys[0] in container:
+            raise ValueError(f"field_path leaf {keys[0]!r} already holds a value")
         container[keys[0]] = value
         return container
     head = keys[0]
@@ -730,11 +739,23 @@ def _set_nested_option(container: dict[str, Any], keys: list[str], value: Any) -
         nested = dict(deep_thaw(child))
     else:
         nested = {}
-    container[head] = _set_nested_option(nested, keys[1:], value)
+    container[head] = _set_nested_option(nested, keys[1:], value, replace_existing=replace_existing)
     return container
 
 
-def _apply_inline_blob_marker(state: CompositionState, field_path: str, marker: dict[str, Any]) -> CompositionState:
+def _apply_inline_blob_marker(
+    state: CompositionState,
+    field_path: str,
+    marker: dict[str, Any],
+    *,
+    replace_existing: bool = True,
+) -> CompositionState:
+    """Write ``marker`` at ``field_path``, refusing every target the wire tool refuses.
+
+    ``replace_existing=False`` (YAML import re-binding) also refuses a leaf
+    that already holds a value: re-binding fills a removed marker's slot and
+    never overwrites what the graph carries.
+    """
     prefix, separator, rest = field_path.partition(".options.")
     if separator == "":
         raise ValueError("field_path must include '.options.'")
@@ -772,7 +793,7 @@ def _apply_inline_blob_marker(state: CompositionState, field_path: str, marker: 
                 "stage an authorable pending source review with set_source or patch_source_options. "
                 f"{_INTERPRETATION_REVIEW_FOLLOWUP}"
             )
-        patched_options = _set_nested_option(dict(deep_thaw(source.options)), keys, marker)
+        patched_options = _set_nested_option(dict(deep_thaw(source.options)), keys, marker, replace_existing=replace_existing)
         return state.with_named_source(source_name, replace(source, options=patched_options))
 
     if prefix.startswith("node:"):
@@ -799,7 +820,7 @@ def _apply_inline_blob_marker(state: CompositionState, field_path: str, marker: 
                         "edit use patch_node_options, or upsert_node for a full node edit, without the runtime hash; "
                         "ELSPETH re-derives it during review reconciliation or execution."
                     )
-                patched_options = _set_nested_option(dict(deep_thaw(node.options)), keys, marker)
+                patched_options = _set_nested_option(dict(deep_thaw(node.options)), keys, marker, replace_existing=replace_existing)
                 new_nodes.append(replace(node, options=patched_options))
                 found = True
             else:
@@ -820,7 +841,7 @@ def _apply_inline_blob_marker(state: CompositionState, field_path: str, marker: 
         found = False
         for output in state.outputs:
             if output.name == output_name:
-                patched_options = _set_nested_option(dict(deep_thaw(output.options)), keys, marker)
+                patched_options = _set_nested_option(dict(deep_thaw(output.options)), keys, marker, replace_existing=replace_existing)
                 new_outputs.append(replace(output, options=patched_options))
                 found = True
             else:

@@ -1,6 +1,8 @@
 import type { JSX } from "react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { useSessionStore } from "@/stores/sessionStore";
 import { axe, toHaveNoViolations } from "jest-axe";
 import { SharedInspectView } from "./SharedInspectView";
 import { ReadOnlyProvider, useReadOnly } from "@/contexts/ReadOnlyContext";
@@ -68,6 +70,8 @@ const _validResponse: SharedInspectResponse = {
   created_by_username: "alice-the-analyst",
   created_at: "2026-05-19T00:00:00+00:00",
   expires_at: "2026-06-19T00:00:00+00:00",
+  import_allowed: false,
+  files: [],
 };
 
 describe("SharedInspectView", () => {
@@ -506,5 +510,118 @@ describe("SharedInspectView scroll ownership", () => {
     );
     expect(style.overflowY).toBe("auto");
     expect(style.minHeight).toBe("0px");
+  });
+});
+
+describe("SharedInspectView import", () => {
+  const importable: SharedInspectResponse = {
+    ..._validResponse,
+    import_allowed: true,
+    files: [
+      { filename: "people.csv", size_bytes: 2048 },
+      { filename: "notes.txt", size_bytes: 12 },
+    ],
+  };
+  const BUTTON = { name: "Import a copy into my workspace" };
+
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    window.location.hash = "#/shared/abc";
+  });
+
+  async function renderImportable(): Promise<void> {
+    vi.spyOn(api, "fetchSharedInspect").mockResolvedValueOnce(importable);
+    render(<SharedInspectView token="abc" />);
+    await screen.findByTestId("shared-inspect-loaded");
+  }
+
+  it("offers no import button for a view-only link", async () => {
+    vi.spyOn(api, "fetchSharedInspect").mockResolvedValueOnce(_validResponse);
+    render(<SharedInspectView token="abc" />);
+    await screen.findByTestId("shared-inspect-loaded");
+    expect(screen.queryByRole("button", BUTTON)).toBeNull();
+    expect(screen.queryByTestId("shared-inspect-import-files")).toBeNull();
+  });
+
+  it("lists the files an import would copy, with sizes", async () => {
+    await renderImportable();
+    const list = screen.getByRole("list", { name: "Files that will be copied" });
+    const items = within(list).getAllByRole("listitem");
+    expect(items.map((i) => i.textContent)).toEqual([
+      "people.csv (2.0 KB)",
+      "notes.txt (12 B)",
+    ]);
+  });
+
+  it("imports, reloads sessions, then navigates to the new session", async () => {
+    await renderImportable();
+    const order: string[] = [];
+    vi.spyOn(api, "importSharedSnapshot").mockResolvedValueOnce({
+      session_id: "sess-new",
+      state_id: "st-1",
+    });
+    const loadSessions = vi.fn().mockImplementation(async () => {
+      order.push(`load:${window.location.hash}`);
+    });
+    vi.spyOn(useSessionStore, "getState").mockReturnValue({ loadSessions } as never);
+    await userEvent.click(screen.getByRole("button", BUTTON));
+    await waitFor(() => expect(window.location.hash).toBe("#/sess-new"));
+    expect(api.importSharedSnapshot).toHaveBeenCalledWith("abc", expect.anything());
+    expect(order).toEqual(["load:#/shared/abc"]);
+  });
+
+  it("disables the button while the import is in flight", async () => {
+    await renderImportable();
+    let resolve!: (v: { session_id: string; state_id: string }) => void;
+    const imp = vi.spyOn(api, "importSharedSnapshot").mockImplementationOnce(
+      () => new Promise((r) => { resolve = r; }),
+    );
+    vi.spyOn(useSessionStore, "getState").mockReturnValue({
+      loadSessions: vi.fn().mockResolvedValue(undefined),
+    } as never);
+    await userEvent.click(screen.getByRole("button", BUTTON));
+    expect(screen.getByRole("button", BUTTON)).toBeDisabled();
+    await userEvent.click(screen.getByRole("button", BUTTON));
+    expect(imp).toHaveBeenCalledTimes(1);
+    resolve({ session_id: "s2", state_id: "x" });
+    await waitFor(() => expect(window.location.hash).toBe("#/s2"));
+  });
+
+  it.each([
+    [{ status: 401, detail: "bad token" }, "This share link has expired", true],
+    [{ status: 403, detail: "no" }, "This link doesn't allow importing", false],
+    [{ status: 404, detail: "gone" }, "ask the sender for a fresh link", true],
+    [{ status: 413, detail: "quota" }, "You don't have enough storage to import these files", true],
+    [{ status: 500, detail: "boom" }, "Couldn't import the shared pipeline", true],
+  ])("shows the mapped message for %j", async (failure, text, retryable) => {
+    await renderImportable();
+    vi.spyOn(api, "importSharedSnapshot").mockRejectedValueOnce(failure);
+    await userEvent.click(screen.getByRole("button", BUTTON));
+    const alert = await screen.findByTestId("shared-inspect-import-error");
+    expect(alert).toHaveTextContent(text);
+    expect(alert).toHaveAttribute("role", "alert");
+    if (retryable) expect(screen.getByRole("button", BUTTON)).toBeEnabled();
+    expect(window.location.hash).toBe("#/shared/abc");
+    // The loaded view stays on screen after a failed import.
+    expect(screen.getByTestId("shared-inspect-loaded")).toBeInTheDocument();
+  });
+
+  it("treats an authentication 401 as sign-in recovery, not an expired link", async () => {
+    await renderImportable();
+    vi.spyOn(api, "importSharedSnapshot").mockRejectedValueOnce({
+      status: 401,
+      error_type: "authentication_required",
+      detail: "Not authenticated",
+    });
+    await userEvent.click(screen.getByRole("button", BUTTON));
+    const alert = await screen.findByTestId("shared-inspect-import-error");
+    expect(alert).toHaveTextContent(/sign.in/i);
+    expect(alert).not.toHaveTextContent(/expired/i);
+    expect(screen.getByRole("button", BUTTON)).toBeEnabled();
+  });
+
+  it("has no axe violations with the import affordance", async () => {
+    await renderImportable();
+    expect(await axe(screen.getByTestId("shared-inspect-loaded"))).toHaveNoViolations();
   });
 });

@@ -147,9 +147,12 @@ from elspeth.web.sessions.telemetry import build_sessions_telemetry  # noqa: E40
 _INBOUND_BEARER = "composer-gw-e2e-inbound-bearer-0123456789abcdef"  # secret-scan: allow-this-line
 _OAUTH_CLIENT_ID = "composer-gw-e2e-oauth-client"
 _OAUTH_CLIENT_SECRET = "composer-gw-e2e-oauth-client-secret-0123456789abcdef"  # secret-scan: allow-this-line
-# This real gateway implements chat completions. GPT-5.4+ names plus the
-# mandatory effort hint select LiteLLM's Responses bridge instead; the local
-# unsupported-route control below preserves that distinction.
+# A reasoning model that litellm keeps on Chat Completions. The hosted gateway
+# here serves only /v1/chat/completions, and since the composer sends a
+# reasoning hint on every call, litellm bridges GPT-5.4+-named aliases with
+# tools to /v1/responses (test_wire_fidelity_matrix.py rows for gpt-5.5), which
+# this gateway answers 404. WebSettings.composer_model defaults to gpt-5.5, so
+# _settings() overrides it. The unsupported-route control below pins that 404.
 _MODEL_ALIAS = "gpt-5.1"
 _SAMPLING_MODEL_ALIAS = "gpt-4.1"  # explicit model whose sampling contract admits temperature + seed
 _MODEL_TARGET = "composer-gw-e2e-target"

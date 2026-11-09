@@ -46,9 +46,13 @@
  *   * `<YamlDisplay>` for the frozen YAML.
  *
  * The composer chat panel, run controls, and edit affordances are
- * deliberately ABSENT — this is an inspect-only view, not a fork
- * surface (multi-user collaborative editing is out of scope per
- * plan 19a §"Scope boundaries").
+ * deliberately ABSENT — the view itself is read-only. When the link allows
+ * it (`import_allowed`), the one write affordance is "Import a copy into my
+ * workspace": it forks the frozen snapshot (and its files) into a NEW session
+ * owned by the viewer and navigates there. The shared snapshot is never
+ * modified; multi-user collaborative editing remains out of scope per plan 19a
+ * §"Scope boundaries". The import control and its file list render outside
+ * any `useReadOnly` consumer, so the read-only provider does not disable it.
  *
  * Error handling:
  *
@@ -58,11 +62,20 @@
  * * 404 (blob reaped) → "This shared snapshot is no longer available"
  *   with a "Ask the sender for a fresh link" message.
  * * Other / network → "Couldn't load the shared pipeline" with retry.
+ *
+ * Import errors keep the loaded view on screen and show an inline alert:
+ * capability 401 → expired, 403 → not allowed, 404 → ask for a fresh link,
+ * 413 → storage quota, authentication 401 → sign-in recovery, anything else →
+ * generic message with the button re-enabled for retry.
  */
 
-import { type JSX, useEffect, useState, type CSSProperties } from "react";
+import { type JSX, useEffect, useRef, useState, type CSSProperties } from "react";
 
-import { fetchSharedInspect } from "@/api/shareableReviews";
+import { Button } from "@/components/ui";
+
+import { fetchSharedInspect, importSharedSnapshot } from "@/api/shareableReviews";
+import { useSessionStore } from "@/stores/sessionStore";
+import { formatBytes } from "@/utils/bytes";
 import { ReadOnlyProvider } from "@/contexts/ReadOnlyContext";
 import { SharedAuditReadinessPanel } from "./SharedAuditReadinessPanel";
 import { YamlDisplay } from "@/components/inspector/YamlDisplay";
@@ -131,6 +144,17 @@ const BANNER_STYLE: CSSProperties = {
   fontSize: "var(--font-size-sm)",
 };
 
+const FILE_LIST_STYLE: CSSProperties = {
+  margin: "0 0 var(--space-md)",
+  paddingLeft: "var(--space-lg)",
+  color: "var(--color-text-secondary)",
+  fontSize: "var(--font-size-sm)",
+};
+
+const NOT_FOUND_MESSAGE =
+  "This shared snapshot is no longer available. The original " +
+  "operator may need to re-share — ask the sender for a fresh link.";
+
 type LoadState =
   | { kind: "loading" }
   | { kind: "loaded"; response: SharedInspectResponse }
@@ -144,17 +168,26 @@ function _isApiError(value: unknown): value is ApiError {
   );
 }
 
-function _classifyError(exc: unknown): { status: number | null; message: string } {
+interface ClassifiedError {
+  status: number | null;
+  message: string;
+  /** A bare-bearer 401: the viewer's sign-in, not the link, was refused. */
+  authentication: boolean;
+}
+
+function _classifyError(exc: unknown): ClassifiedError {
   if (_isApiError(exc)) {
     if (exc.status === 401) {
       if (exc.error_type === "authentication_required") {
         return {
           status: 401,
+          authentication: true,
           message: "Your sign-in was not accepted for this request. Reload this link or sign in again.",
         };
       }
       return {
         status: 401,
+        authentication: false,
         message:
           "This share link is no longer valid. The link may have expired or " +
           "been revoked. Ask the sender for a fresh link.",
@@ -163,20 +196,38 @@ function _classifyError(exc: unknown): { status: number | null; message: string 
     if (exc.status === 404) {
       return {
         status: 404,
-        message:
-          "This shared snapshot is no longer available. The original " +
-          "operator may need to re-share — ask the sender for a fresh link.",
+        authentication: false,
+        message: NOT_FOUND_MESSAGE,
       };
     }
     return {
       status: exc.status,
+      authentication: false,
       message: exc.detail ?? "Couldn't load the shared pipeline.",
     };
   }
   if (exc instanceof Error) {
-    return { status: null, message: exc.message };
+    return { status: null, authentication: false, message: exc.message };
   }
-  return { status: null, message: "Couldn't load the shared pipeline." };
+  return { status: null, authentication: false, message: "Couldn't load the shared pipeline." };
+}
+
+/** User-facing copy for a failed import, on top of the shared classifier. */
+function _importFailureMessage(exc: unknown): string {
+  const classified = _classifyError(exc);
+  if (classified.authentication) return classified.message;
+  switch (classified.status) {
+    case 401:
+      return "This share link has expired";
+    case 403:
+      return "This link doesn't allow importing";
+    case 404:
+      return classified.message;
+    case 413:
+      return "You don't have enough storage to import these files";
+    default:
+      return "Couldn't import the shared pipeline";
+  }
 }
 
 function _returnToWorkspaceUrl(): string {
@@ -193,6 +244,9 @@ function _returnToWorkspaceUrl(): string {
 
 export function SharedInspectView({ token }: SharedInspectViewProps): JSX.Element {
   const [state, setState] = useState<LoadState>({ kind: "loading" });
+  const [importing, setImporting] = useState(false);
+  const [importError, setImportError] = useState<{ status: number | null; message: string } | null>(null);
+  const importingRef = useRef(false);
 
   useEffect(() => {
     if (token === null) return;
@@ -214,6 +268,26 @@ export function SharedInspectView({ token }: SharedInspectViewProps): JSX.Elemen
       controller.abort();
     };
   }, [token]);
+
+  async function importCopy(): Promise<void> {
+    if (token === null || importingRef.current) return;
+    importingRef.current = true;
+    setImporting(true);
+    setImportError(null);
+    try {
+      const imported = await importSharedSnapshot(token, new AbortController().signal);
+      // The shared route is a separate App branch whose hash the session
+      // router ignores: refresh the session list first so the composer tree
+      // finds the new session, then switch to its canonical hash.
+      await useSessionStore.getState().loadSessions();
+      window.location.hash = `#/${imported.session_id}`;
+    } catch (exc: unknown) {
+      setImportError({ status: _classifyError(exc).status, message: _importFailureMessage(exc) });
+      setImporting(false);
+    } finally {
+      importingRef.current = false;
+    }
+  }
 
   const displayState: LoadState = token === null
     ? {
@@ -293,6 +367,39 @@ export function SharedInspectView({ token }: SharedInspectViewProps): JSX.Elemen
             </time>
             .
           </p>
+          {response.import_allowed && (
+            <section
+              aria-label="Import a copy"
+              data-testid="shared-inspect-import"
+            >
+              {response.files.length > 0 && (
+                <ul
+                  aria-label="Files that will be copied"
+                  data-testid="shared-inspect-import-files"
+                  style={FILE_LIST_STYLE}
+                >
+                  {response.files.map((file) => (
+                    <li key={file.filename}>
+                      {file.filename} ({formatBytes(file.size_bytes)})
+                    </li>
+                  ))}
+                </ul>
+              )}
+              <Button
+                type="button"
+                variant="primary"
+                disabled={importing || importError?.status === 403}
+                onClick={() => void importCopy()}
+              >
+                Import a copy into my workspace
+              </Button>
+              {importError !== null && (
+                <p role="alert" data-testid="shared-inspect-import-error">
+                  {importError.message}
+                </p>
+              )}
+            </section>
+          )}
           <h1 style={H1_STYLE} data-testid="shared-inspect-pipeline-name">
             {pipelineName}
           </h1>

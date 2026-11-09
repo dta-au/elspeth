@@ -6,6 +6,9 @@ Responsibilities:
 * Freeze a complete snapshot of the composition at mark-time — including
   the readiness panel — into a content-addressable blob in the payload
   store.
+* When the owner opts in to import, freeze every uploaded file the
+  composition uses into the same content-addressed payload store and list
+  them in the snapshot's private ``files`` manifest.
 * Record the audit event in ``composer_completion_events_table`` BEFORE
   writing the blob (audit-first ordering).
 * Mint a signed capability token that encodes the content-address.
@@ -14,16 +17,28 @@ Responsibilities:
 
 Audit-first ordering (load-bearing):
 
-1. Build snapshot dict in memory.
-2. Canonical-JSON-serialize → compute ``payload_digest``.
-3. INSERT ``composer_completion_events`` row (sync, crash-on-failure).
-4. Write blob to payload store.
-5. Sign token.
-6. Return.
+1. When import is allowed, read and verify every referenced file (refuse
+   the whole share if any file is not shareable — nothing is stored).
+2. Build snapshot dict in memory.
+3. Canonical-JSON-serialize → compute ``payload_digest``.
+4. Store the verified file bytes (content-addressed; the snapshot's
+   ``files`` manifest names them by sha256).
+5. INSERT ``composer_completion_events`` row (sync, crash-on-failure).
+6. Write the snapshot blob to the payload store.
+7. Sign token.
+8. Return.
 
-If the audit insert fails, no blob is ever written. If the blob write fails
-after the audit insert, the audit row stands as honest evidence of the
-attempt; no token is returned.
+No token is minted unless every file is frozen. If the audit insert fails,
+no snapshot blob is ever written (frozen file bytes may remain: they are
+content-addressed copies of the owner's own uploads, reachable only through
+a snapshot that names them). If the snapshot write fails after the audit
+insert, the audit row stands as honest evidence of the attempt; no token is
+returned.
+
+Snapshot shapes: this release writes nine keys (the seven ``_BlobShape``
+keys plus ``import_allowed`` and ``files``). The reader also accepts the previous
+release's exact seven-key shape and treats it as view-only. Those are the
+only two shapes; any other key set is refused.
 
 Frozen-at-mark-time discipline (load-bearing):
 
@@ -54,6 +69,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import secrets
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -63,6 +79,14 @@ from uuid import UUID
 from sqlalchemy import desc, select
 from sqlalchemy.engine import Engine
 
+from elspeth.contracts.blobs import (
+    STORAGE_MIME_TYPES,
+    BlobNotFoundError,
+    BlobRecord,
+    BlobServiceProtocol,
+    BlobStateError,
+)
+from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.core.canonical import canonical_json
 from elspeth.core.payload_store import FilesystemPayloadStore
@@ -84,10 +108,20 @@ from elspeth.web.execution.completion_gates import CompletionGateFacts, parse_co
 from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.models import composer_completion_events_table
 from elspeth.web.sessions.protocol import SessionOperationAuthority
+from elspeth.web.shareable_reviews.file_manifest import (
+    FileBinding,
+    ShareManifestError,
+    collect_file_bindings,
+    file_binding_from_json,
+    file_binding_to_json,
+)
 from elspeth.web.shareable_reviews.models import (
     CompositionStateResponse,
     MarkReadyForReviewResponse,
+    ShareableFilesResponse,
+    ShareableFileView,
     ShareableLinkResponse,
+    SharedFileSummary,
     SharedInspectResponse,
 )
 from elspeth.web.shareable_reviews.signer import (
@@ -137,6 +171,13 @@ class CompositionNotRunnableError(Exception):
       against different composition versions.
     * ``"completion_event_missing"`` — re-mint was requested before the
       current state had passed ``mark_ready_for_review``.
+    * ``"file_not_shareable"`` — import was requested but a file the
+      composition uses cannot be frozen for import (missing, not ready,
+      assistant-written, or its bytes disagree with its record); ``detail``
+      names the file.
+    * ``"lifetime_exceeds_maximum"`` — the requested link lifetime is longer
+      than the deployment's ``shareable_link_lifetime_seconds``. The route
+      maps this one to HTTP 422.
     """
 
     def __init__(self, *, reason: str, detail: str = "") -> None:
@@ -194,7 +235,11 @@ class _ReadinessServiceLike(Protocol):
 
 
 class _BlobShape(TypedDict):
-    """Exact canonical-JSON shape produced and consumed by this release."""
+    """The seven snapshot keys every readable share snapshot carries.
+
+    This is the whole of the previous release's (view-only) snapshot and the
+    common core of the current one; ``_SnapshotShape`` adds the import keys.
+    """
 
     pipeline_metadata: Any  # CompositionObject (dict[str, JsonValue])
     composition_snapshot: Any  # CompositionObject
@@ -207,14 +252,39 @@ class _BlobShape(TypedDict):
     compartment_id: str | None
 
 
-# Closed-set producer-side guard. The digest only proves bytes-on-disk
-# integrity; it does NOT detect a producer drift that emits an extra or
-# missing key (the buggy bytes round-trip cleanly through the digest).
-# ``_assert_blob_shape`` catches that class of drift at the producer so
-# the bug surfaces in the owner's request instead of several frames away
-# in the reviewer's Pydantic construction. Both producer and reader enforce
-# this exact shape; update ``_BlobShape`` and this set together.
-_BLOB_KEYS: Final[frozenset[str]] = frozenset(
+class ShareFileEntry(TypedDict):
+    """One frozen file in a snapshot's private ``files`` manifest.
+
+    ``sha256`` is the bare hex content-address of the frozen bytes in the
+    payload store (equal to the owner's blob row ``content_hash``). Blob ids
+    and storage paths are deliberately absent: the import path re-creates
+    the file in the recipient's session from these bytes.
+    """
+
+    sha256: str
+    size_bytes: int
+    filename: str
+    mime_type: str
+    bindings: list[dict[str, object]]  # file_binding_to_json output, one per binding site
+
+
+class _SnapshotShape(_BlobShape):
+    """Exact canonical-JSON shape produced by this release."""
+
+    import_allowed: bool
+    files: list[ShareFileEntry]  # sorted by sha256; [] when not importable
+
+
+# Closed-set guards. The digest only proves bytes-on-disk integrity; it does
+# NOT detect a producer drift that emits an extra or missing key (the buggy
+# bytes round-trip cleanly through the digest). The producer guard in
+# ``_build_snapshot`` catches that class of drift at the producer so the bug
+# surfaces in the owner's request instead of several frames away in the
+# reviewer's Pydantic construction. The reader accepts exactly these two
+# closed sets — the previous release's seven keys (read as view-only) and
+# the current nine — and nothing in between. Update the TypedDicts and these
+# sets together.
+_LEGACY_BLOB_KEYS: Final[frozenset[str]] = frozenset(
     {
         "pipeline_metadata",
         "composition_snapshot",
@@ -225,6 +295,30 @@ _BLOB_KEYS: Final[frozenset[str]] = frozenset(
         "compartment_id",
     }
 )
+_BLOB_KEYS: Final[frozenset[str]] = _LEGACY_BLOB_KEYS | {"import_allowed", "files"}
+_FILE_ENTRY_KEYS: Final[frozenset[str]] = frozenset({"sha256", "size_bytes", "filename", "mime_type", "bindings"})
+_SHA256_HEX: Final = re.compile(r"[0-9a-f]{64}")
+
+
+@dataclass(frozen=True, slots=True)
+class ParsedSnapshot:
+    """A verified share snapshot, as the resolve and import paths read it.
+
+    ``blob`` carries the seven keys every readable snapshot has. A legacy
+    seven-key snapshot reads as ``import_allowed=False`` with no files.
+    """
+
+    blob: _BlobShape
+    import_allowed: bool
+    files: tuple[ShareFileEntry, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _FrozenFile:
+    """One verified file awaiting storage: its bytes and its manifest entry."""
+
+    content: bytes
+    entry: ShareFileEntry
 
 
 @dataclass(frozen=True, slots=True)
@@ -255,6 +349,115 @@ def _public_audit_readiness(snapshot: AuditReadinessSnapshot) -> AuditReadinessS
     return snapshot.model_copy(update={"rows": rows})
 
 
+def _check_shareable_blob(record: BlobRecord, content: bytes | None) -> str | None:
+    """Return why ``record`` cannot travel with an importable share, or ``None``.
+
+    The message is user register and names the file. ``content`` is the
+    blob's bytes as read under the caller's session-operation context, or
+    ``None`` when they were not read (a blob that is not ready is refused
+    from its row alone). Shared by the mark-ready freeze and the owner's
+    file preview, so both report the same verdict.
+    """
+    name = record.filename
+    if record.status != "ready":
+        return f"'{name}' is not ready to share (its upload is {record.status})"
+    if record.content_hash is None:
+        return f"'{name}' has no recorded content hash and cannot be shared for import"
+    if record.creation_modality is not CreationModality.VERBATIM:
+        return f"'{name}' was written by the assistant and cannot be shared for import"
+    if content is None:
+        return f"'{name}' could not be read and cannot be shared for import"
+    if len(content) != record.size_bytes or hashlib.sha256(content).hexdigest() != record.content_hash:
+        return f"'{name}' does not match its recorded content and cannot be shared for import"
+    return None
+
+
+@dataclass(frozen=True, slots=True)
+class _InspectedFile:
+    """One bound blob as read and judged: ``refusal`` is ``None`` when it can travel."""
+
+    bindings: list[FileBinding]
+    record: BlobRecord | None
+    content: bytes | None
+    refusal: str | None
+
+
+def _describe_use(binding: FileBinding) -> str:
+    """Name where a file is used, for the owner's preview."""
+    if binding.kind in ("source_blob_ref", "source_blob_rows"):
+        return f"source '{binding.source_name}'"
+    if binding.field_path is None:
+        raise RuntimeError("inline_content binding without a field_path")
+    owner, _, path = binding.field_path.partition(".options.")
+    kind, _, name = owner.partition(":")
+    return f"{kind} '{name}' ({path})"
+
+
+def _binding_site(binding: FileBinding) -> str:
+    """Name where a file is used, for a refusal that has no filename to give."""
+    if binding.kind == "source_blob_ref":
+        return f"source '{binding.source_name}'"
+    if binding.kind == "source_blob_rows":
+        return f"source '{binding.source_name}' (blobs[{binding.row_index}])"
+    return f"option {binding.field_path}"
+
+
+def _describe_lifetime(seconds: int) -> str:
+    if seconds % 86400 == 0:
+        days = seconds // 86400
+        return "1 day" if days == 1 else f"{days} days"
+    return f"{seconds} seconds"
+
+
+def _parse_file_manifest(value: object) -> tuple[ShareFileEntry, ...]:
+    """Validate a snapshot's ``files`` manifest; raise ``InvalidToken`` on any drift.
+
+    Tier-1 data (our own digest-verified blob), so every deviation from the
+    producer's exact shape is corruption, not something to repair: entries
+    are exact-keyed, strictly sorted by sha256 (which also forbids
+    duplicates), and every binding must round-trip ``file_binding_from_json``.
+    """
+    if type(value) is not list:
+        raise InvalidToken("share snapshot file manifest is invalid")
+    entries: list[ShareFileEntry] = []
+    previous_sha: str | None = None
+    for raw in value:
+        if type(raw) is not dict or frozenset(raw) != _FILE_ENTRY_KEYS:
+            raise InvalidToken("share snapshot file entry shape is invalid")
+        sha256 = raw["sha256"]
+        if type(sha256) is not str or _SHA256_HEX.fullmatch(sha256) is None:
+            raise InvalidToken("share snapshot file digest is invalid")
+        if previous_sha is not None and sha256 <= previous_sha:
+            raise InvalidToken("share snapshot files are not uniquely sorted by digest")
+        previous_sha = sha256
+        size_bytes = raw["size_bytes"]
+        if type(size_bytes) is not int or size_bytes < 0:
+            raise InvalidToken("share snapshot file size is invalid")
+        filename = raw["filename"]
+        if type(filename) is not str or not filename.strip():
+            raise InvalidToken("share snapshot filename is invalid")
+        mime_type = raw["mime_type"]
+        if type(mime_type) is not str or mime_type not in STORAGE_MIME_TYPES:
+            raise InvalidToken("share snapshot file type is invalid")
+        raw_bindings = raw["bindings"]
+        if type(raw_bindings) is not list or not raw_bindings:
+            raise InvalidToken("share snapshot file bindings are invalid")
+        try:
+            bindings = [file_binding_to_json(file_binding_from_json(binding)) for binding in raw_bindings]
+        except ValueError as exc:
+            raise InvalidToken("share snapshot file binding is invalid") from exc
+        entries.append(
+            {
+                "sha256": sha256,
+                "size_bytes": size_bytes,
+                "filename": filename,
+                "mime_type": mime_type,
+                "bindings": bindings,
+            }
+        )
+    return tuple(entries)
+
+
 def _build_snapshot(
     *,
     session_id: UUID,
@@ -263,13 +466,17 @@ def _build_snapshot(
     created_by_user_id: str,
     created_by_username: str,
     compartment_id: str | None,
+    import_allowed: bool,
+    files: list[ShareFileEntry],
 ) -> _Snapshot:
     """Build the canonical-JSON snapshot blob and compute its content-address.
 
-    The blob shape is the same one ``SharedInspectResponse`` deserialises
-    on the resolve path — pipeline_metadata, composition_snapshot, yaml,
-    audit_readiness, created_by_user_id, created_by_username, compartment_id.
-    This is the contractual wire shape for the share artifact.
+    The blob shape is the one the resolve and import paths read back —
+    pipeline_metadata, composition_snapshot, yaml, audit_readiness,
+    created_by_user_id, created_by_username, compartment_id, import_allowed
+    and the private ``files`` manifest. This is the contractual shape for
+    the share artifact; ``payload_digest`` binds the import decision and the
+    manifest along with everything else.
 
     Both attribution fields are frozen into the blob: the identity id
     because the token signature binds it, and the username because it is
@@ -308,7 +515,9 @@ def _build_snapshot(
     audit_readiness_dict["checked_at"] = state_record.created_at.isoformat()
     if compartment_id is not None and not is_compartment_id(compartment_id):
         raise ValueError("shareable-review compartment_id does not match the configured shape")
-    blob: _BlobShape = {
+    if not import_allowed and files:
+        raise ValueError("a view-only share snapshot must not carry a file manifest")
+    blob: _SnapshotShape = {
         "pipeline_metadata": pipeline_metadata,
         "composition_snapshot": composition_dict,
         "yaml": yaml_text,
@@ -316,8 +525,10 @@ def _build_snapshot(
         "created_by_user_id": created_by_user_id,
         "created_by_username": created_by_username,
         "compartment_id": compartment_id,
+        "import_allowed": import_allowed,
+        "files": sorted(files, key=lambda entry: entry["sha256"]),
     }
-    # Producer-side drift guard. ``_BlobShape: TypedDict`` is a static
+    # Producer-side drift guard. ``_SnapshotShape: TypedDict`` is a static
     # type — Python does not enforce it at runtime. Without this assert,
     # a future refactor adding/dropping a key would produce a digest-stable
     # but shape-drifted blob; the bug would surface in Pydantic
@@ -329,7 +540,7 @@ def _build_snapshot(
         extra = actual_keys - _BLOB_KEYS
         raise RuntimeError(
             f"shareable-review snapshot blob shape drift: missing={sorted(missing)!r} extra={sorted(extra)!r}. "
-            "Update _BlobShape and _BLOB_KEYS together."
+            "Update _SnapshotShape and _BLOB_KEYS together."
         )
     canonical_str = canonical_json(blob)
     canonical_bytes = canonical_str.encode("utf-8")
@@ -366,6 +577,7 @@ class ShareableReviewService:
         session_operation_authority: SessionOperationAuthority,
         payload_store: FilesystemPayloadStore,
         telemetry: SessionsTelemetry,
+        blob_service: BlobServiceProtocol,
     ) -> None:
         self._session_service = session_service
         self._execution_service = execution_service
@@ -383,6 +595,9 @@ class ShareableReviewService:
         # mark_ready_for_review can fire the helper after engine.begin()
         # exits cleanly.
         self._telemetry = telemetry
+        # Reads the owner's uploaded files (under the route's COMPOSE
+        # context) when a share opts in to import.
+        self._blob_service = blob_service
 
     async def mark_ready_for_review(
         self,
@@ -391,6 +606,8 @@ class ShareableReviewService:
         user_id: str,
         username: str,
         session_operation_context: SessionOperationContext,
+        allow_import: bool = False,
+        lifetime_seconds: int | None = None,
     ) -> MarkReadyForReviewResponse:
         """Build a signed share artifact for ``(session_id, current state)``.
 
@@ -400,21 +617,42 @@ class ShareableReviewService:
         recipient's banner can name who shared the pipeline; nothing
         authorises off it.
 
+        ``allow_import`` lets recipients import a copy: every file the
+        composition uses is verified and frozen into the payload store, and
+        listed in the snapshot's private ``files`` manifest. ``lifetime_seconds``
+        is the link's lifespan; ``None`` means the deployment maximum, and a
+        longer value is refused (``lifetime_exceeds_maximum``).
+
         Sequence (audit-first ordering):
 
         1. Validate the composition and completion gates (raises
            ``CompositionNotRunnableError`` on failure).
         2. Compute the readiness snapshot using the OWNER's user_id and
            apply the mark-time gate (no row with status='error').
-        3. Build the canonical-JSON snapshot bytes; compute payload_digest.
-        4. INSERT the audit row into ``composer_completion_events_table``.
-        5. Write the blob to the payload store.
-        6. Sign the token; return.
+        3. When importing, read and verify every referenced file; any file
+           that is not shareable refuses the whole share
+           (``file_not_shareable``) before anything is stored.
+        4. Build the canonical-JSON snapshot bytes; compute payload_digest.
+        5. Store the verified file bytes.
+        6. INSERT the audit row into ``composer_completion_events_table``.
+        7. Write the snapshot blob to the payload store.
+        8. Sign the token; return.
 
-        If step (4) fails the request fails before any blob is written. If
-        step (5) fails the audit row stands as honest evidence of the
-        attempt; no token is returned.
+        No token is minted unless every file is frozen. If step (6) fails
+        the request fails before the snapshot blob is written. If step (7)
+        fails the audit row stands as honest evidence of the attempt; no
+        token is returned.
         """
+        max_lifetime_seconds = self._settings.shareable_link_lifetime_seconds
+        if lifetime_seconds is None:
+            lifetime_seconds = max_lifetime_seconds
+        elif lifetime_seconds <= 0:
+            raise ValueError(f"lifetime_seconds must be positive, got {lifetime_seconds}")
+        elif lifetime_seconds > max_lifetime_seconds:
+            raise CompositionNotRunnableError(
+                reason="lifetime_exceeds_maximum",
+                detail=f"a shared link can last at most {_describe_lifetime(max_lifetime_seconds)} on this deployment",
+            )
         state_record = await self._session_service.get_current_state(session_id)
         if state_record is None:
             raise CompositionNotRunnableError(
@@ -482,6 +720,12 @@ class ShareableReviewService:
                 detail="composition changed while preparing the review snapshot; retry against the current state",
             )
 
+        frozen_files = (
+            await self._verify_shareable_files(composition_state, session_operation_context=session_operation_context)
+            if allow_import
+            else ()
+        )
+
         snapshot = _build_snapshot(
             session_id=session_id,
             state_record=state_record,
@@ -489,13 +733,26 @@ class ShareableReviewService:
             created_by_user_id=user_id,
             created_by_username=username,
             compartment_id=self._settings.compartment_id,
+            import_allowed=allow_import,
+            files=[frozen.entry for frozen in frozen_files],
         )
 
         # Stamp expiry now so the same value lands in both the audit row
         # and the signed token envelope. The validity period is set at
         # issue-time; the signer's verify() rejects after this point.
-        lifetime = timedelta(seconds=self._settings.shareable_link_lifetime_seconds)
-        expires_at = snapshot.created_at + lifetime
+        # ``get_shareable_link`` re-derives the lifespan from the audit row
+        # (expires_at - created_at), so a re-mint keeps the chosen lifespan.
+        expires_at = snapshot.created_at + timedelta(seconds=lifetime_seconds)
+
+        # Files before the audit row: the row's digest commits to a manifest
+        # whose bytes are already frozen, so no audited share can name a
+        # file the payload store never received.
+        for frozen in frozen_files:
+            stored_file_hex = self._payload_store.store(frozen.content)
+            if stored_file_hex != frozen.entry["sha256"]:
+                raise RuntimeError(
+                    f"payload store returned digest {stored_file_hex} for a frozen share file whose verified sha256 is {frozen.entry['sha256']}"
+                )
 
         # AUDIT FIRST under the exact COMPOSE authority already spanning
         # validation and readiness (a completion event is a write, so the
@@ -584,7 +841,14 @@ class ShareableReviewService:
                 reason="not_marked_ready",
                 detail=_NOT_MARKED_READY_DETAIL,
             )
-        lifetime = timedelta(seconds=self._settings.shareable_link_lifetime_seconds)
+        # Keep the lifespan the owner chose at mark time: a 1-day link must
+        # not be stretched to the deployment maximum by "copy link again".
+        # Clamped to the CURRENT maximum: if the operator lowered the cap
+        # since the mark, the server still never issues a longer link.
+        lifetime = min(
+            event.expires_at - event.created_at,
+            timedelta(seconds=self._settings.shareable_link_lifetime_seconds),
+        )
         created_at = datetime.now(UTC)
         expires_at = created_at + lifetime
         token = self._sign_token(
@@ -623,13 +887,8 @@ class ShareableReviewService:
                 layer maps this to HTTP 404 with a "ask the sender for a
                 fresh link" message.
         """
-        payload = self._signer.verify(token)
-        digest_hex = payload.payload_digest.removeprefix(_DIGEST_PREFIX)
-        blob_bytes = self._payload_store.retrieve(digest_hex)
-        # The payload store has already verified the digest matches —
-        # any tampering on the filesystem path raises IntegrityError
-        # before we get here.
-        blob_dict = self._parse_blob(blob_bytes)
+        payload, snapshot = await self.load_snapshot(token=token)
+        blob_dict = snapshot.blob
         # A valid digest authenticates the immutable evidence blob. Reconstruct
         # the frozen state and project it without rewriting those bytes.
         composition_state = CompositionState.from_dict(blob_dict["composition_snapshot"])
@@ -654,9 +913,163 @@ class ShareableReviewService:
             # the blob is content-addressed and must not carry mint-time data.
             created_at=payload.created_at,
             expires_at=payload.expires_at,
+            import_allowed=snapshot.import_allowed,
+            files=[SharedFileSummary(filename=entry["filename"], size_bytes=entry["size_bytes"]) for entry in snapshot.files],
         )
 
+    async def load_snapshot(self, *, token: str) -> tuple[ShareTokenPayload, ParsedSnapshot]:
+        """Verify ``token`` and return its payload with the parsed frozen snapshot.
+
+        The one loader for every reader of a share (inspect and import).
+
+        Raises:
+            InvalidToken: signature mismatch, malformed envelope, expired,
+                or a snapshot whose shape this release does not read.
+            PayloadNotFoundError: the snapshot blob is no longer stored.
+        """
+        payload = self._signer.verify(token)
+        digest_hex = payload.payload_digest.removeprefix(_DIGEST_PREFIX)
+        blob_bytes = self._payload_store.retrieve(digest_hex)
+        # The payload store has already verified the digest matches —
+        # any tampering on the filesystem path raises IntegrityError
+        # before we get here.
+        return payload, self._parse_blob(blob_bytes)
+
     # ── private helpers ─────────────────────────────────────────────
+
+    async def _inspect_bound_files(
+        self,
+        composition_state: CompositionState,
+        *,
+        session_operation_context: SessionOperationContext,
+        stop_on_refusal: bool,
+    ) -> tuple[list[_InspectedFile], str | None]:
+        """Read each file ``composition_state`` binds once and judge it.
+
+        Returns one ``_InspectedFile`` per distinct blob, in collector order,
+        and a refusal for a binding collection that is itself malformed. The
+        share freeze and the owner's preview both go through here, so they
+        refuse for exactly the same reasons. With ``stop_on_refusal`` the walk
+        ends at the first refused file (the freeze raises on it); without it
+        every file is judged (the preview lists what it can).
+        """
+        try:
+            bound = collect_file_bindings(composition_state)
+        except ShareManifestError as exc:
+            return [], f"a file in this pipeline cannot be shared for import: {exc.detail}"
+        bindings_by_blob: dict[UUID, list[FileBinding]] = {}
+        for item in bound:
+            bindings_by_blob.setdefault(item.blob_id, []).append(item.binding)
+
+        inspected: list[_InspectedFile] = []
+        for blob_id, bindings in bindings_by_blob.items():
+            try:
+                record = await self._blob_service.get_blob(blob_id, session_operation_context=session_operation_context)
+            except BlobNotFoundError:
+                inspected.append(
+                    _InspectedFile(
+                        bindings=bindings,
+                        record=None,
+                        content=None,
+                        refusal=f"the file used by {_binding_site(bindings[0])} no longer exists; reattach it before sharing for import",
+                    )
+                )
+                if stop_on_refusal:
+                    break
+                continue
+            content: bytes | None = None
+            refusal: str | None = None
+            if record.status == "ready":
+                try:
+                    content = await self._blob_service.read_blob_content(blob_id, session_operation_context=session_operation_context)
+                except (BlobNotFoundError, BlobStateError):
+                    refusal = f"'{record.filename}' changed while preparing the share; retry"
+            if refusal is None:
+                refusal = _check_shareable_blob(record, content)
+            inspected.append(_InspectedFile(bindings=bindings, record=record, content=content, refusal=refusal))
+            if refusal is not None and stop_on_refusal:
+                break
+        return inspected, None
+
+    async def preview_shareable_files(
+        self,
+        *,
+        session_id: UUID,
+        session_operation_context: SessionOperationContext,
+    ) -> ShareableFilesResponse:
+        """List the files an importable share of the current state would carry.
+
+        Same refusal rules as ``mark_ready_for_review(allow_import=True)``,
+        reported instead of raised. Reads blobs under the caller's context and
+        stores nothing. The response names no blob id, path or hash.
+        """
+        state_record = await self._session_service.get_current_state(session_id)
+        if state_record is None:
+            return ShareableFilesResponse(files=[], importable=False, not_importable_reason="No composition state exists for this session")
+        inspected, collect_refusal = await self._inspect_bound_files(
+            state_from_record(state_record), session_operation_context=session_operation_context, stop_on_refusal=False
+        )
+        reason = collect_refusal
+        views: dict[str, ShareableFileView] = {}
+        for item in inspected:
+            if item.refusal is not None and reason is None:
+                reason = item.refusal
+            if item.record is None:
+                continue
+            # Identical bytes travel as one file, so list them once.
+            key = item.record.content_hash if item.record.content_hash is not None else str(item.record.id)
+            view = views.setdefault(key, ShareableFileView(filename=item.record.filename, size_bytes=item.record.size_bytes, used_by=[]))
+            for binding in item.bindings:
+                label = _describe_use(binding)
+                if label not in view.used_by:
+                    view.used_by.append(label)
+        return ShareableFilesResponse(files=list(views.values()), importable=reason is None, not_importable_reason=reason)
+
+    async def _verify_shareable_files(
+        self,
+        composition_state: CompositionState,
+        *,
+        session_operation_context: SessionOperationContext,
+    ) -> tuple[_FrozenFile, ...]:
+        """Read and verify every file ``composition_state`` uses, once per blob.
+
+        Raises ``CompositionNotRunnableError(reason="file_not_shareable")``
+        naming the first file that cannot travel. Stores nothing: the caller
+        stores the returned bytes only after every file has passed.
+
+        Two blobs with identical bytes share one content address, so they
+        become one manifest entry carrying both blobs' binding sites; the
+        first blob's filename and MIME type name it.
+        """
+        inspected, collect_refusal = await self._inspect_bound_files(
+            composition_state, session_operation_context=session_operation_context, stop_on_refusal=True
+        )
+        if collect_refusal is not None:
+            raise CompositionNotRunnableError(reason="file_not_shareable", detail=collect_refusal)
+        frozen_by_sha: dict[str, _FrozenFile] = {}
+        for item in inspected:
+            if item.refusal is not None:
+                raise CompositionNotRunnableError(reason="file_not_shareable", detail=item.refusal)
+            record, content, bindings = item.record, item.content, item.bindings
+            # No refusal, so the bytes were read and match the row's
+            # non-null content_hash.
+            if record is None or content is None or record.content_hash is None:
+                raise RuntimeError("_inspect_bound_files passed a blob without verified content")
+            binding_json = [file_binding_to_json(binding) for binding in bindings]
+            if record.content_hash in frozen_by_sha:
+                frozen_by_sha[record.content_hash].entry["bindings"].extend(binding_json)
+                continue
+            frozen_by_sha[record.content_hash] = _FrozenFile(
+                content=content,
+                entry={
+                    "sha256": record.content_hash,
+                    "size_bytes": record.size_bytes,
+                    "filename": record.filename,
+                    "mime_type": record.mime_type,
+                    "bindings": binding_json,
+                },
+            )
+        return tuple(frozen_by_sha[sha] for sha in sorted(frozen_by_sha))
 
     def _latest_mark_ready_event(self, *, session_id: UUID, state_id: UUID, user_id: str) -> Any | None:
         """Return the latest committed mark-ready event for this exact state."""
@@ -697,23 +1110,39 @@ class ShareableReviewService:
         )
 
     @staticmethod
-    def _parse_blob(blob_bytes: bytes) -> _BlobShape:
-        """Decode the canonical-JSON blob back to the typed wire shape.
+    def _parse_blob(blob_bytes: bytes) -> ParsedSnapshot:
+        """Decode the canonical-JSON blob back to the typed snapshot.
 
         Tier-1 input: the blob came out of OUR payload store, integrity
         verified by digest. Any decode failure here is a corruption event.
-        The current release accepts only the producer's exact key set. A
-        signed token for an older blob shape does not enable a fallback reader.
+        Exactly two closed key sets are read: the current nine-key shape,
+        and the previous release's seven-key shape, which predates the
+        import opt-in and so reads as view-only with no files. Any other key
+        set — including a partial or half-upgraded shape — is refused.
         """
         try:
             parsed = json.loads(blob_bytes.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise InvalidToken("share snapshot decode failed") from exc
-        if type(parsed) is not dict or frozenset(parsed) != _BLOB_KEYS:
+        if type(parsed) is not dict:
+            raise InvalidToken("unsupported share snapshot shape")
+        keys = frozenset(parsed)
+        if keys == _LEGACY_BLOB_KEYS:
+            import_allowed = False
+            files: tuple[ShareFileEntry, ...] = ()
+        elif keys == _BLOB_KEYS:
+            import_allowed = parsed["import_allowed"]
+            if type(import_allowed) is not bool:
+                raise InvalidToken("share snapshot import flag is invalid")
+            files = _parse_file_manifest(parsed["files"])
+            if not import_allowed and files:
+                raise InvalidToken("view-only share snapshot carries a file manifest")
+        else:
             raise InvalidToken("unsupported share snapshot shape")
         if type(parsed["created_by_username"]) is not str or not parsed["created_by_username"].strip():
             raise InvalidToken("share snapshot username is invalid")
         compartment_id = parsed["compartment_id"]
         if compartment_id is not None and not is_compartment_id(compartment_id):
             raise InvalidToken("share snapshot compartment is invalid")
-        return cast(_BlobShape, parsed)
+        blob = cast(_BlobShape, {key: parsed[key] for key in _LEGACY_BLOB_KEYS})
+        return ParsedSnapshot(blob=blob, import_allowed=import_allowed, files=files)

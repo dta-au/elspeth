@@ -22,6 +22,7 @@ export default tseslint.config(
       "tests/e2e/composer-workspace-*.spec.ts",
       "tests/e2e/composer-workspace.visual.spec.ts",
       "tests/e2e/composer-reflow.spec.ts",
+      "tests/e2e/shared-graph-import.spec.ts",
       "tests/e2e/helpers/api.ts",
       "tests/e2e/helpers/workspace-*.ts",
       "tests/e2e/page-objects/composer-page.ts",
