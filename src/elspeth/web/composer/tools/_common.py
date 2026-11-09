@@ -178,10 +178,10 @@ _AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELDS_TEXT: Final[str] = (
     + ", with optional display_title (a non-empty string of at most 200 characters)"
 )
 _INTERPRETATION_REVIEW_FOLLOWUP: Final[str] = (
-    "When request_interpretation_review is offered, call it for an authorable staged site. "
-    "On a proposal-only surface, include pending requirements in the complete proposal instead. "
-    "Backend-owned review kinds are surfaced automatically. The user resolves "
-    "the card and ELSPETH writes resolved review metadata."
+    "Author only vague_term and registered pipeline_decision rows; never author invented_source, "
+    "llm_prompt_template, llm_model_choice or source_data_contract rows, which the server stages. "
+    "Where request_interpretation_review is offered, call it as the review ownership rules direct; on a "
+    "proposal-only surface the rows you author ride in the proposal and there is no review call."
 )
 _INTERPRETATION_REQUIREMENTS_OWNERSHIP_SCHEMA_NOTE: Final[str] = (
     " Inside interpretation_requirements, only "
@@ -189,10 +189,10 @@ _INTERPRETATION_REQUIREMENTS_OWNERSHIP_SCHEMA_NOTE: Final[str] = (
     + " are authorable. display_title is a concise human-readable approval name. "
     "Resolver-owned fields are not settable: "
     + ", ".join(sorted(_RESOLVER_OWNED_INTERPRETATION_REQUIREMENT_FIELDS))
-    + ". Omit those fields. On incremental surfaces, persist an authorable pending review with the offered mutation tool "
-    "and call request_interpretation_review when offered. On a proposal-only surface, include the pending requirements "
-    "in the appropriate source/node options of the complete proposal instead. Backend-owned review kinds are surfaced automatically. "
-    "The user resolves the card and ELSPETH writes resolved review metadata."
+    + ". Omit those fields. Author only vague_term and registered pipeline_decision rows; never author "
+    "invented_source, llm_prompt_template, llm_model_choice or source_data_contract rows, which the server stages. "
+    "Where request_interpretation_review is offered, call it as the review ownership rules direct; on a "
+    "proposal-only surface the rows you author ride in the proposal and there is no review call."
 )
 _LLM_OPTIONS_OWNERSHIP_SCHEMA_NOTE: Final[str] = (
     " Runtime-owned LLM option fields are not settable: "

@@ -400,9 +400,10 @@ _SOURCE_CUSTODY_RULES: Final[tuple[str, ...]] = (
     # placeholder content' — a provenance inversion in an audit-grade tool.
     "Content YOU fabricated at the user's request ('make up N rows', "
     "'invent sample complaints') is planner-authored, not discovered: bind "
-    "it via inline_blob, stage the invented_source interpretation review, "
-    "and narrate it in FIRST PERSON — 'I generated this content as you "
+    "it via inline_blob and narrate it in FIRST PERSON — 'I generated this content as you "
     "asked' — never as something 'the system' produced or you found. "
+    "The server stages the invented_source review from the bound bytes; "
+    "never author that row. "
     "Reading a blob you authored this turn back through get_blob_content or read_attachment "
     "does not make its content external.",
 )
@@ -462,9 +463,9 @@ _FORK_COALESCE_RULES: Final[tuple[str, ...]] = (
     "Do not author interpretation_requirements rows for llm_prompt_template "
     "or llm_model_choice — required LLM reviews auto-stage on every llm "
     "node. Author rows only for the planner-owned kinds (vague_term wired "
-    "via prompt_template_parts, registered pipeline_decision, "
-    "invented_source), each in the short form {kind, user_term, draft} with "
-    "user_term mandatory.",
+    "via prompt_template_parts, and registered pipeline_decision), each in "
+    "the short form {kind, user_term, draft} with user_term mandatory. "
+    "Never author invented_source: the server stages it.",
     "Composer-authored coalesces support policy require_all, best_effort "
     "(requires timeout_seconds), or first, and merge union or nested. Engine "
     "quorum/select require fields this surface cannot author. Use best_effort "
@@ -930,8 +931,9 @@ _REVIEW_REGISTRY_RULES: Final[tuple[str, ...]] = (
     "the draft's provenance, not whether the row is staged.",
     "Do not author rows for llm_prompt_template or llm_model_choice — "
     "required LLM reviews auto-stage on every llm node. The planner-owned "
-    "kinds are vague_term (wired via prompt_template_parts), registered "
-    "pipeline_decision, and invented_source.",
+    "kinds are vague_term (wired via prompt_template_parts) and registered "
+    "pipeline_decision. Never author invented_source: the server stages "
+    "it when it binds source rows you generated.",
     "Only the llm_prompt_template review auto-surfaces through ordinary "
     "no-tool finalization at TURN END against the final frozen pipeline "
     "skeleton — an "
@@ -2253,8 +2255,8 @@ def fork_coalesce_exemplar_args(
             "schema": {"mode": "observed"},
             # llm_prompt_template and llm_model_choice reviews are backend
             # auto-staged on every llm node — never hand-authored. Planner-
-            # owned kinds (vague_term, registered pipeline_decision,
-            # invented_source) ARE authored when the node calls for them:
+            # owned kinds (vague_term, registered pipeline_decision) ARE
+            # authored when the node calls for them:
             # the urgency branch below authors category semantics and must
             # stage its own wired vague_term review (run-3 E6: an exemplar
             # demonstrating an un-reviewed classification was imported as

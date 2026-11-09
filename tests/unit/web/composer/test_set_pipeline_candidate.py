@@ -2086,10 +2086,11 @@ def _semantic_failure_cases(tmp_path: Path) -> list[tuple[str, dict[str, Any], T
             "Node 'classify': set_pipeline options.interpretation_requirements[0] includes resolver-owned status "
             "'resolved'. Composer tool input may stage pending review requirements only. Omit resolver-owned fields "
             "and retry set_pipeline with exactly kind, user_term, and draft, with optional display_title "
-            "(a non-empty string of at most 200 characters). When request_interpretation_review is offered, "
-            "call it for an authorable staged site. On a proposal-only surface, include pending requirements "
-            "in the complete proposal instead. Backend-owned review kinds are surfaced automatically. The user resolves "
-            "the card and ELSPETH writes resolved review metadata.",
+            "(a non-empty string of at most 200 characters). Author only vague_term and registered "
+            "pipeline_decision rows; never author invented_source, llm_prompt_template, llm_model_choice or "
+            "source_data_contract rows, which the server stages. Where request_interpretation_review is offered, "
+            "call it as the review ownership rules direct; on a proposal-only surface the rows you author ride in "
+            "the proposal and there is no review call.",
             "interpretation_requirements_invalid",
         ),
     ]
