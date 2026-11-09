@@ -4,7 +4,7 @@ import asyncio
 import json
 import re
 from dataclasses import replace
-from typing import Annotated, Final, NotRequired, TypedDict
+from typing import Annotated, NotRequired, TypedDict
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -22,7 +22,8 @@ from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.schemas import PluginKind
 from elspeth.web.compartments import compartment_ingress_record, compartment_marking_header
 from elspeth.web.composer.invariants import InvariantError
-from elspeth.web.composer.state import SOURCE_AUTHORING_KEY, CompositionState, NodeSpec, OutputSpec, SourceSpec
+from elspeth.web.composer.state import CompositionState, SourceSpec
+from elspeth.web.composer.tools.blobs import _apply_inline_blob_marker, _llm_authored_prompt_surface_error
 from elspeth.web.composer.yaml_generator import (
     PUBLIC_EXPORT_REBIND_GUIDANCE,
     PUBLIC_EXPORT_REDACTED_SOURCE_MARKER_PREFIX,
@@ -550,24 +551,13 @@ async def _state_with_imported_source_blobs(
             raise HTTPException(status_code=400, detail=f"source_blob_ids.{source_name} must be a UUID") from exc
         requested_blobs.append((source_name, blob_id))
 
-    blob_service = request.app.state.blob_service
-    if blob_service is None:
-        raise HTTPException(status_code=409, detail="Blob service unavailable for YAML import")
-
     for source_name, blob_id in requested_blobs:
-        try:
-            blob = await blob_service.get_blob(blob_id, session_operation_context=session_operation_context)
-        except BlobNotFoundError:
-            raise HTTPException(status_code=404, detail="Blob not found") from None
-        if blob.session_id != session_id:
-            raise HTTPException(status_code=404, detail="Blob not found")
-        # Ownership first so a missing blob and another session's blob stay
-        # indistinguishable (404). A pending or error blob has no settled
-        # bytes to bind: the export side of this round trip and the blob
-        # download/preview routes already refuse a non-ready blob.
-        if blob.status != "ready":
-            raise HTTPException(status_code=409, detail="Blob is not ready")
-
+        blob = await _ready_import_blob(
+            blob_id,
+            request=request,
+            session_id=session_id,
+            session_operation_context=session_operation_context,
+        )
         source = sources[source_name]
         options = dict(source.options)
         for key in SOURCE_LOCAL_PATH_OPTION_KEYS:
@@ -593,11 +583,6 @@ async def _state_with_imported_source_blobs(
     )
 
 
-# Source option roots the server writes from session records (the composer's
-# set_source_from_blob(s) tools refuse them as wire targets too).
-_SERVER_OWNED_SOURCE_ROOTS: Final = frozenset({"blob_ref", "blobs", SOURCE_AUTHORING_KEY})
-
-
 class _SourceBlobRowsEntry(TypedDict):
     """One ``blob_rows`` file entry, in ``_resolve_source_blobs``'s shape."""
 
@@ -621,11 +606,13 @@ async def _ready_import_blob(
     request: Request,
     session_id: UUID,
     session_operation_context: SessionOperationContext,
-) -> tuple[BlobRecord, str]:
-    """Return this session's ready blob and its content hash, refusing as the source re-bind does.
+) -> BlobRecord:
+    """Return this session's ready blob; the one fetch-and-check every import re-bind uses.
 
-    A missing blob and another session's blob are indistinguishable (404); a
-    pending or errored blob has no settled bytes to bind (409).
+    Ownership first so a missing blob and another session's blob stay
+    indistinguishable (404). A pending or error blob has no settled bytes to
+    bind (409): the export side of this round trip and the blob
+    download/preview routes already refuse a non-ready blob.
     """
     blob_service = request.app.state.blob_service
     if blob_service is None:
@@ -638,77 +625,13 @@ async def _ready_import_blob(
         raise HTTPException(status_code=404, detail="Blob not found")
     if blob.status != "ready":
         raise HTTPException(status_code=409, detail="Blob is not ready")
+    return blob
+
+
+def _ready_blob_content_hash(blob: BlobRecord) -> str:
     if blob.content_hash is None:
         raise AuditIntegrityError(f"Ready blob '{blob.id}' has no canonical content hash")
-    return blob, blob.content_hash
-
-
-def _with_inline_marker[SpecT: (SourceSpec, NodeSpec, OutputSpec)](
-    spec: SpecT,
-    keys: list[str],
-    marker: dict[str, str],
-    *,
-    field_path: str,
-) -> SpecT:
-    """``spec`` with ``marker`` at ``keys`` inside a thawed copy of its options.
-
-    Missing intermediate mappings are created. A value already at the leaf,
-    or a non-mapping value on the way to it, is refused: re-binding fills a
-    removed marker's slot and never overwrites what the graph carries.
-    """
-    patched = deep_thaw(spec.options)
-    container = patched
-    for key in keys[:-1]:
-        if key not in container:
-            container[key] = {}
-        child = container[key]
-        if type(child) is not dict:
-            raise HTTPException(
-                status_code=400,
-                detail=f"inline_blob_bindings path '{field_path}' crosses option '{key}', which is not an object",
-            )
-        container = child
-    if keys[-1] in container:
-        raise HTTPException(
-            status_code=400,
-            detail=f"inline_blob_bindings path '{field_path}' already holds a value; a file can only fill an empty option",
-        )
-    container[keys[-1]] = marker
-    return replace(spec, options=patched)
-
-
-def _state_with_inline_marker(state: CompositionState, ref: BlobInlineRef, marker: dict[str, str]) -> CompositionState:
-    prefix, _separator, rest = ref.field_path.partition(".options.")
-    keys = rest.split(".")
-    if prefix == "source" or prefix.startswith("source:"):
-        source_name = "source" if prefix == "source" else prefix.removeprefix("source:")
-        if source_name not in state.sources:
-            raise HTTPException(status_code=400, detail=f"inline_blob_bindings references unknown source '{source_name}'")
-        if keys[0] in _SERVER_OWNED_SOURCE_ROOTS:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"inline_blob_bindings path '{ref.field_path}' targets server-owned source option '{keys[0]}'; "
-                    "bind source files with source_blob_ids or source_blob_rows"
-                ),
-            )
-        source = _with_inline_marker(state.sources[source_name], keys, marker, field_path=ref.field_path)
-        return replace(state, sources={**state.sources, source_name: source})
-    if prefix.startswith("node:"):
-        node_id = prefix.removeprefix("node:")
-        node_index = next((index for index, node in enumerate(state.nodes) if node.id == node_id), None)
-        if node_index is None:
-            raise HTTPException(status_code=400, detail=f"inline_blob_bindings references unknown node '{node_id}'")
-        node = _with_inline_marker(state.nodes[node_index], keys, marker, field_path=ref.field_path)
-        nodes = (*state.nodes[:node_index], node, *state.nodes[node_index + 1 :])
-        return replace(state, nodes=nodes)
-    output_name = prefix.removeprefix("output:")
-    output_index = next((index for index, output in enumerate(state.outputs) if output.name == output_name), None)
-    if output_index is None:
-        raise HTTPException(status_code=400, detail=f"inline_blob_bindings references unknown output '{output_name}'")
-    output = _with_inline_marker(state.outputs[output_index], keys, marker, field_path=ref.field_path)
-    outputs = (*state.outputs[:output_index], output, *state.outputs[output_index + 1 :])
-    return replace(state, outputs=outputs)
+    return blob.content_hash
 
 
 async def _state_with_imported_inline_blobs(
@@ -723,8 +646,13 @@ async def _state_with_imported_inline_blobs(
 
     Each marker is rebuilt in the canonical writer's shape
     (``wire_blob_inline_ref``) from this session's blob record, so its
-    ``sha256`` is the copy's own content hash. The version is unchanged: this
-    completes the imported graph, it is not an edit of it.
+    ``sha256`` is the copy's own content hash. This request field is also
+    open to the ordinary pasted-YAML route, so it is a second write path for
+    inline markers: it refuses everything the canonical writer refuses by
+    running the writer's own checks (``_llm_authored_prompt_surface_error``
+    and ``_apply_inline_blob_marker``), and additionally refuses an occupied
+    leaf. The version is unchanged: this completes the imported graph, it is
+    not an edit of it.
     """
     if not inline_blob_bindings:
         return state
@@ -734,12 +662,13 @@ async def _state_with_imported_inline_blobs(
         for field_path, binding in inline_blob_bindings.items()
     ]
     for field_path, blob_id, encoding in requested:
-        blob, content_hash = await _ready_import_blob(
+        blob = await _ready_import_blob(
             blob_id,
             request=request,
             session_id=session_id,
             session_operation_context=session_operation_context,
         )
+        content_hash = _ready_blob_content_hash(blob)
         try:
             ref = BlobInlineRef(field_path=field_path, blob_id=blob.id, sha256=content_hash, encoding=encoding)
         except ValueError:
@@ -750,10 +679,22 @@ async def _state_with_imported_inline_blobs(
                     "(source:<name>.options.<field>, node:<id>.options.<field> or output:<name>.options.<field>)"
                 ),
             ) from None
+        prompt_surface_error = _llm_authored_prompt_surface_error(
+            state,
+            ref.field_path,
+            blob_id=blob.id,
+            creation_modality=blob.creation_modality,
+        )
+        if prompt_surface_error is not None:
+            raise HTTPException(status_code=400, detail=prompt_surface_error)
         marker = {"blob_ref": str(blob.id), "mode": "inline_content", "sha256": content_hash}
         if encoding != "utf-8":
             marker["encoding"] = encoding
-        state = _state_with_inline_marker(state, ref, marker)
+        try:
+            rebound = _apply_inline_blob_marker(state, ref.field_path, marker, replace_existing=False)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=f"inline_blob_bindings path '{field_path}': {exc}") from None
+        state = replace(rebound, version=state.version)
     return state
 
 
@@ -795,12 +736,13 @@ async def _state_with_imported_source_blob_rows(
         entries: list[_SourceBlobRowsEntry] = []
         seen_hashes: set[str] = set()
         for blob_id in blob_ids:
-            blob, content_hash = await _ready_import_blob(
+            blob = await _ready_import_blob(
                 blob_id,
                 request=request,
                 session_id=session_id,
                 session_operation_context=session_operation_context,
             )
+            content_hash = _ready_blob_content_hash(blob)
             if content_hash in seen_hashes:
                 raise HTTPException(
                     status_code=400,

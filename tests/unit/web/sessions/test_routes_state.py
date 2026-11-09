@@ -3857,6 +3857,55 @@ sinks:
 """
 
 
+_REBIND_GATE_YAML = """
+sources:
+  source:
+    plugin: csv
+    on_success: gate_in
+    on_validation_failure: discard
+    options:
+      schema:
+        mode: observed
+gates:
+  - name: threshold
+    input: gate_in
+    condition: row['amount'] > 500
+    routes:
+      true: high
+      false: standard
+sinks:
+  high:
+    plugin: json
+    on_write_failure: discard
+  standard:
+    plugin: json
+    on_write_failure: discard
+"""
+
+_REBIND_LLM_YAML = """
+sources:
+  source:
+    plugin: csv
+    on_success: score
+    on_validation_failure: discard
+    options:
+      schema:
+        mode: observed
+transforms:
+- name: score
+  plugin: llm
+  input: source
+  on_success: main
+  on_error: discard
+  options:
+    model: anthropic/claude-haiku-4.5
+sinks:
+  main:
+    plugin: json
+    on_write_failure: discard
+"""
+
+
 def _hashed_blob(
     *,
     blob_id: uuid.UUID,
@@ -4115,6 +4164,123 @@ class TestImportRebindsSharedFiles:
 
         assert resp.status_code == 400, resp.text
         assert "blob_rows" in resp.json()["detail"]
+        assert await service.get_current_state(session.id) is None
+
+    @pytest.mark.asyncio
+    async def test_import_rebinds_inline_marker_on_a_source(self, tmp_path: Path) -> None:
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session = await service.create_session("alice", "Rebind", "local")
+        blob = _hashed_blob(blob_id=uuid.uuid4(), session_id=session.id, content_hash=_REBIND_DIGEST_A)
+        app.state.blob_service = _blob_service_for(blob)
+
+        with patch("elspeth.web.sessions.routes.composer.state._runtime_preflight_for_state", side_effect=_rebind_preflight):
+            resp = client.post(
+                f"/api/sessions/{session.id}/state/yaml",
+                json={
+                    "yaml": _REBIND_NODE_YAML,
+                    "inline_blob_bindings": {"source:source.options.lookup.doc": {"blob_id": str(blob.id)}},
+                },
+            )
+
+        assert resp.status_code == 200, resp.text
+        record = await service.get_current_state(session.id)
+        assert record is not None
+        assert record.sources["source"]["options"]["lookup"] == {
+            "doc": {"blob_ref": str(blob.id), "mode": "inline_content", "sha256": _REBIND_DIGEST_A}
+        }
+        # Re-binding completes the imported graph; it is not an edit of it.
+        assert record.version == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("yaml_text", "field_path", "expected_detail"),
+        [
+            (
+                _REBIND_GATE_YAML,
+                "node:threshold.options.doc",
+                "Inline blob references can only be wired into source, transform, aggregation, collector, or output plugin options.",
+            ),
+            (
+                _REBIND_NODE_YAML,
+                "node:lookup.options.interpretation_requirements.doc",
+                "wire_blob_inline_ref cannot write node interpretation_requirements",
+            ),
+            (
+                _REBIND_NODE_YAML,
+                "source:source.options.interpretation_requirements.doc",
+                "wire_blob_inline_ref cannot write source interpretation_requirements",
+            ),
+            (
+                _REBIND_NODE_YAML,
+                "output:main.options.interpretation_requirements.doc",
+                "wire_blob_inline_ref cannot write output interpretation_requirements",
+            ),
+            (
+                _REBIND_LLM_YAML,
+                "node:score.options.approved_prompt_artifact_hash",
+                "targets runtime-owned top-level LLM option 'approved_prompt_artifact_hash'",
+            ),
+        ],
+        ids=[
+            "gate-node",
+            "node-interpretation-requirements",
+            "source-interpretation-requirements",
+            "output-interpretation-requirements",
+            "llm-runtime-owned-hash",
+        ],
+    )
+    async def test_import_inline_binding_refuses_what_the_canonical_writer_refuses(
+        self,
+        tmp_path: Path,
+        yaml_text: str,
+        field_path: str,
+        expected_detail: str,
+    ) -> None:
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session = await service.create_session("alice", "Rebind", "local")
+        blob = _hashed_blob(blob_id=uuid.uuid4(), session_id=session.id, content_hash=_REBIND_DIGEST_A)
+        app.state.blob_service = _blob_service_for(blob)
+
+        with patch("elspeth.web.sessions.routes.composer.state._runtime_preflight_for_state", side_effect=_rebind_preflight):
+            resp = client.post(
+                f"/api/sessions/{session.id}/state/yaml",
+                json={"yaml": yaml_text, "inline_blob_bindings": {field_path: {"blob_id": str(blob.id)}}},
+            )
+
+        assert resp.status_code == 400, resp.text
+        assert expected_detail in resp.json()["detail"]
+        assert await service.get_current_state(session.id) is None
+
+    @pytest.mark.asyncio
+    async def test_import_inline_binding_refuses_llm_authored_blob_on_prompt_surface(self, tmp_path: Path) -> None:
+        from dataclasses import replace as dataclass_replace
+
+        from elspeth.contracts.enums import CreationModality
+
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session = await service.create_session("alice", "Rebind", "local")
+        blob = dataclass_replace(
+            _hashed_blob(blob_id=uuid.uuid4(), session_id=session.id, content_hash=_REBIND_DIGEST_A),
+            creation_modality=CreationModality.LLM_GENERATED,
+        )
+        app.state.blob_service = _blob_service_for(blob)
+
+        with patch("elspeth.web.sessions.routes.composer.state._runtime_preflight_for_state", side_effect=_rebind_preflight):
+            resp = client.post(
+                f"/api/sessions/{session.id}/state/yaml",
+                json={
+                    "yaml": _REBIND_LLM_YAML,
+                    "inline_blob_bindings": {"node:score.options.prompt_template": {"blob_id": str(blob.id)}},
+                },
+            )
+
+        assert resp.status_code == 400, resp.text
+        assert resp.json()["detail"].startswith(
+            f"wire_blob_inline_ref cannot wire LLM-authored blob '{blob.id}' into LLM node 'score' option 'prompt_template'"
+        )
         assert await service.get_current_state(session.id) is None
 
     @pytest.mark.asyncio

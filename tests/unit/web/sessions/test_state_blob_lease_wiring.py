@@ -80,12 +80,27 @@ def test_state_import_owns_one_compose_lease_and_threads_its_context() -> None:
         helper_name="_state_with_imported_source_blobs",
     )
 
-    helper = _function(tree, "_state_with_imported_source_blobs")
-    context_arg = helper.args.kwonlyargs[-1]
-    assert context_arg.arg == "session_operation_context"
-    assert helper.args.kw_defaults[-1] is None
+    # Every import re-bind (source_blob_ids, inline_blob_bindings,
+    # source_blob_rows) threads the lease context into the one shared
+    # fetch-and-check, which owns the single get_blob call.
+    for rebind_helper in (
+        "_state_with_imported_source_blobs",
+        "_state_with_imported_inline_blobs",
+        "_state_with_imported_source_blob_rows",
+    ):
+        helper = _function(tree, rebind_helper)
+        context_arg = helper.args.kwonlyargs[-1]
+        assert context_arg.arg == "session_operation_context"
+        assert helper.args.kw_defaults[-1] is None
+        assert _calls(helper, "get_blob") == []
+        fetches = _calls(helper, "_ready_import_blob")
+        assert len(fetches) == 1
+        assert ast.unparse(_keyword(fetches[0], "session_operation_context")) == "session_operation_context"
+    helper = _function(tree, "_ready_import_blob")
+    assert helper.args.kwonlyargs[-1].arg == "session_operation_context"
     get_blob_calls = _calls(helper, "get_blob")
     assert len(get_blob_calls) == 1
+    assert ast.unparse(_keyword(get_blob_calls[0], "session_operation_context")) == "session_operation_context"
     # The blob layer is HEAD's (open decision 1 on elspeth-4d6c0dd0f5):
     # get_blob takes no session_operation_context; the helper still receives
     # and owns the route's exact context for its session-side writes.
