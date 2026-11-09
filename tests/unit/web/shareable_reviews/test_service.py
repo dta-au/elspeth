@@ -2690,3 +2690,88 @@ async def test_mark_ready_with_import_stores_files_before_the_audit_row(
         )
 
     assert _completion_rows(session_engine_with_row, session_record.id) == []
+
+
+@pytest.mark.asyncio
+async def test_get_shareable_link_clamps_to_a_lowered_maximum(
+    session_engine_with_row,
+    payload_store,
+    signer,
+    session_record,
+    state_record,
+    session_operation_context: SessionOperationContext,
+):
+    """A re-mint never issues a link longer than the current maximum."""
+    settings = _FakeSettings(shareable_link_lifetime_seconds=2592000)
+    service, *_ = _build_service(
+        engine=session_engine_with_row,
+        payload_store=payload_store,
+        signer=signer,
+        session_record=session_record,
+        state_record=state_record,
+        validation=_ok_validation(),
+        readiness=_readiness_snapshot(session_record.id),
+        settings=settings,
+    )
+    await service.mark_ready_for_review(
+        session_id=session_record.id,
+        user_id=session_record.user_id,
+        username=_OWNER_USERNAME,
+        session_operation_context=session_operation_context,
+        lifetime_seconds=2592000,
+    )
+    settings.shareable_link_lifetime_seconds = 604800
+
+    before = datetime.now(UTC)
+    reminted = await service.get_shareable_link(session_id=session_record.id, user_id=session_record.user_id)
+    after = datetime.now(UTC)
+
+    assert before + timedelta(seconds=604800) <= reminted.expires_at <= after + timedelta(seconds=604800)
+    payload = signer.verify(reminted.token)
+    assert payload.expires_at - payload.created_at == timedelta(seconds=604800)
+
+
+@pytest.mark.asyncio
+async def test_mark_ready_view_only_still_works_with_llm_authored_file(
+    session_engine_with_row,
+    payload_store,
+    signer,
+    session_record,
+    state_record,
+    session_operation_context: SessionOperationContext,
+):
+    """Assistant-written files only block import; a view-only share is unaffected."""
+    blob_service = _FakeBlobService()
+    user_blob = blob_service.add(session_record.id, filename="customers.csv", content=b"id\n1\n")
+    llm_blob = blob_service.add(
+        session_record.id,
+        filename="notes.txt",
+        content=b"assistant wrote this\n",
+        mime_type="text/plain",
+        creation_modality=CreationModality.LLM_GENERATED,
+    )
+    service, *_ = _build_service(
+        engine=session_engine_with_row,
+        payload_store=payload_store,
+        signer=signer,
+        session_record=session_record,
+        state_record=_file_bound_state(state_record, source_blob=user_blob, node_value=_inline_marker(llm_blob)),
+        validation=_ok_validation(),
+        readiness=_readiness_snapshot(session_record.id),
+        blob_service=blob_service,
+    )
+
+    response = await service.mark_ready_for_review(
+        session_id=session_record.id,
+        user_id=session_record.user_id,
+        username=_OWNER_USERNAME,
+        session_operation_context=session_operation_context,
+        allow_import=False,
+    )
+
+    blob = _stored_snapshot(payload_store, response.payload_digest)
+    assert blob["import_allowed"] is False
+    assert blob["files"] == []
+    assert blob_service.contexts == []
+    assert blob_service.reads == []
+    assert len(_completion_rows(session_engine_with_row, session_record.id)) == 1

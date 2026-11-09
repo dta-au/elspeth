@@ -819,7 +819,12 @@ class ShareableReviewService:
             )
         # Keep the lifespan the owner chose at mark time: a 1-day link must
         # not be stretched to the deployment maximum by "copy link again".
-        lifetime = event.expires_at - event.created_at
+        # Clamped to the CURRENT maximum: if the operator lowered the cap
+        # since the mark, the server still never issues a longer link.
+        lifetime = min(
+            event.expires_at - event.created_at,
+            timedelta(seconds=self._settings.shareable_link_lifetime_seconds),
+        )
         created_at = datetime.now(UTC)
         expires_at = created_at + lifetime
         token = self._sign_token(
