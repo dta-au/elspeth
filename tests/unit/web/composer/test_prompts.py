@@ -1010,7 +1010,7 @@ class TestBuildSystemPrompt:
             "Do not call `request_interpretation_review` or tell the user review cards are waiting while the latest mutation reports non-review validation errors"
             in flattened
         )
-        assert "repair the topology first, then surface the review cards" in flattened
+        assert "Repair the topology first, then surface the review cards from the repaired state" in flattened
         assert "Review acceptance is not required before adding a missing schema-proven cleanup transform" in flattened
         assert "Do not treat a subset of pending review cards as enough" in flattened
         assert "missing `vague_term` or prompt-injection recommendation review is still non-terminal" in flattened
