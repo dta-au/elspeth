@@ -85,8 +85,8 @@ from elspeth.web.composer.tools._common import (
     review_reconciliation_failure_message,
 )
 from elspeth.web.composer.tools.blobs import (
+    _BLOB_ID_UUID_ERROR,
     BlobToolRecord,
-    _blob_id_uuid_validation_error,
     _blob_row_to_tool_dict,
     _locked_read_ready_blob,
     _PreparedBlobCreate,
@@ -107,6 +107,7 @@ from elspeth.web.interpretation_state import (
 from elspeth.web.provider_config_policy import (
     web_aws_s3_endpoint_url_policy_error,
 )
+from elspeth.web.resource_identity import canonical_resource_uuid
 from elspeth.web.sessions.models import blobs_table
 
 _INSPECT_SOURCE_MAX_BYTES = 8 * 1024
@@ -840,9 +841,10 @@ def _resolve_source_blob(
         return _failure_result(state, manual_blobs_error, error_code="plugin_options_invalid")
     if session_engine is None or session_id is None:
         return _failure_result(state, "Blob tools require session context.", error_code="source_binding_context_unavailable")
-    blob_id_error = _blob_id_uuid_validation_error(blob_id)
-    if blob_id_error is not None:
-        return _failure_result(state, blob_id_error, error_code="source_blob_identity_invalid")
+    selector = canonical_resource_uuid(blob_id)
+    if selector is None:
+        return _failure_result(state, _BLOB_ID_UUID_ERROR, error_code="source_blob_identity_invalid")
+    blob_id = selector
     blob = _sync_get_blob(session_engine, blob_id, session_id)
     if blob is None:
         return _failure_result(state, f"Blob '{blob_id}' not found.", error_code="source_blob_unavailable")
@@ -1387,13 +1389,13 @@ def _resolve_source_blobs(
             rejected_component=_source_component_id(source_name),
         )
     seen_ids: set[str] = set()
+    canonical_ids: list[str] = []
     for blob_id in blob_ids:
-        blob_id_error = _blob_id_uuid_validation_error(blob_id)
-        if blob_id_error is not None:
+        normalized = canonical_resource_uuid(blob_id)
+        if normalized is None:
             return _saved_graph_rejection_result(
-                state, blob_id_error, error_code="source_blob_identity_invalid", rejected_component=_source_component_id(source_name)
+                state, _BLOB_ID_UUID_ERROR, error_code="source_blob_identity_invalid", rejected_component=_source_component_id(source_name)
             )
-        normalized = blob_id.lower()
         if normalized in seen_ids:
             return _saved_graph_rejection_result(
                 state,
@@ -1402,11 +1404,12 @@ def _resolve_source_blobs(
                 rejected_component=_source_component_id(source_name),
             )
         seen_ids.add(normalized)
+        canonical_ids.append(normalized)
 
     entries: list[dict[str, Any]] = []
     payloads: list[SourceBlobPayload] = []
     seen_hashes: dict[str, str] = {}
-    for blob_id in blob_ids:
+    for blob_id in canonical_ids:
         blob = _sync_get_blob(session_engine, blob_id, session_id)
         if blob is None:
             return _saved_graph_rejection_result(
@@ -1913,10 +1916,9 @@ def _execute_inspect_source(
             category=ToolArgumentErrorCategory.MODEL_VALIDATION,
         ) from exc
 
-    blob_id = validated.blob_id
-    blob_id_error = _blob_id_uuid_validation_error(blob_id)
-    if blob_id_error is not None:
-        return _failure_result(state, blob_id_error)
+    blob_id = canonical_resource_uuid(validated.blob_id)
+    if blob_id is None:
+        return _failure_result(state, _BLOB_ID_UUID_ERROR)
     blob = _sync_get_blob(context.session_engine, blob_id, context.session_id)
     if blob is None:
         return _failure_result(state, f"Blob '{blob_id}' not found.")

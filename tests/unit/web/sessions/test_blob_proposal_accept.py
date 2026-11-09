@@ -30,7 +30,7 @@ from elspeth.web.middleware.rate_limit import ComposerRateLimiter
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
 from elspeth.web.sessions.engine import create_session_engine
-from elspeth.web.sessions.models import proposal_blob_effect_receipts_table
+from elspeth.web.sessions.models import composition_proposals_table, proposal_blob_effect_receipts_table
 from elspeth.web.sessions.protocol import (
     CompositionProposalRecord,
     CompositionStateData,
@@ -44,6 +44,7 @@ from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.identities import ensure_test_identity, wire_test_pipeline_user_authority
+from tests.fixtures.resource_identity import UUID_SPELLINGS, uuid_spelling
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 from tests.unit.web.blobs.test_mutation_admission import _context, _empty_state, _resources
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
@@ -224,7 +225,8 @@ def _admit_test_blob_effect(service, blob_service, session_id, tmp_path, tool_na
 
 
 @pytest.mark.parametrize("content", ["approved content", "original content"])
-def test_accept_update_blob_proposal_commits_without_composition_state_delta(tmp_path: Path, content: str) -> None:
+@pytest.mark.parametrize("spelling", UUID_SPELLINGS)
+def test_accept_update_blob_proposal_commits_without_composition_state_delta(tmp_path: Path, content: str, spelling: str) -> None:
     app, service = _make_app(tmp_path)
     blob_service = BlobServiceImpl(
         service._engine,
@@ -258,7 +260,7 @@ def test_accept_update_blob_proposal_commits_without_composition_state_delta(tmp
             content=b"original content",
         )
     )
-    arguments = {"blob_id": str(blob.id), "content": content}
+    arguments = {"blob_id": uuid_spelling(str(blob.id), spelling), "content": content}
     _admit_test_blob_effect(service, blob_service, session_id, tmp_path, "update_blob", arguments, user_message.id)
     proposal = asyncio.run(
         _create_test_proposal(
@@ -294,10 +296,16 @@ def test_accept_update_blob_proposal_commits_without_composition_state_delta(tmp
     assert persisted.id == state_record.id
     assert client.post(f"/api/sessions/{session_id}/proposals/{proposal.id}/accept").status_code == 200
     with service._engine.connect() as connection:
-        assert len(connection.execute(select(proposal_blob_effect_receipts_table)).all()) == 1
+        receipt = connection.execute(select(proposal_blob_effect_receipts_table)).one()
+        stored = connection.execute(select(composition_proposals_table)).one()
+        assert receipt.arguments_hash == stable_hash(arguments)
+        assert stored.arguments_json == arguments
+        assert stored.tool_arguments_hash == stable_hash(arguments)
 
 
-def test_accept_update_blob_proposal_remains_blocked_by_second_pending_reference(tmp_path: Path) -> None:
+@pytest.mark.parametrize("spelling", UUID_SPELLINGS)
+@pytest.mark.parametrize("tool_name", ["update_blob", "delete_blob"])
+def test_accept_blob_proposal_remains_blocked_by_second_pending_reference(tmp_path: Path, spelling: str, tool_name: str) -> None:
     app, service = _make_app(tmp_path)
     blob_service = BlobServiceImpl(
         service._engine,
@@ -332,18 +340,18 @@ def test_accept_update_blob_proposal_remains_blocked_by_second_pending_reference
         )
     )
 
-    async def create_update_proposal(*, tool_call_id: str, content: str) -> CompositionProposalRecord:
-        arguments = {"blob_id": str(blob.id), "content": content}
+    async def create_blob_proposal(*, tool_call_id: str, content: str) -> CompositionProposalRecord:
+        arguments = {"blob_id": uuid_spelling(str(blob.id), spelling), **({"content": content} if tool_name == "update_blob" else {})}
         return await _create_test_proposal(
             service,
             session_id=session_id,
             tool_call_id=tool_call_id,
-            tool_name="update_blob",
+            tool_name=tool_name,
             summary="Update the report blob.",
             rationale="Requested by the current composer turn.",
             affects=("blob",),
             arguments_json=arguments,
-            arguments_redacted_json={"blob_id": str(blob.id), "content": "<redacted>"},
+            arguments_redacted_json={**arguments, **({"content": "<redacted>"} if tool_name == "update_blob" else {})},
             base_state_id=state_record.id,
             actor="composer-web:user:alice",
             user_message_id=user_message.id,
@@ -354,8 +362,8 @@ def test_accept_update_blob_proposal_remains_blocked_by_second_pending_reference
             tool_arguments_hash=stable_hash(arguments),
         )
 
-    accepted_candidate = asyncio.run(create_update_proposal(tool_call_id="call_update_blob_first", content="first content"))
-    retaining_proposal = asyncio.run(create_update_proposal(tool_call_id="call_update_blob_second", content="second content"))
+    accepted_candidate = asyncio.run(create_blob_proposal(tool_call_id="call_blob_first", content="first content"))
+    retaining_proposal = asyncio.run(create_blob_proposal(tool_call_id="call_blob_second", content="second content"))
 
     response = client.post(f"/api/sessions/{session_id}/proposals/{accepted_candidate.id}/accept")
 
@@ -369,7 +377,8 @@ def test_accept_update_blob_proposal_remains_blocked_by_second_pending_reference
     }
 
 
-def test_accept_delete_blob_proposal_commits_without_composition_state_delta(tmp_path: Path) -> None:
+@pytest.mark.parametrize("spelling", UUID_SPELLINGS)
+def test_accept_delete_blob_proposal_commits_without_composition_state_delta(tmp_path: Path, spelling: str) -> None:
     app, service = _make_app(tmp_path)
     blob_service = BlobServiceImpl(
         service._engine,
@@ -395,7 +404,7 @@ def test_accept_delete_blob_proposal_commits_without_composition_state_delta(tmp
             content=b"obsolete content",
         )
     )
-    arguments = {"blob_id": str(blob.id)}
+    arguments = {"blob_id": uuid_spelling(str(blob.id), spelling)}
     _admit_test_blob_effect(service, blob_service, session_id, tmp_path, "delete_blob", arguments)
     proposal = asyncio.run(
         _create_test_proposal(
@@ -430,6 +439,13 @@ def test_accept_delete_blob_proposal_commits_without_composition_state_delta(tmp
     assert persisted is not None
     assert persisted.id == state_record.id
 
+    with service._engine.connect() as connection:
+        receipt = connection.execute(select(proposal_blob_effect_receipts_table)).one()
+        stored = connection.execute(select(composition_proposals_table)).one()
+        assert receipt.arguments_hash == stable_hash(arguments)
+        assert stored.arguments_json == arguments
+        assert stored.tool_arguments_hash == stable_hash(arguments)
+
 
 @pytest.mark.parametrize(
     ("tool_name", "tampered_receipt_field", "advance_state_head"),
@@ -438,16 +454,20 @@ def test_accept_delete_blob_proposal_commits_without_composition_state_delta(tmp
         ("delete_blob", None, False),
         ("update_blob", "arguments_hash", False),
         ("delete_blob", "result_blob_snapshot_hash", False),
+        ("update_blob", "selector_spelling", False),
+        ("delete_blob", "selector_spelling", False),
         ("update_blob", None, True),
         ("delete_blob", None, True),
     ],
 )
+@pytest.mark.parametrize("spelling", UUID_SPELLINGS)
 def test_retry_after_blob_effect_before_proposal_settlement_does_not_reexecute(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     tool_name: str,
     tampered_receipt_field: str | None,
     advance_state_head: bool,
+    spelling: str,
 ) -> None:
     app, service = _make_app(tmp_path)
     blob_service = BlobServiceImpl(
@@ -475,7 +495,7 @@ def test_retry_after_blob_effect_before_proposal_settlement_does_not_reexecute(
         )
     )
     user_message_id = None
-    arguments: dict[str, str] = {"blob_id": str(blob.id)}
+    arguments: dict[str, str] = {"blob_id": uuid_spelling(str(blob.id), spelling)}
     if tool_name == "update_blob":
         user_message = asyncio.run(
             service.add_message(
@@ -553,7 +573,21 @@ def test_retry_after_blob_effect_before_proposal_settlement_does_not_reexecute(
         assert receipt.result_blob_snapshot["id"] == str(blob.id)
         assert receipt.accepted_event_id is None
         assert receipt.accepted_at is None
-        if tampered_receipt_field is not None:
+        stored = conn.execute(select(composition_proposals_table).where(composition_proposals_table.c.id == str(proposal.id))).one()
+        assert stored.arguments_json == arguments
+        assert stored.tool_arguments_hash == stable_hash(arguments)
+        if tampered_receipt_field == "selector_spelling":
+            changed = {**arguments, "blob_id": str(blob.id) if arguments["blob_id"] != str(blob.id) else str(blob.id).upper()}
+            from elspeth.web.sessions.proposal_blob_refs import proposal_blob_reference_ids
+
+            assert changed != arguments
+            assert proposal_blob_reference_ids(tool_name, changed) == (str(blob.id),)
+            conn.execute(
+                update(composition_proposals_table)
+                .where(composition_proposals_table.c.id == str(proposal.id))
+                .values(arguments_json=changed)
+            )
+        elif tampered_receipt_field is not None:
             conn.execute(
                 update(proposal_blob_effect_receipts_table)
                 .where(proposal_blob_effect_receipts_table.c.proposal_id == str(proposal.id))
@@ -603,6 +637,10 @@ def test_retry_after_blob_effect_before_proposal_settlement_does_not_reexecute(
         ).one()
     assert settled_receipt.accepted_event_id == retry_response.json()["audit_event_id"]
     assert settled_receipt.accepted_at is not None
+    assert settled_receipt.arguments_hash == stable_hash(arguments)
+    stored_after = asyncio.run(service.list_composition_proposals(session_id))[0]
+    assert stored_after.arguments_json == arguments
+    assert stored_after.tool_arguments_hash == stable_hash(arguments)
 
     duplicate_response = client.post(f"/api/sessions/{session_id}/proposals/{proposal.id}/accept")
 

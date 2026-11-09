@@ -1745,6 +1745,61 @@ async def test_digest_omission_keeps_inventory_available_after_details_close(
     assert [invocation.tool_name for invocation in recorder.invocations] == ["list_sources"]
 
 
+@pytest.mark.asyncio
+async def test_alias_metadata_success_resolves_the_canonical_fact_in_the_next_planner_request(tmp_path, tool_context):
+    from elspeth.web.blobs.service import BlobServiceImpl
+    from tests.fixtures.resource_identity import uuid_spelling
+
+    engine, origin = await _session_context()
+    try:
+        with fenced_operation_context(engine, origin.session_id) as context:
+            blob = await BlobServiceImpl(engine, tmp_path).create_blob(
+                UUID(origin.session_id), "identity.csv", b"name,score\nada,42\n", "text/csv", session_operation_context=context
+            )
+            pipeline = _inline_pipeline(tmp_path)
+            del pipeline["source"]["inline_blob"]
+            pipeline["source"]["blob_id"] = str(blob.id)
+            alias = uuid_spelling(str(blob.id), "braced")
+            completion = _ScriptedCompletion(
+                _response_with_call_id("metadata-alias", "get_blob_metadata", {"blob_id": alias}),
+                _response_with_call_id("emit-identity", "emit_pipeline_proposal", {"pipeline": pipeline}),
+            )
+            custody = replace(
+                _custody(tmp_path),
+                session_engine=engine,
+                session_operation_context=context,
+                session_operation_authority=SQLiteLocalSessionOperationAuthority(engine),
+            )
+            key = f"blob.metadata:{blob.id}"
+            policy = pipeline_planner.PlannerDiscoveryPolicy(
+                manifest=pipeline_planner.PlannerInformationManifest(supplied=frozenset(), unresolved=frozenset({key})),
+                discovery_tool_names=PLANNER_DISCOVERY_TOOL_NAMES,
+                unresolved_classes=(),
+            )
+            with patch.object(pipeline_planner.PlannerDiscoveryPolicy, "initial", return_value=policy):
+                await _plan(
+                    tmp_path=tmp_path,
+                    tool_context=tool_context,
+                    completion=completion,
+                    originating_message=origin,
+                    custody_config=custody,
+                    information_aware=True,
+                )
+            first = next(
+                json.loads(m["content"])
+                for m in completion.requests[1]["messages"]
+                if m.get("tool_call_id") == "metadata-alias" and m["role"] == "tool"
+            )
+            assert first["success"] is True
+            assert first["data"]["id"] == str(blob.id)
+            initial = json.loads(completion.requests[0]["messages"][2]["content"])
+            assert initial["information_manifest"]["unresolved"] == [key]
+            closure = "All declared information gaps are closed; emit the terminal proposal now."
+            assert sum(m.get("content") == closure for m in completion.requests[1]["messages"]) == 1
+    finally:
+        engine.dispose()
+
+
 def test_pipeline_information_semantic_dominance_is_directional() -> None:
     import elspeth.web.composer.pipeline_planner as planner_module
 

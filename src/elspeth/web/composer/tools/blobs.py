@@ -106,6 +106,7 @@ from elspeth.web.credential_guard import CREDENTIAL_REFUSAL_DETAIL, CredentialMa
 from elspeth.web.execution._validation_materialization import is_llm_authored_prompt_surface_binding, llm_prompt_surface_field
 from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY, reconcile_authoritative_reviews
 from elspeth.web.provider_config_policy import web_aws_s3_endpoint_url_policy_error
+from elspeth.web.resource_identity import canonical_resource_uuid
 from elspeth.web.sessions.models import (
     blobs_table,
 )
@@ -508,6 +509,14 @@ def _sync_get_blob(engine: Engine, blob_id: str, session_id: str | None = None) 
         return _blob_row_to_tool_dict(row)
 
 
+_BLOB_ID_UUID_ERROR = (
+    "blob_id is not a valid UUID. Use list_blobs or "
+    "list_composer_blobs to select an uploaded blob, ask the user to "
+    "upload the source file, or use create_blob for inline content "
+    "before calling this tool."
+)
+
+
 @observation_boundary(
     tier=3,
     source="LLM composer tool-call blob_id argument",
@@ -519,15 +528,8 @@ def _blob_id_uuid_validation_error(blob_id: Any) -> str | None:
     """Return a repairable boundary error when ``blob_id`` is not canonical."""
     if not isinstance(blob_id, str):
         return f"blob_id must be a UUID string, got {type(blob_id).__name__}."
-    try:
-        UUID(blob_id)
-    except ValueError:
-        return (
-            "blob_id is not a valid UUID. Use list_blobs or "
-            "list_composer_blobs to select an uploaded blob, ask the user to "
-            "upload the source file, or use create_blob for inline content "
-            "before calling this tool."
-        )
+    if canonical_resource_uuid(blob_id) is None:
+        return _BLOB_ID_UUID_ERROR
     return None
 
 
@@ -665,10 +667,10 @@ def _handle_get_blob_metadata(
     session_id = context.session_id
     if session_engine is None or session_id is None:
         return _failure_result(state, "Blob tools require session context.")
-    blob_id_error = _blob_id_uuid_validation_error(validated.blob_id)
-    if blob_id_error is not None:
-        return _failure_result(state, blob_id_error)
-    blob = _sync_get_blob(session_engine, validated.blob_id, session_id)
+    blob_id = canonical_resource_uuid(validated.blob_id)
+    if blob_id is None:
+        return _failure_result(state, _BLOB_ID_UUID_ERROR)
+    blob = _sync_get_blob(session_engine, blob_id, session_id)
     if blob is None:
         return _failure_result(state, "Blob not found for this session.")
     safe_blob: BlobMetadataPayload = {
@@ -1035,15 +1037,15 @@ def _execute_wire_blob_inline_ref(
         return _failure_result(state, "Blob tools require session context.")
 
     field_path = validated.field_path
-    blob_id_error = _blob_id_uuid_validation_error(validated.blob_id)
-    if blob_id_error is not None:
-        return _failure_result(state, blob_id_error)
-    blob_id = UUID(validated.blob_id)
+    selector = canonical_resource_uuid(validated.blob_id)
+    if selector is None:
+        return _failure_result(state, _BLOB_ID_UUID_ERROR)
+    blob_id = UUID(selector)
 
     # The argument model validates ContentEncoding and defaults absence to utf-8.
     encoding = validated.encoding
 
-    blob = _sync_get_blob(session_engine, str(blob_id), session_id)
+    blob = _sync_get_blob(session_engine, selector, session_id)
     if blob is None:
         return _failure_result(state, f"Blob '{blob_id}' not found.")
     if blob["status"] != "ready":
@@ -1774,9 +1776,10 @@ def admit_blob_mutation(tool_name: str, arguments: object, state: CompositionSta
     else:
         update_arguments = _validated_blob_update(arguments)
         blob_id = update_arguments.blob_id
-    blob_id_error = _blob_id_uuid_validation_error(blob_id)
-    if blob_id_error is not None:
-        return _failure_result(state, blob_id_error)
+    selector = canonical_resource_uuid(blob_id)
+    if selector is None:
+        return _failure_result(state, _BLOB_ID_UUID_ERROR)
+    blob_id = selector
     content_bytes = _blob_update_bytes(update_arguments) if update_arguments is not None else None
     authority, operation = _require_blob_tool_authority(context)
     provenance = _blob_creation_provenance(update_arguments.content, context) if update_arguments is not None else None
@@ -1865,9 +1868,9 @@ def _execute_update_blob(
     if context.data_dir is None:
         return _failure_result(state, "Blob tools require data_dir for storage.")
     validated = _validated_blob_update(arguments)
-    blob_id_error = _blob_id_uuid_validation_error(validated.blob_id)
-    if blob_id_error is not None:
-        return _failure_result(state, blob_id_error)
+    blob_id = canonical_resource_uuid(validated.blob_id)
+    if blob_id is None:
+        return _failure_result(state, _BLOB_ID_UUID_ERROR)
     content_bytes = _blob_update_bytes(validated)
     authority, operation = _require_blob_tool_authority(context)
     provenance = _blob_creation_provenance(validated.content, context)
@@ -1881,12 +1884,12 @@ def _execute_update_blob(
     try:
         expected = authority.mutate(
             operation,
-            lambda transaction: transaction.blobs.read_blob(blob_id=UUID(validated.blob_id)),
+            lambda transaction: transaction.blobs.read_blob(blob_id=UUID(blob_id)),
         )
-        if _state_references_blob(state, validated.blob_id, expected.storage_path):
+        if _state_references_blob(state, blob_id, expected.storage_path):
             return _failure_result(
                 state,
-                f"Blob '{validated.blob_id}' is referenced by the current composition and cannot be updated; unbind it first.",
+                f"Blob '{blob_id}' is referenced by the current composition and cannot be updated; unbind it first.",
             )
         replacement = _blob_replacement_record(expected, content_bytes, provenance, context)
         result = driver.replace_blob(
@@ -1898,7 +1901,7 @@ def _execute_update_blob(
             accepting_proposal_id=UUID(context.executing_proposal_id) if context.executing_proposal_id is not None else None,
         )
     except SessionDerivedCustodyError:
-        return _failure_result(state, f"Blob '{validated.blob_id}' not found.")
+        return _failure_result(state, f"Blob '{blob_id}' not found.")
     except (BlobActiveRunError, BlobPendingProposalError, BlobInProgressForkError, BlobQuotaExceededError, BlobStateError) as exc:
         return _failure_result(state, str(exc))
     return _discovery_result(
@@ -1953,10 +1956,9 @@ def _execute_delete_blob(
         return _failure_result(state, "Blob tools require session context.")
     if context.data_dir is None:
         return _failure_result(state, "Blob tools require data_dir for storage.")
-    blob_id = validated.blob_id
-    blob_id_error = _blob_id_uuid_validation_error(blob_id)
-    if blob_id_error is not None:
-        return _failure_result(state, blob_id_error)
+    blob_id = canonical_resource_uuid(validated.blob_id)
+    if blob_id is None:
+        return _failure_result(state, _BLOB_ID_UUID_ERROR)
     authority, operation = _require_blob_tool_authority(context)
     service = BlobServiceImpl(
         context.session_engine,
@@ -2143,10 +2145,9 @@ def _execute_get_blob_content(
         return _failure_result(state, "Blob tools require session context.")
 
     validated = _validate_mutation_arguments(GetBlobContentArgumentsModel, arguments, "get_blob_content arguments")
-    blob_id = validated.blob_id
-    blob_id_error = _blob_id_uuid_validation_error(blob_id)
-    if blob_id_error is not None:
-        return _failure_result(state, blob_id_error)
+    blob_id = canonical_resource_uuid(validated.blob_id)
+    if blob_id is None:
+        return _failure_result(state, _BLOB_ID_UUID_ERROR)
     # Guards 1 + 2 (lifecycle, integrity) run inside the same-session
     # custody lock so the row and the bytes are one version — a read
     # racing update/delete must block rather than pair the old committed
@@ -2196,7 +2197,7 @@ def _execute_get_blob_content(
         return _failure_result(state, "Blob content offset exceeds its decoded character length.")
 
     payload: AttachmentContentPayload = {
-        "blob_id": blob_id,
+        "blob_id": blob["id"],
         "filename": blob["filename"],
         "mime_type": blob["mime_type"],
         "content": content,
@@ -2313,10 +2314,9 @@ def _execute_read_attachment(arguments: dict[str, Any], state: CompositionState,
     if session_engine is None or session_id is None:
         return _failure_result(state, "Blob tools require session context.")
     validated = _validate_mutation_arguments(ReadAttachmentArgumentsModel, arguments, "read_attachment arguments")
-    blob_id = validated.blob_id
-    blob_id_error = _blob_id_uuid_validation_error(blob_id)
-    if blob_id_error is not None:
-        return _failure_result(state, blob_id_error)
+    blob_id = canonical_resource_uuid(validated.blob_id)
+    if blob_id is None:
+        return _failure_result(state, _BLOB_ID_UUID_ERROR)
     blob, data = _locked_read_ready_blob(
         session_engine,
         session_id,
@@ -2348,7 +2348,7 @@ def _execute_read_attachment(arguments: dict[str, Any], state: CompositionState,
     if validated.expected_content_hash is not None and not hmac.compare_digest(validated.expected_content_hash, verified_hash):
         return _failure_result(state, "Blob content changed; restart inspection with its current content hash.")
     payload: AttachmentContentPayload = {
-        "blob_id": blob_id,
+        "blob_id": blob["id"],
         "filename": blob["filename"],
         "mime_type": blob["mime_type"],
         "content": content,

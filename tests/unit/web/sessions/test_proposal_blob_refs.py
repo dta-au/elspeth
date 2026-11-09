@@ -13,6 +13,120 @@ import pytest
 
 from elspeth.web.composer.pipeline_proposal import OWNED_COMPOSITION_STATE_AUTHORITY
 from elspeth.web.sessions.proposal_blob_refs import ProposalResourceUnavailableError, proposal_blob_reference_ids
+from tests.fixtures.resource_identity import BLOB_UUID, UUID_SPELLINGS, uuid_spelling
+
+
+@pytest.mark.parametrize("spelling", UUID_SPELLINGS)
+@pytest.mark.parametrize(
+    "tool", ["update_blob", "delete_blob", "set_source_from_blob", "wire_blob_inline_ref", "set_source_from_blobs", "set_pipeline"]
+)
+def test_reference_projection_canonicalizes_selector_custody_without_rewriting_arguments(spelling, tool):
+    from copy import deepcopy
+
+    alias = uuid_spelling(BLOB_UUID, spelling)
+    arguments = {"blob_id": alias}
+    if tool == "set_source_from_blobs":
+        arguments = {"blob_ids": [alias, BLOB_UUID]}
+    elif tool == "set_pipeline":
+        # Conservative custody projection does not admit this graph marker.
+        arguments = {"source": {"blob_id": alias, "options": {"nested": [{"blob_ref": alias}], "path": f"blob:{BLOB_UUID}"}}}
+    original = deepcopy(arguments)
+    assert proposal_blob_reference_ids(tool, arguments) == (BLOB_UUID,)
+    assert arguments == original
+
+
+@pytest.mark.parametrize("spelling", UUID_SPELLINGS)
+@pytest.mark.parametrize("availability", ["ready", "missing", "foreign", "pending", "error", "corrupt"])
+def test_alias_reference_validation_preserves_ownership_status_and_corruption(spelling, availability):
+    from sqlalchemy import Column, MetaData, String, Table, create_engine
+
+    from elspeth.contracts.errors import AuditIntegrityError
+    from elspeth.web.sessions.proposal_blob_refs import validate_proposal_blob_references
+
+    engine = create_engine("sqlite://")
+    metadata = MetaData()
+    blobs = Table("blobs", metadata, Column("id", String), Column("session_id", String), Column("status", String))
+    metadata.create_all(engine)
+    arguments = {"blob_id": uuid_spelling(BLOB_UUID, spelling)}
+    with engine.begin() as conn:
+        if availability != "missing":
+            conn.execute(
+                blobs.insert().values(
+                    id=BLOB_UUID,
+                    session_id="foreign" if availability == "foreign" else "owned",
+                    status="invalid" if availability == "corrupt" else availability,
+                )
+            )
+        if availability == "ready":
+            validate_proposal_blob_references(conn, session_id="owned", tool_name="delete_blob", arguments=arguments)
+        else:
+            expected = AuditIntegrityError if availability == "corrupt" else ProposalResourceUnavailableError
+            with pytest.raises(expected):
+                validate_proposal_blob_references(conn, session_id="owned", tool_name="delete_blob", arguments=arguments)
+    engine.dispose()
+
+
+@pytest.mark.parametrize("spelling", ["uppercase", "mixed", "braced", "hyphenless", "urn"])
+def test_conservative_projection_never_relaxes_strict_sentinel_grammar(spelling):
+    with pytest.raises(ValueError, match="non-canonical"):
+        proposal_blob_reference_ids("set_pipeline", {"source": {"options": {"path": "blob:" + uuid_spelling(BLOB_UUID, spelling)}}})
+
+
+@pytest.mark.parametrize("spelling", UUID_SPELLINGS)
+def test_pending_alias_retains_blob_and_only_exact_acceptance_is_excluded(spelling):
+    from sqlalchemy import JSON, Column, MetaData, String, Table, create_engine
+
+    from elspeth.contracts.errors import AuditIntegrityError
+    from elspeth.web.sessions.proposal_blob_refs import pending_proposal_reference_id
+
+    engine = create_engine("sqlite://")
+    metadata = MetaData()
+    proposals = Table(
+        "composition_proposals",
+        metadata,
+        Column("id", String),
+        Column("session_id", String),
+        Column("status", String),
+        Column("tool_name", String),
+        Column("arguments_json", JSON),
+    )
+    metadata.create_all(engine)
+    arguments = {"blob_id": uuid_spelling(BLOB_UUID, spelling), "content": "private-original"}
+    with engine.begin() as conn:
+        conn.execute(
+            proposals.insert().values(
+                id="accepting", session_id="owned", status="pending", tool_name="update_blob", arguments_json=arguments
+            )
+        )
+        assert pending_proposal_reference_id(conn, session_id="owned", blob_id=BLOB_UUID) == "accepting"
+        assert pending_proposal_reference_id(conn, session_id="foreign", blob_id=BLOB_UUID) is None
+        assert (
+            pending_proposal_reference_id(
+                conn, session_id="owned", blob_id=BLOB_UUID, accepting_proposal_id="accepting", accepting_tool_name="update_blob"
+            )
+            is None
+        )
+        with pytest.raises(AuditIntegrityError, match="tool does not match"):
+            pending_proposal_reference_id(
+                conn, session_id="owned", blob_id=BLOB_UUID, accepting_proposal_id="accepting", accepting_tool_name="delete_blob"
+            )
+        conn.execute(
+            proposals.insert().values(
+                id="second",
+                session_id="owned",
+                status="pending",
+                tool_name="delete_blob",
+                arguments_json={"blob_id": uuid_spelling(BLOB_UUID, "urn")},
+            )
+        )
+        assert (
+            pending_proposal_reference_id(
+                conn, session_id="owned", blob_id=BLOB_UUID, accepting_proposal_id="accepting", accepting_tool_name="update_blob"
+            )
+            == "second"
+        )
+        assert conn.execute(proposals.select().where(proposals.c.id == "accepting")).one().arguments_json == arguments
+    engine.dispose()
 
 
 @pytest.mark.parametrize("availability", ["missing", "foreign", "pending", "error", "ready", "corrupt", "null"])

@@ -174,6 +174,7 @@ from elspeth.web.composer.tools._common import (
 )
 from elspeth.web.composer.tools._dispatch import _schema_violation_loc, execute_discovery_tool_with_context
 from elspeth.web.composer.tools._generation_schema_response import AdmittedPluginSchemaResponse
+from elspeth.web.composer.tools.blobs import BlobIdArgumentsModel
 from elspeth.web.composer.tools.generation import (
     _CLOSED_VALIDATION_ERROR_CODES,
     EXPLAIN_VALIDATION_ERROR_GUIDANCE,
@@ -182,6 +183,7 @@ from elspeth.web.composer.tools.generation import (
 )
 from elspeth.web.composer.tools.schema_contract import canonical_set_pipeline_schema, canonical_set_pipeline_validator
 from elspeth.web.composer.tools.sessions import build_set_pipeline_candidate, canonicalize_authored_node_review_requirements
+from elspeth.web.composer.tools.sources import InspectSourceArgumentsModel
 from elspeth.web.composer.tools.wire_projection import (
     _WIRE_TOOL_DEFS,
     decode_wire_arguments,
@@ -197,6 +199,7 @@ from elspeth.web.credential_guard import (
     require_no_credential_material_in_tool_wire,
 )
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+from elspeth.web.resource_identity import canonical_resource_uuid
 from elspeth.web.secrets.wiring_policy import SecretWiringPolicy
 from elspeth.web.sessions.protocol import SessionOperationAuthority, SessionServiceProtocol
 
@@ -438,23 +441,41 @@ def _tool_information_keys(name: str, arguments: Mapping[str, Any]) -> tuple[str
     if name == "list_composer_blobs":
         return ("blob.index.composer",)
     if name == "get_blob_metadata":
-        blob_id = arguments["blob_id"] if "blob_id" in arguments else None
+        try:
+            metadata = BlobIdArgumentsModel.model_validate(deep_thaw(arguments))
+        except PydanticValidationError:
+            return ()
+        blob_id = canonical_resource_uuid(metadata.blob_id)
+        if blob_id is None:
+            return ()
         return (f"blob.metadata:{blob_id}",)
     if name == "inspect_source":
-        blob_id = arguments["blob_id"] if "blob_id" in arguments else None
+        try:
+            inspection = InspectSourceArgumentsModel.model_validate(deep_thaw(arguments))
+        except PydanticValidationError:
+            return ()
+        blob_id = canonical_resource_uuid(inspection.blob_id)
+        if blob_id is None:
+            return ()
         return (f"blob.inspection:{blob_id}",)
     if name == "get_blob_content":
         try:
             page = GetBlobContentArgumentsModel.model_validate(deep_thaw(arguments))
         except PydanticValidationError:
             return ()
-        return ("blob.content:" + canonical_json((page.blob_id, page.offset_chars, page.expected_content_hash)),)
+        blob_id = canonical_resource_uuid(page.blob_id)
+        if blob_id is None:
+            return ()
+        return ("blob.content:" + canonical_json((blob_id, page.offset_chars, page.expected_content_hash)),)
     if name == "read_attachment":
         try:
             attachment = ReadAttachmentArgumentsModel.model_validate(deep_thaw(arguments))
         except PydanticValidationError:
             return ()
-        return ("blob.attachment:" + canonical_json((attachment.blob_id, attachment.expected_content_hash)),)
+        blob_id = canonical_resource_uuid(attachment.blob_id)
+        if blob_id is None:
+            return ()
+        return ("blob.attachment:" + canonical_json((blob_id, attachment.expected_content_hash)),)
     if name == "list_secret_refs":
         return ("secret.index",)
     if name == "validate_secret_ref":
