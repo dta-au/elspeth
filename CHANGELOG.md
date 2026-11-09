@@ -114,6 +114,20 @@ establish qualification, a published tag or an image.
   conformance capability sweep covers it. The reference image's
   `adapter-fingerprint` label changes accordingly.
 
+### Dependencies
+
+- **Security updates.** The application lock moves filelock to 4.2.1, litellm
+  to 1.102.2, oauthlib to 4.0.1 and virtualenv to 21.14.5. The gateway lock
+  moves filelock to 4.2.1 and opentelemetry-api to 1.45.2, and the gateway
+  image rebuilds on the current `python:3.12-alpine` digest, which carries
+  musl 1.2.6-r3 and zlib 1.3.2-r1. The frontend and test-tooling npm locks
+  take the patched dompurify, zod, undici, fast-uri, vitest and minimatch
+  releases.
+- **Still open.** The application's OpenTelemetry 1.40 pin (CVE-2026-114603)
+  and eight virtualenv advisories remain. OpenTelemetry 1.45 breaks web start-up
+  and operator telemetry custody, and virtualenv 21.14.7 or later needs
+  packaging 26, which langfuse 3 forbids. Both need their own change.
+
 ### Upgrade notes
 
 0.8.10 changes neither schema epoch, so the 0.8.9 cutover guidance continues to
