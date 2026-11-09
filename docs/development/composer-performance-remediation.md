@@ -780,7 +780,15 @@ positive (second call with identical tools performs no scan) and a negative
 (a tool list containing a credential-shaped string is still refused, cached
 or not).
 
-**Evidence.** _(fill in)_
+**Evidence (landed).** `_check_tools_memoized` in `provider_context.py`: a
+16-entry, lock-guarded memo of **passing** tool lists keyed by SHA-256 of a
+sorted-key JSON encoding of the already-finite list; a refused list is never
+cached and is rescanned and refused on every call; messages are scanned on
+every call unchanged. `_check_tools` confirmed pure in `tools` (module
+constant policies only). `capture_provider_context` planner tools
+**17.2 → 9.9 ms**, compose-loop tools **28.4 → 11.1 ms** (messages-only
+≈ 7.1 ms is the remaining floor). Five new tests, 74 passed in the file;
+two negative controls (memo removed; refused list cached as pass) go red.
 
 ---
 
@@ -805,7 +813,21 @@ for mutation.
 **Tests.** `tests/unit/web/composer/tools/` schema-contract tests; add a
 call-count assertion and a byte-identity check against the uncached result.
 
-**Evidence.** _(fill in)_
+**Evidence (landed).** `_canonical_set_pipeline_schema_text()` (`@cache`)
+builds, verifies and JSON-encodes the augmented schema once per process; a
+failed build raises and is not cached; `canonical_set_pipeline_schema()`
+decodes a fresh independent copy per call so no caller can reach the retained
+value. New `canonical_set_pipeline_validator()` (`@cache`) replaces the
+per-rejection `Draft202012Validator(...)` rebuild in `pipeline_planner.py`
+(+2/−5, unused import removed; no architecture line pins on that file).
+`canonical_set_pipeline_schema` **5.04 → 0.07 ms**; rejection-path validator
+**5.6 → 0.024 ms**. The deep copy was only 0.19 ms — the cost was the build
+(mostly the compatibility check), so no immutable-view variant is needed.
+Four new tests + one adjusted (cache cleared; failures not cached), 6
+passed; three negative controls (no cache; shared dict handed out; key-order
+drift) go red. `check_contracts` unchanged. Batch-gate note: the planner edit
+is inside `_plan_pipeline_inner`, which carries `fp=` allowlist entries —
+check fingerprint churn in the lint corpus diff.
 
 ---
 

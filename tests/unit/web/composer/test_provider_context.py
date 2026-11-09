@@ -385,3 +385,94 @@ async def test_real_rendered_composer_prompt_is_reconstructable_on_covered_surfa
     public = await _get(test_client, f"/api/sessions/{session.id}/messages")
     assert public.status_code == 200
     assert "prepared_litellm_messages_and_tools" not in json.dumps(public.json())
+
+
+# --- Tools pass-verdict memo (composer-performance-remediation fix 11) -------
+
+
+@pytest.fixture
+def tools_scan_counter(monkeypatch):
+    from elspeth.web.composer import provider_context as provider_context_module
+
+    with provider_context_module._TOOLS_PASS_MEMO_LOCK:
+        provider_context_module._TOOLS_PASS_MEMO.clear()
+    scanned: list[object] = []
+    real_check_tools = provider_context_module._check_tools
+
+    def counting_check_tools(tools):
+        scanned.append(tools)
+        real_check_tools(tools)
+
+    monkeypatch.setattr(provider_context_module, "_check_tools", counting_check_tools)
+    yield scanned
+    with provider_context_module._TOOLS_PASS_MEMO_LOCK:
+        provider_context_module._TOOLS_PASS_MEMO.clear()
+
+
+def _real_planner_tools() -> list[dict[str, object]]:
+    from elspeth.contracts.composer_llm_audit import ToolContractDialect
+    from elspeth.web.composer.pipeline_planner import planner_tool_definitions
+
+    return planner_tool_definitions(dialect=ToolContractDialect("openai_strict"))
+
+
+def test_identical_tool_list_is_scanned_once_and_capture_is_unchanged(tools_scan_counter) -> None:
+    tools = _real_planner_tools()
+    first = capture_provider_context(messages=_messages(), tools=tools)
+    second = capture_provider_context(messages=_messages(), tools=deepcopy(tools))
+    assert first.disposition == second.disposition == "retained"
+    assert first.canonical == second.canonical
+    assert json.loads(second.canonical)["tools"] == tools
+    assert len(tools_scan_counter) == 1
+
+
+def test_messages_are_still_scanned_when_the_tools_verdict_is_memoized(tools_scan_counter) -> None:
+    tools = _real_planner_tools()
+    assert capture_provider_context(messages=_messages(), tools=tools).disposition == "retained"
+    leaked = capture_provider_context(messages=[{"role": "user", "content": "password=synthetic-private-value"}], tools=tools)
+    assert leaked.disposition == "unavailable"
+    assert leaked.reasons == ("recognized_credential",)
+    assert len(tools_scan_counter) == 1
+
+
+def test_credential_shaped_tool_list_is_refused_on_every_call(tools_scan_counter) -> None:
+    safe = _real_planner_tools()
+    assert capture_provider_context(messages=_messages(), tools=safe).disposition == "retained"
+    poisoned = deepcopy(safe)
+    poisoned[0]["function"]["description"] = "password=synthetic-private-value"
+    for _ in range(3):
+        context = capture_provider_context(messages=_messages(), tools=poisoned)
+        assert context.disposition == "unavailable"
+        assert context.reasons == ("recognized_credential",)
+        assert context.canonical is None
+    # One scan for the safe list, then the refused list is rescanned each call.
+    assert len(tools_scan_counter) == 4
+
+
+def test_distinct_tool_lists_get_distinct_memo_entries(tools_scan_counter) -> None:
+    from elspeth.web.composer import provider_context as provider_context_module
+
+    base = _tools()
+    variant = deepcopy(base)
+    variant[0]["function"]["description"] = "Read current state, revised."
+    for tools in (base, variant, base, variant):
+        assert capture_provider_context(messages=_messages(), tools=tools).disposition == "retained"
+    assert len(tools_scan_counter) == 2
+    assert len(provider_context_module._TOOLS_PASS_MEMO) == 2
+
+
+def test_tools_memo_is_bounded(tools_scan_counter) -> None:
+    from elspeth.web.composer import provider_context as provider_context_module
+
+    limit = provider_context_module._TOOLS_PASS_MEMO_MAX
+    for index in range(limit + 3):
+        tools = _tools()
+        tools[0]["function"]["description"] = f"Read current state, variant {index}."
+        assert capture_provider_context(messages=_messages(), tools=tools).disposition == "retained"
+    assert len(provider_context_module._TOOLS_PASS_MEMO) == limit
+    assert len(tools_scan_counter) == limit + 3
+    # The oldest entry was evicted, so its list is scanned again.
+    evicted = _tools()
+    evicted[0]["function"]["description"] = "Read current state, variant 0."
+    capture_provider_context(messages=_messages(), tools=evicted)
+    assert len(tools_scan_counter) == limit + 4
